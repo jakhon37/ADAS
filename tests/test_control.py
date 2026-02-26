@@ -1,6 +1,5 @@
 """Tests for controller."""
 
-import pytest
 
 from adas.control import PIDLikeLongitudinalController
 from adas.core.models import MotionPlan

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Dict
 
 from adas.core.logger import setup_logger
 

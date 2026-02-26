@@ -3,11 +3,10 @@
 import pytest
 
 from adas.core.exceptions import ValidationError
-from adas.core.models import BoundingBox, ControlCommand, LaneModel, MotionPlan
+from adas.core.models import BoundingBox, ControlCommand, MotionPlan
 from adas.core.validation import (
     validate_bounding_box,
     validate_control_command,
-    validate_lane_model,
     validate_motion_plan,
 )
 

@@ -62,7 +62,12 @@ docker run -d \
 python3 -m venv venv
 source venv/bin/activate
 
-# Install package
+# Install from PyPI (recommended)
+pip install adas-core
+
+# Or install from source
+git clone https://github.com/jakhon37/ADAS.git
+cd ADAS
 pip install -e .
 ```
 

@@ -8,7 +8,6 @@ perception, planning, and control outputs.
 from __future__ import annotations
 
 import time
-from typing import Optional
 
 try:
     import rclpy
@@ -26,11 +25,10 @@ except ImportError:
 from adas.core.logger import setup_logger
 from adas.core.models import PerceptionFrame
 from adas.runtime import ADASPipeline
-from adas.ros2.topics import ADASTopics, QoSProfiles
+from adas.ros2.topics import ADASTopics
 from adas.ros2.converters import (
     bbox_to_detection_msg,
     control_cmd_to_msg,
-    lane_to_marker_array,
     ros_image_to_numpy,
 )
 

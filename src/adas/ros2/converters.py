@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from adas.core.models import BoundingBox, ControlCommand, LaneModel, MotionPlan, TrackedObject
+from adas.core.models import BoundingBox, ControlCommand, LaneModel
 
 # Type hints for ROS2 messages (avoid hard dependency)
 try:
     from sensor_msgs.msg import Image
     from std_msgs.msg import Header, Float32
-    from geometry_msgs.msg import Pose, Twist, Point
+    from geometry_msgs.msg import Point
     from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithPose
     from visualization_msgs.msg import Marker, MarkerArray
     ROS2_MSGS_AVAILABLE = True
