@@ -45,14 +45,24 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed architecture documentation.
 
 ## 📦 Installation
 
-### Quick Start
+### From PyPI (Recommended)
+
+```bash
+# Install latest version
+pip install adas-core
+
+# Run synthetic test
+adas-run --frames 60
+```
+
+### From Source
 
 ```bash
 # Clone repository
 git clone https://github.com/jakhon37/ADAS.git
 cd ADAS
 
-# Install package
+# Install in editable mode
 pip install -e .
 
 # Run synthetic test

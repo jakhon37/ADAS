@@ -11,7 +11,7 @@ import pickle
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from adas.core.logger import setup_logger
 from adas.core.models import ControlCommand, MotionPlan, PerceptionFrame
@@ -181,8 +181,8 @@ class DataRecorder:
         # Save summary
         summary_path = self.recording_dir / "summary.txt"
         with open(summary_path, "w") as f:
-            f.write(f"ADAS Recording Summary\n")
-            f.write(f"=" * 50 + "\n\n")
+            f.write("ADAS Recording Summary\n")
+            f.write("=" * 50 + "\n\n")
             f.write(f"Recording: {self.config.recording_name}\n")
             f.write(f"Total Frames: {len(self.frame_data)}\n")
             f.write(f"Duration: {self.metadata.get('end_time', 0) - self.metadata['start_time']:.2f}s\n")

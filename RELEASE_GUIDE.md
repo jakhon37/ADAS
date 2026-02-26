@@ -82,7 +82,7 @@ git push origin v0.1.0
 git push origin release/v0.1.0
 
 # Create PR on GitHub
-# Go to: https://github.com/your-org/adas-core/compare
+# Go to: https://github.com/jakhon37/ADAS/compare
 # Select: base: main <- compare: release/v0.1.0
 # Title: "Release v0.1.0 - Production-Ready ADAS Core"
 # Review and merge
@@ -202,7 +202,7 @@ adas-run --frames 10
 
 ## 🚀 Step 5: Create GitHub Release
 
-1. Go to: https://github.com/your-org/adas-core/releases/new
+1. Go to: https://github.com/jakhon37/ADAS/releases/new
 2. Choose tag: `v0.1.0`
 3. Release title: `v0.1.0 - Production-Ready ADAS Core`
 4. Description:
@@ -264,7 +264,7 @@ adas-run --config config.json
 
 See [CHANGELOG.md](CHANGELOG.md) for full details.
 
-**Full Changelog**: https://github.com/your-org/adas-core/commits/v0.1.0
+**Full Changelog**: https://github.com/jakhon37/ADAS/commits/v0.1.0
 ```
 
 5. Attach files (optional):
@@ -283,7 +283,7 @@ See [CHANGELOG.md](CHANGELOG.md) for full details.
 [![PyPI version](https://badge.fury.io/py/adas-core.svg)](https://badge.fury.io/py/adas-core)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://github.com/your-org/adas-core/workflows/CI/badge.svg)](https://github.com/your-org/adas-core/actions)
+[![Tests](https://github.com/jakhon37/ADAS/workflows/CI/badge.svg)](https://github.com/jakhon37/ADAS/actions)
 ```
 
 ---
@@ -344,7 +344,7 @@ Production-ready Advanced Driver Assistance System with:
 Install: pip install adas-core
 
 #AutonomousDriving #ROS2 #Python #ADAS
-https://github.com/your-org/adas-core
+https://github.com/jakhon37/ADAS
 ```
 
 ### GitHub Discussions
@@ -392,8 +392,8 @@ git checkout -b release/v0.2.0
 
 ## 📞 Support
 
-- Issues: https://github.com/your-org/adas-core/issues
-- Discussions: https://github.com/your-org/adas-core/discussions
+- Issues: https://github.com/jakhon37/ADAS/issues
+- Discussions: https://github.com/jakhon37/ADAS/discussions
 - PyPI: https://pypi.org/project/adas-core/
 
 ---

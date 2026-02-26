@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
 
 from adas.core.exceptions import SafetyViolation
 from adas.core.logger import setup_logger
@@ -99,9 +98,10 @@ class SafetyMonitor:
         """
         # Check steering rate of change (cmd.steering is normalized [-1,1])
         if self._last_timestamp > 0:
-            steering_rate = abs(cmd.steering - self._last_steering) / dt
+            _steering_rate = abs(cmd.steering - self._last_steering) / dt
             # Note: This is rate of normalized steering, not radians
             # In production, convert to actual steering angle rate
+            # TODO: Add actual steering rate validation using _steering_rate
         
         self._last_steering = cmd.steering
         self._last_timestamp += dt

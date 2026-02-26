@@ -141,4 +141,4 @@ This is a reference implementation for development and testing. For production a
 
 ---
 
-**Full Changelog**: https://github.com/your-org/adas-core/commits/codex/check-project
+**Full Changelog**: https://github.com/jakhon37/ADAS/commits/codex/check-project

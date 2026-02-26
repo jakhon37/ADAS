@@ -1,6 +1,5 @@
 """Tests for multi-object tracker."""
 
-import pytest
 
 from adas.core.models import BoundingBox
 from adas.tracking import MultiObjectTracker

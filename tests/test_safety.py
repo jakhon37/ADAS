@@ -1,9 +1,8 @@
 """Tests for safety monitor."""
 
-import math
 import pytest
 
-from adas.control import SafetyLimits, SafetyMonitor
+from adas.control import SafetyMonitor
 from adas.core.exceptions import SafetyViolation
 from adas.core.models import ControlCommand, MotionPlan, TrackedObject, BoundingBox
 

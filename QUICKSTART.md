@@ -5,6 +5,12 @@
 ### 1. Install Package
 
 ```bash
+# From PyPI (recommended)
+pip install adas-core
+
+# Or from source
+git clone https://github.com/jakhon37/ADAS.git
+cd ADAS
 pip install -e .
 ```
 
@@ -116,6 +122,9 @@ make clean
 ### Module Import Errors
 ```bash
 # Reinstall package
+pip install --upgrade adas-core
+
+# Or from source
 pip install -e .
 ```
 

@@ -1,6 +1,5 @@
 """Tests for behavior planner."""
 
-import pytest
 
 from adas.core.models import BoundingBox, TrackedObject
 from adas.planning import BehaviorPlanner
