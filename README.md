@@ -1,6 +1,6 @@
 # ADAS Core - Production-Grade Advanced Driver Assistance System
 
-[![CI](https://github.com/your-org/adas-core/workflows/CI/badge.svg)](https://github.com/your-org/adas-core/actions)
+[![CI](https://github.com/jakhon37/ADAS/workflows/CI/badge.svg)](https://github.com/jakhon37/ADAS/actions)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -49,8 +49,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed architecture documentation.
 
 ```bash
 # Clone repository
-git clone https://github.com/your-org/adas-core.git
-cd adas-core
+git clone https://github.com/jakhon37/ADAS.git
+cd ADAS
 
 # Install package
 pip install -e .

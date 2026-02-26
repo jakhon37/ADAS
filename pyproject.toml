@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Production-grade Advanced Driver Assistance System with ACC, LKA, tracking, and ROS2 integration"
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "ADAS Team", email = "adas@example.com" }]
+authors = [{ name = "Jakhongir Nodirov", email = "jakhon37@gmail.com" }]
 license = { text = "MIT" }
 keywords = ["adas", "autonomous-driving", "ros2", "jetson", "computer-vision", "acc", "lane-keeping"]
 classifiers = [
@@ -26,11 +26,11 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-org/adas-core"
-Documentation = "https://github.com/your-org/adas-core#readme"
-Repository = "https://github.com/your-org/adas-core"
-Issues = "https://github.com/your-org/adas-core/issues"
-Changelog = "https://github.com/your-org/adas-core/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/jakhon37/ADAS"
+Documentation = "https://github.com/jakhon37/ADAS#readme"
+Repository = "https://github.com/jakhon37/ADAS"
+Issues = "https://github.com/jakhon37/ADAS/issues"
+Changelog = "https://github.com/jakhon37/ADAS/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
