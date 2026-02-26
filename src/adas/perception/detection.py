@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from adas.types import BoundingBox
+from adas.core.models import BoundingBox
 
 
 @dataclass(slots=True)

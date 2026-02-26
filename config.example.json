@@ -1,0 +1,41 @@
+{
+  "detector": {
+    "model_path": "models/yolov8n.onnx",
+    "confidence_threshold": 0.35,
+    "iou_threshold": 0.5,
+    "max_detections": 100
+  },
+  "tracker": {
+    "max_missed_frames": 5,
+    "association_threshold_px": 120.0,
+    "focal_length_px": 35.0,
+    "min_box_height_px": 1.0,
+    "max_distance_m": 200.0
+  },
+  "planner": {
+    "cruise_speed_mps": 15.0,
+    "min_follow_distance_m": 12.0,
+    "max_steering_deg": 22.0,
+    "time_gap_s": 2.0,
+    "max_decel_mps2": 3.0,
+    "lane_center_gain": 1.0
+  },
+  "controller": {
+    "kp_speed": 0.15,
+    "max_throttle": 1.0,
+    "max_brake": 1.0,
+    "max_steering_angle_deg": 25.0,
+    "steering_deadband_deg": 0.5
+  },
+  "safety": {
+    "max_speed_mps": 33.0,
+    "max_acceleration_mps2": 3.0,
+    "max_deceleration_mps2": 8.0,
+    "max_steering_rate_rad_s": 0.5,
+    "max_steering_angle_rad": 0.52,
+    "min_following_distance_m": 2.0,
+    "max_lateral_offset_m": 1.5
+  },
+  "fps": 20,
+  "log_level": "INFO"
+}

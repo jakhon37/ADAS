@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  adas-core:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: adas-core:latest
+    container_name: adas-core
+    restart: unless-stopped
+    
+    environment:
+      - ADAS_LOG_LEVEL=INFO
+      - ADAS_CONFIG_PATH=/app/config.json
+    
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./logs:/logs
+      - ./data:/data
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 512M
+    
+    # Network configuration
+    networks:
+      - adas-network
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  adas-network:
+    driver: bridge

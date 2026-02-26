@@ -5,7 +5,7 @@ Production deployments can replace this with learned lane segmentation + spline 
 
 from __future__ import annotations
 
-from adas.types import LaneModel
+from adas.core.models import LaneModel
 
 
 class LaneEstimator:

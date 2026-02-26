@@ -1,0 +1,48 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Documentation
+*.md
+!README.md
+
+# CI/CD
+.github/
+
+# Test files
+tests/
+
+# Environment
+.env
+.venv/
+venv/
+ENV/
+
+# Logs
+*.log
+logs/
+
+# Data
+data/
+models/
+*.onnx
+*.pt
+*.pth

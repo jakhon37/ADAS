@@ -3,12 +3,12 @@ from __future__ import annotations
 import time
 
 from adas.cli import build_pipeline
+from adas.core.models import BoundingBox, PerceptionFrame, TrackedObject
 from adas.runtime import synthetic_frame
-from adas.types import BoundingBox, PerceptionFrame, TrackedObject
 
 
 def test_pipeline_synthetic_smoke() -> None:
-    pipeline = build_pipeline()
+    pipeline, fps = build_pipeline()
     frame = synthetic_frame()
     perception = PerceptionFrame(
         frame_id=1,
@@ -18,7 +18,7 @@ def test_pipeline_synthetic_smoke() -> None:
         height=frame["height"],
     )
 
-    plan, command = pipeline.step(perception)
+    plan, command = pipeline.step(perception, current_speed_mps=10.0)
 
     assert plan.target_speed_mps >= 0.0
     assert -22.0 <= plan.steering_angle_deg <= 22.0
@@ -28,7 +28,7 @@ def test_pipeline_synthetic_smoke() -> None:
 
 
 def test_planner_slows_for_close_vehicle() -> None:
-    pipeline = build_pipeline()
+    pipeline, fps = build_pipeline()
     close_obj = TrackedObject(
         track_id=1,
         box=BoundingBox(0, 0, 100, 100, 0.9, "vehicle"),
@@ -38,4 +38,4 @@ def test_planner_slows_for_close_vehicle() -> None:
 
     plan = pipeline.planner.plan(frame_width_px=1280, lane_center_px=640.0, objects=[close_obj])
     assert plan.target_speed_mps < pipeline.planner.cruise_speed_mps
-    assert "lead_vehicle" in plan.reason
+    assert "follow" in plan.reason

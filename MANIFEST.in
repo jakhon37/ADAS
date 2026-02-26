@@ -1,0 +1,38 @@
+# Include documentation
+include README.md
+include LICENSE
+include CHANGELOG.md
+include ARCHITECTURE.md
+include DEPLOYMENT.md
+include QUICKSTART.md
+
+# Include configuration examples
+include config.example.json
+
+# Include documentation directory
+recursive-include docs *.md
+
+# Exclude development files
+exclude .gitignore
+exclude Makefile
+exclude RELEASE_GUIDE.md
+exclude TRANSFORMATION_SUMMARY.md
+exclude REORGANIZATION_SUMMARY.md
+exclude PHASE3_COMPLETION.md
+
+# Exclude Docker files
+exclude Dockerfile
+exclude docker-compose.yml
+exclude .dockerignore
+
+# Exclude CI/CD
+recursive-exclude .github *
+
+# Exclude tests
+recursive-exclude tests *
+
+# Exclude build artifacts
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude *.so
+global-exclude .DS_Store

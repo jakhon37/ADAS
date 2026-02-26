@@ -5,19 +5,52 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "adas-core"
 version = "0.1.0"
-description = "Production-oriented ADAS reference pipeline for Jetson-class edge devices"
-readme = "readme.md"
+description = "Production-grade Advanced Driver Assistance System with ACC, LKA, tracking, and ROS2 integration"
+readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "ADAS Team" }]
+authors = [{ name = "ADAS Team", email = "adas@example.com" }]
+license = { text = "MIT" }
+keywords = ["adas", "autonomous-driving", "ros2", "jetson", "computer-vision", "acc", "lane-keeping"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/adas-core"
+Documentation = "https://github.com/your-org/adas-core#readme"
+Repository = "https://github.com/your-org/adas-core"
+Issues = "https://github.com/your-org/adas-core/issues"
+Changelog = "https://github.com/your-org/adas-core/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
   "ruff>=0.3",
+  "pytest-cov>=4.0",
+]
+ros2 = [
+  "rclpy>=3.0",
+]
+all = [
+  "pytest>=8.0",
+  "ruff>=0.3",
+  "pytest-cov>=4.0",
+  "rclpy>=3.0",
 ]
 
 [project.scripts]
 adas-run = "adas.cli:main"
+adas-bridge = "adas.ros2.bridge:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
