@@ -1,10 +1,12 @@
-# ADAS Core - Production-Grade Advanced Driver Assistance System
+# ADAS Core
 
 [![CI](https://github.com/jakhon37/ADAS/workflows/CI/badge.svg)](https://github.com/jakhon37/ADAS/actions)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A production-ready Advanced Driver Assistance System (ADAS) implementation designed for edge deployment on platforms like NVIDIA Jetson. This system provides adaptive cruise control, lane keeping assistance, and object tracking with comprehensive safety monitoring.
+Python pipeline for adaptive cruise, lane keeping, tracking, control, and a safety monitor, with a ROS 2 bridge.
+
+**Status:** planning, control, and the safety monitor are implemented. Perception is a mock detector and a fixed lane model — replace those before using this on a vehicle. `adas-run` exercises the stack on synthetic frames.
 
 ## 🚗 Features
 
