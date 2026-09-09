@@ -13,7 +13,7 @@ This guide covers production deployment of the ADAS (Advanced Driver Assistance 
 - **Storage**: 10GB+ available space
 
 ### Software Requirements
-- Python 3.10 or higher
+- Python 3.8 or higher (3.8 is required on JetPack 5 / this Xavier NX)
 - Docker 20.10+ (for containerized deployment)
 - Linux OS (Ubuntu 20.04+ recommended for production)
 

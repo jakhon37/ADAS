@@ -1,14 +1,24 @@
 {
   "detector": {
-    "model_path": "models/yolov8n.onnx",
+    "backend": "mock",
+    "model_path": "models/yolov5n.engine",
     "confidence_threshold": 0.35,
     "iou_threshold": 0.5,
-    "max_detections": 100
+    "max_detections": 100,
+    "input_size": 640
+  },
+  "lane": {
+    "backend": "mock",
+    "model_path": "models/ufldv2_culane_res18.engine",
+    "input_width": 1600,
+    "input_height": 320,
+    "crop_ratio": 0.6
   },
   "tracker": {
     "max_missed_frames": 5,
     "association_threshold_px": 120.0,
-    "focal_length_px": 35.0,
+    "focal_length_px": 910.0,
+    "object_height_m": 1.5,
     "min_box_height_px": 1.0,
     "max_distance_m": 200.0
   },
@@ -18,7 +28,8 @@
     "max_steering_deg": 22.0,
     "time_gap_s": 2.0,
     "max_decel_mps2": 3.0,
-    "lane_center_gain": 1.0
+    "lane_center_gain": 1.0,
+    "ego_lane_half_width_frac": 0.2
   },
   "controller": {
     "kp_speed": 0.15,
@@ -34,7 +45,14 @@
     "max_steering_rate_rad_s": 0.5,
     "max_steering_angle_rad": 0.52,
     "min_following_distance_m": 2.0,
-    "max_lateral_offset_m": 1.5
+    "max_lateral_offset_m": 1.5,
+    "plan_horizon_s": 1.0
+  },
+  "source": {
+    "type": "synthetic",
+    "uri": "",
+    "width": 1280,
+    "height": 720
   },
   "fps": 20,
   "log_level": "INFO"

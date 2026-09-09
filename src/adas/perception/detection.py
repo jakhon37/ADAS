@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from adas.core.models import BoundingBox
 
 
-@dataclass(slots=True)
+@dataclass
 class ObjectDetector:
     confidence_threshold: float = 0.35
 

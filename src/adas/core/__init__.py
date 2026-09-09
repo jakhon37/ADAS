@@ -12,9 +12,11 @@ This package contains fundamental building blocks:
 from adas.core.config import (
     ControllerConfig,
     DetectorConfig,
+    LaneConfig,
     PlannerConfig,
     RuntimeConfig,
     SafetyConfig,
+    SourceConfig,
     TrackerConfig,
     load_config,
 )
@@ -52,9 +54,11 @@ __all__ = [
     # Config
     "ControllerConfig",
     "DetectorConfig",
+    "LaneConfig",
     "PlannerConfig",
     "RuntimeConfig",
     "SafetyConfig",
+    "SourceConfig",
     "TrackerConfig",
     "load_config",
     # Exceptions

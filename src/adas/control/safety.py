@@ -15,7 +15,7 @@ from adas.core.models import ControlCommand, MotionPlan, TrackedObject
 logger = setup_logger(__name__)
 
 
-@dataclass(slots=True)
+@dataclass
 class SafetyLimits:
     """Safety limits for ADAS operation."""
     
@@ -26,6 +26,7 @@ class SafetyLimits:
     max_steering_angle_rad: float = 0.52  # ~30 degrees
     min_following_distance_m: float = 2.0  # Minimum safe distance
     max_lateral_offset_m: float = 1.5  # Lane keeping limit
+    plan_horizon_s: float = 1.0  # Horizon used to judge plan accel/decel
 
 
 class SafetyMonitor:
@@ -67,19 +68,18 @@ class SafetyMonitor:
                 f"±{self.limits.max_steering_angle_rad:.3f} rad"
             )
         
-        # Check acceleration/deceleration
+        # Judge requested speed change over a planning horizon, not one frame.
+        horizon = self.limits.plan_horizon_s if self.limits.plan_horizon_s > 1e-6 else 1.0
         speed_delta = plan.target_speed_mps - current_speed_mps
         if speed_delta > 0:
-            # Accelerating - assume 0.1s time horizon
-            accel = speed_delta / 0.1
+            accel = speed_delta / horizon
             if accel > self.limits.max_acceleration_mps2:
                 logger.warning(
                     f"High acceleration requested: {accel:.2f} m/s² "
                     f"(limit: {self.limits.max_acceleration_mps2:.2f} m/s²)"
                 )
         else:
-            # Decelerating
-            decel = abs(speed_delta) / 0.1
+            decel = abs(speed_delta) / horizon
             if decel > self.limits.max_deceleration_mps2:
                 raise SafetyViolation(
                     f"Deceleration {decel:.2f} m/s² exceeds limit "

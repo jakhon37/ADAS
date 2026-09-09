@@ -20,10 +20,17 @@ src/adas/
 │   ├── models.py                 # Domain data models
 │   └── validation.py             # Input validation utilities
 │
+├── infer/                         # TensorRT + CUDA runtime (Jetson)
+│   ├── cudart.py
+│   └── trt_engine.py
+│
 ├── perception/                    # 👁️ Perception
 │   ├── __init__.py
-│   ├── detection.py              # Object detection
-│   └── lane.py                   # Lane estimation
+│   ├── factory.py                # mock | tensorrt | ufld
+│   ├── detection.py              # Mock object detector
+│   ├── yolo.py                   # YOLOv5/v8 TensorRT detector
+│   ├── lane.py                   # Mock lane estimator
+│   └── ufld.py                   # UFLDv2 TensorRT estimator
 │
 ├── tracking/                      # 🎯 Tracking
 │   ├── __init__.py
@@ -41,7 +48,8 @@ src/adas/
 └── runtime/                       # ⚙️ Runtime
     ├── __init__.py
     ├── pipeline.py               # Pipeline orchestration
-    └── runner.py                 # Runtime execution
+    ├── runner.py                 # Runtime execution
+    └── capture.py                # synthetic | video | camera | CSI
 ```
 
 ## Module Descriptions
@@ -83,13 +91,11 @@ src/adas/
 
 **Purpose**: Sensor data processing and feature extraction.
 
-- **`detection.py`**: Object detection
-  - Mock detector (replace with TensorRT)
-  - Returns list of `BoundingBox`
-  
-- **`lane.py`**: Lane estimation
-  - Mock estimator (replace with segmentation)
-  - Returns `LaneModel`
+- **`factory.py`**: Selects mock / TensorRT YOLO / UFLD from config
+- **`detection.py`**: Mock detector (default)
+- **`yolo.py`**: TensorRT YOLOv5/v8 (lazy import)
+- **`lane.py`**: Mock lane estimator (default)
+- **`ufld.py`**: TensorRT UFLDv2 (lazy import; engine not built yet)
 
 ### 🎯 Tracking (`adas.tracking`)
 

@@ -13,7 +13,7 @@ from adas.core.validation import validate_motion_plan
 logger = setup_logger(__name__)
 
 
-@dataclass(slots=True)
+@dataclass
 class BehaviorPlanner:
     """Behavior planner for lane keeping and adaptive cruise control."""
     
@@ -25,6 +25,7 @@ class BehaviorPlanner:
     
     # Steering control gains
     lane_center_gain: float = 1.0  # Proportional gain for centering
+    ego_lane_half_width_frac: float = 0.0  # 0 disables lateral gating
     
     def __post_init__(self) -> None:
         """Validate planner configuration."""
@@ -64,8 +65,9 @@ class BehaviorPlanner:
             if frame_width_px <= 0:
                 raise ValidationError(f"Invalid frame width: {frame_width_px}")
             
+            ahead = self._objects_ahead(frame_width_px, lane_center_px, objects)
             # Longitudinal planning (speed control)
-            target_speed, speed_reason = self._plan_speed(objects)
+            target_speed, speed_reason = self._plan_speed(ahead)
             
             # Lateral planning (steering control)
             steering_deg, steer_reason = self._plan_steering(frame_width_px, lane_center_px)
@@ -94,6 +96,25 @@ class BehaviorPlanner:
         except Exception as e:
             raise PlanningError(f"Planning failed: {e}") from e
     
+    def _objects_ahead(
+        self,
+        frame_width_px: int,
+        lane_center_px: float | None,
+        objects: list[TrackedObject],
+    ) -> list[TrackedObject]:
+        """Optionally keep objects near the ego-lane center."""
+        frac = self.ego_lane_half_width_frac
+        if frac <= 0.0 or frame_width_px <= 0:
+            return objects
+        cx_ref = lane_center_px if lane_center_px is not None else frame_width_px / 2.0
+        half = frame_width_px * frac
+        gated = []
+        for obj in objects:
+            cx = (obj.box.x1 + obj.box.x2) / 2.0
+            if abs(cx - cx_ref) <= half:
+                gated.append(obj)
+        return gated
+
     def _plan_speed(self, objects: list[TrackedObject]) -> tuple[float, str]:
         """Plan target speed based on detected objects.
         

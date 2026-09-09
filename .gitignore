@@ -49,6 +49,11 @@ htmlcov/
 # Recordings
 recordings/
 
+# Jetson models (download/build locally)
+models/*.onnx
+models/*.engine
+models/*.engine.build.log
+
 # Logs
 *.log
 logs/

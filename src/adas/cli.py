@@ -7,49 +7,42 @@ import logging
 import sys
 
 from adas.control import PIDLikeLongitudinalController, SafetyLimits, SafetyMonitor
-from adas.core.config import load_config
+from adas.core.config import RuntimeConfig, load_config
 from adas.core.logger import setup_logger
-from adas.perception.detection import ObjectDetector
-from adas.perception.lane import LaneEstimator
+from adas.perception.factory import build_detector, build_lane_estimator
 from adas.planning import BehaviorPlanner
 from adas.runtime import ADASPipeline, PipelineRunner
+from adas.runtime.capture import parse_source_arg
 from adas.tracking import MultiObjectTracker
 
 logger = setup_logger(__name__)
 
 
-def build_pipeline(config_path: str | None = None) -> tuple[ADASPipeline, int]:
-    """Build ADAS pipeline from configuration.
-    
-    Args:
-        config_path: Path to configuration file (None for defaults)
-        
-    Returns:
-        Tuple of (pipeline, target_fps)
-    """
-    config = load_config(config_path)
-    
-    # Configure logging level
+def build_pipeline(
+    config_path: str | None = None,
+    config: RuntimeConfig | None = None,
+) -> tuple[ADASPipeline, RuntimeConfig]:
+    """Build ADAS pipeline from configuration."""
+    if config is None:
+        config = load_config(config_path)
+
     log_level = getattr(logging, config.log_level)
     logging.getLogger().setLevel(log_level)
-    
+
     logger.info("Building ADAS pipeline from configuration")
-    
-    # Build components from configuration
-    detector = ObjectDetector(
-        confidence_threshold=config.detector.confidence_threshold,
-    )
-    
-    lane_estimator = LaneEstimator()
-    
+
+    detector = build_detector(config.detector)
+    lane_estimator = build_lane_estimator(config.lane)
+
     tracker = MultiObjectTracker(
         max_missed=config.tracker.max_missed_frames,
         association_threshold_px=config.tracker.association_threshold_px,
         focal_length_px=config.tracker.focal_length_px,
+        object_height_m=config.tracker.object_height_m,
         min_box_height_px=config.tracker.min_box_height_px,
         max_distance_m=config.tracker.max_distance_m,
     )
-    
+
     planner = BehaviorPlanner(
         cruise_speed_mps=config.planner.cruise_speed_mps,
         min_follow_distance_m=config.planner.min_follow_distance_m,
@@ -57,8 +50,9 @@ def build_pipeline(config_path: str | None = None) -> tuple[ADASPipeline, int]:
         time_gap_s=config.planner.time_gap_s,
         max_decel_mps2=config.planner.max_decel_mps2,
         lane_center_gain=config.planner.lane_center_gain,
+        ego_lane_half_width_frac=config.planner.ego_lane_half_width_frac,
     )
-    
+
     controller = PIDLikeLongitudinalController(
         kp_speed=config.controller.kp_speed,
         max_throttle=config.controller.max_throttle,
@@ -66,8 +60,7 @@ def build_pipeline(config_path: str | None = None) -> tuple[ADASPipeline, int]:
         max_steering_angle_deg=config.controller.max_steering_angle_deg,
         steering_deadband_deg=config.controller.steering_deadband_deg,
     )
-    
-    # Build safety monitor from config
+
     safety_limits = SafetyLimits(
         max_speed_mps=config.safety.max_speed_mps,
         max_acceleration_mps2=config.safety.max_acceleration_mps2,
@@ -76,10 +69,10 @@ def build_pipeline(config_path: str | None = None) -> tuple[ADASPipeline, int]:
         max_steering_angle_rad=config.safety.max_steering_angle_rad,
         min_following_distance_m=config.safety.min_following_distance_m,
         max_lateral_offset_m=config.safety.max_lateral_offset_m,
+        plan_horizon_s=config.safety.plan_horizon_s,
     )
     safety_monitor = SafetyMonitor(limits=safety_limits)
-    
-    # Build pipeline
+
     pipeline = ADASPipeline(
         detector=detector,
         lane_estimator=lane_estimator,
@@ -88,9 +81,9 @@ def build_pipeline(config_path: str | None = None) -> tuple[ADASPipeline, int]:
         controller=controller,
         safety_monitor=safety_monitor,
     )
-    
+
     logger.info("Pipeline built successfully")
-    return pipeline, config.fps
+    return pipeline, config
 
 
 def main() -> None:
@@ -99,49 +92,73 @@ def main() -> None:
         description="ADAS Core - Advanced Driver Assistance System",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument("--config", type=str, default=None, help="Path to JSON configuration file")
     parser.add_argument(
-        "--config", 
-        type=str, 
-        default=None, 
-        help="Path to JSON configuration file"
+        "--source",
+        type=str,
+        default=None,
+        help="synthetic (default), video path, camera, csi, or camera:N",
     )
     parser.add_argument(
-        "--synthetic", 
-        action="store_true", 
-        help="Run synthetic test (default mode)"
+        "--detector",
+        type=str,
+        choices=["mock", "tensorrt"],
+        default=None,
+        help="Override detector backend",
     )
     parser.add_argument(
-        "--frames", 
-        type=int, 
-        default=60, 
-        help="Number of frames to process in synthetic mode"
+        "--lane",
+        type=str,
+        choices=["mock", "ufld"],
+        default=None,
+        help="Override lane backend",
     )
+    parser.add_argument("--synthetic", action="store_true", help="Run synthetic test (default mode)")
+    parser.add_argument("--frames", type=int, default=60, help="Number of frames to process")
     parser.add_argument(
         "--log-level",
         type=str,
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         default=None,
-        help="Override log level from config"
+        help="Override log level from config",
     )
-    
+
     args = parser.parse_args()
-    
+
     try:
-        # Build pipeline
-        pipeline, fps = build_pipeline(args.config)
-        
-        # Override log level if specified
+        config = load_config(args.config)
+        if args.detector:
+            config.detector.backend = args.detector
+        if args.lane:
+            config.lane.backend = args.lane
+        if args.source:
+            source_type, uri = parse_source_arg(args.source)
+            config.source.type = source_type
+            config.source.uri = uri
+        elif args.synthetic:
+            config.source.type = "synthetic"
+
         if args.log_level:
-            log_level = getattr(logging, args.log_level)
-            logging.getLogger().setLevel(log_level)
-        
-        # Run synthetic test
-        logger.info(f"Starting ADAS system (FPS={fps})")
-        runner = PipelineRunner(pipeline, target_fps=float(fps))
-        runner.run_synthetic(max_frames=args.frames)
-        
+            config.log_level = args.log_level
+
+        pipeline, config = build_pipeline(config=config)
+
+        if args.log_level:
+            logging.getLogger().setLevel(getattr(logging, args.log_level))
+
+        needs_image = config.detector.backend != "mock" or config.lane.backend != "mock"
+        logger.info("Starting ADAS system (FPS=%s, source=%s)", config.fps, config.source.type)
+        runner = PipelineRunner(pipeline, target_fps=float(config.fps))
+        runner.run(
+            source_type=config.source.type,
+            uri=config.source.uri,
+            max_frames=args.frames,
+            width=config.source.width,
+            height=config.source.height,
+            as_image=needs_image,
+        )
         logger.info("ADAS system shutdown complete")
-        
+
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
         sys.exit(0)

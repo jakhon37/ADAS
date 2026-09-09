@@ -13,7 +13,7 @@ from adas.core.validation import validate_control_command, validate_motion_plan
 logger = setup_logger(__name__)
 
 
-@dataclass(slots=True)
+@dataclass
 class PIDLikeLongitudinalController:
     """Proportional controller for speed and steering commands.
     

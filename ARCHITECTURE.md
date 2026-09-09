@@ -63,16 +63,16 @@ ADAS Core is a production-grade Advanced Driver Assistance System implemented in
 
 ### 1. Perception Layer (`src/adas/perception/`)
 
-#### Object Detector (`detection.py`)
+#### Object Detector (`detection.py`, `yolo.py`)
 - **Purpose**: Detect vehicles and obstacles in camera frames
-- **Current**: Mock detector with fixed geometry
-- **Production**: Replace with TensorRT-optimized YOLO/SSD model
+- **Backends**: `mock` (default) or `tensorrt` (`YoloTensorRTDetector`, YOLOv5/v8)
+- **Jetson**: `models/yolov5n.engine` (TensorRT 8.5 FP16) — see `docs/JETSON.md`
 - **Output**: List of `BoundingBox` with confidence scores
 
-#### Lane Estimator (`lane.py`)
+#### Lane Estimator (`lane.py`, `ufld.py`)
 - **Purpose**: Estimate lane boundaries and center
-- **Current**: Fixed lane geometry
-- **Production**: Replace with learned segmentation + polynomial fitting
+- **Backends**: `mock` (default, fixed 36%/64% geometry) or `ufld` (UFLDv2 TensorRT)
+- **Jetson**: UFLD engine **not built yet**
 - **Output**: `LaneModel` with lane coefficients and center
 
 ### 2. Tracking Layer (`src/adas/tracking.py`)
@@ -82,7 +82,8 @@ ADAS Core is a production-grade Advanced Driver Assistance System implemented in
 - **Features**:
   - Persistent track IDs across frames
   - Track creation, association, and deletion
-  - Distance estimation from bounding box height
+  - Pinhole range: `(object_height_m * focal_length_px) / box_height`
+  - Range-rate velocity from consecutive distances
 - **Optimizations**:
   - Uses `math.hypot()` for efficient distance calculation
   - Configurable association threshold

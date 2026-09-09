@@ -43,14 +43,12 @@ def validate_lane_model(lane: LaneModel) -> None:
     Raises:
         ValidationError: If lane parameters are invalid
     """
-    if not math.isfinite(lane.lateral_offset_m):
-        raise ValidationError(f"Invalid lateral offset: {lane.lateral_offset_m}")
-    
-    if not math.isfinite(lane.heading_error_rad):
-        raise ValidationError(f"Invalid heading error: {lane.heading_error_rad}")
-    
-    if abs(lane.heading_error_rad) > math.pi:
-        raise ValidationError(f"Heading error too large: {lane.heading_error_rad} rad")
+    if not math.isfinite(lane.lane_center_px):
+        raise ValidationError(f"Invalid lane center: {lane.lane_center_px}")
+    if not math.isfinite(lane.curvature_m):
+        raise ValidationError(f"Invalid curvature: {lane.curvature_m}")
+    if len(lane.left_coeffs) != 3 or len(lane.right_coeffs) != 3:
+        raise ValidationError("Lane coefficients must be quadratic (3 terms)")
 
 
 def validate_motion_plan(plan: MotionPlan) -> None:

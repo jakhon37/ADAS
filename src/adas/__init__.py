@@ -9,7 +9,7 @@ This package provides a modular ADAS implementation with:
 - Runtime (pipeline orchestration)
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # Re-export commonly used components for convenience
 from adas.core import (

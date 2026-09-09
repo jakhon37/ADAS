@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, List
 
 
-@dataclass(slots=True)
+@dataclass
 class BoundingBox:
     x1: float
     y1: float
@@ -16,7 +16,7 @@ class BoundingBox:
     label: str
 
 
-@dataclass(slots=True)
+@dataclass
 class LaneModel:
     left_coeffs: tuple[float, float, float]
     right_coeffs: tuple[float, float, float]
@@ -24,7 +24,7 @@ class LaneModel:
     curvature_m: float
 
 
-@dataclass(slots=True)
+@dataclass
 class TrackedObject:
     track_id: int
     box: BoundingBox
@@ -32,7 +32,7 @@ class TrackedObject:
     distance_m: float
 
 
-@dataclass(slots=True)
+@dataclass
 class PerceptionFrame:
     frame_id: int
     timestamp_s: float
@@ -43,14 +43,14 @@ class PerceptionFrame:
     lane: LaneModel | None = None
 
 
-@dataclass(slots=True)
+@dataclass
 class MotionPlan:
     target_speed_mps: float
     steering_angle_deg: float
     reason: str
 
 
-@dataclass(slots=True)
+@dataclass
 class ControlCommand:
     throttle: float
     brake: float

@@ -1,31 +1,37 @@
 # ADAS Core - Quick Start Guide
 
-## 🚀 Get Started in 5 Minutes
+On the Xavier NX in this workspace, skip PyPI/`pip install` and use `PYTHONPATH`. Full board notes: [docs/JETSON.md](docs/JETSON.md).
+
+```bash
+cd /home/nvidia/myspace/ADAS
+PYTHONPATH=src python3 -m pytest tests/ -v --tb=short
+PYTHONPATH=src python3 -m adas.cli --frames 10
+# TensorRT YOLO (needs models/yolov5n.engine)
+PYTHONPATH=src python3 -m adas.cli --detector tensorrt \
+  --source Ultra-Fast-Lane-Detection-v2/example.mp4 --frames 60
+```
+
+Expected mock synthetic line (lead vehicle ~10.5 m, not emergency brake):
+
+```
+plan=follow_close_10.5m|lane_center_err_0.00, cmd=t0.47/b0.00/s0.00
+```
+
+## 🚀 Other machines
 
 ### 1. Install Package
 
 ```bash
-# From PyPI (recommended)
-pip install adas-core
-
-# Or from source
-git clone https://github.com/jakhon37/ADAS.git
+# From source
+git clone --recurse-submodules https://github.com/jakhon37/ADAS.git
 cd ADAS
-pip install -e .
+pip install -e ".[dev]"
 ```
 
 ### 2. Run Synthetic Test
 
 ```bash
 adas-run --frames 60
-```
-
-Expected output:
-```
-2026-02-26 09:14:24 - adas.logger - INFO - Using default configuration
-2026-02-26 09:14:24 - adas.logger - INFO - Building ADAS pipeline from configuration
-...
-2026-02-26 09:14:24 - adas.pipeline - INFO - Frame 0: detections=2, tracks=2, lane=✓, plan=...
 ```
 
 ### 3. Customize Configuration
@@ -130,7 +136,7 @@ pip install -e .
 
 ### Tests Failing
 ```bash
-# Check Python version (need 3.10+)
+# Check Python version (need 3.8+)
 python3 --version
 
 # Install test dependencies

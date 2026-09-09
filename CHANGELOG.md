@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.2.0] - 2026-09-09
+
+### Jetson-native Python 3.8 runtime
+
+ADAS now runs as a single process on JetPack 5 (Python 3.8 + TensorRT 8.5) instead of requiring 3.10+.
+
+- Dropped `@dataclass(slots=True)` so the package imports on CPython 3.8
+- `requires-python = ">=3.8"`
+- Pinhole range: `distance = (object_height_m * focal_length_px) / box_height` (defaults 1.5 m, 910 px)
+- Track range-rate velocity
+- Swappable perception: `mock` (default) | `tensorrt` YOLO | `ufld` lanes
+- Video / CSI / OpenCV camera sources (`--source`)
+- Safety plan accel/decel judged over a 1 s horizon
+- `scripts/build_yolo_engine.py` waits for free RAM/GPU before `trtexec`
+- Verified on Xavier NX: YOLOv5n FP16 engine, ~45 ms/frame end-to-end on `example.mp4`
+
+### Notes
+
+TensorRT backends stay lazy-imported. Mock tests do not load CUDA. Build engines only when the board is idle (DMS replay holds ~0.8 GB + GPU). Pickup doc: `docs/JETSON.md`.
+
+---
+
 ## [0.1.0] - 2026-02-26
 
 ### Major Refactoring: Production-Ready ADAS Core

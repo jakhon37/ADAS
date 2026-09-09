@@ -75,19 +75,26 @@ def test_tracker_deletes_lost_tracks():
 
 
 def test_tracker_distance_estimation():
-    """Test distance estimation from box height."""
-    tracker = MultiObjectTracker(focal_length_px=35.0)
-    
-    # Larger box = closer object
+    """Pinhole range: distance = (object_height * focal) / box_height."""
+    tracker = MultiObjectTracker(focal_length_px=900.0, object_height_m=1.5)
+
     detections = [
         BoundingBox(x1=100, y1=100, x2=200, y2=235, confidence=0.9, label="car")  # height=135
     ]
-    
     tracked = tracker.update(detections)
-    
-    # distance = 35 / 135 ≈ 0.26m (very close for testing)
-    assert tracked[0].distance_m > 0
-    assert tracked[0].distance_m < 1.0
+
+    # 1.5 * 900 / 135 = 10.0 m
+    assert abs(tracked[0].distance_m - 10.0) < 0.05
+
+
+def test_tracker_velocity_from_range_rate():
+    tracker = MultiObjectTracker(focal_length_px=900.0, object_height_m=1.5)
+    far = BoundingBox(x1=100, y1=100, x2=200, y2=200, confidence=0.9, label="car")  # h=100 → 13.5m
+    close = BoundingBox(x1=90, y1=80, x2=210, y2=230, confidence=0.9, label="car")  # h=150 → 9.0m
+    tracker.update([far], dt_s=0.1)
+    tracked = tracker.update([close], dt_s=0.1)
+    # closing: (13.5 - 9.0) / 0.1 = 45 m/s
+    assert tracked[0].velocity_mps > 0.0
 
 
 def test_tracker_reset():

@@ -8,7 +8,7 @@ from adas.runtime import synthetic_frame
 
 
 def test_pipeline_synthetic_smoke() -> None:
-    pipeline, fps = build_pipeline()
+    pipeline, _config = build_pipeline()
     frame = synthetic_frame()
     perception = PerceptionFrame(
         frame_id=1,
@@ -20,7 +20,7 @@ def test_pipeline_synthetic_smoke() -> None:
 
     plan, command = pipeline.step(perception, current_speed_mps=10.0)
 
-    assert plan.target_speed_mps >= 0.0
+    assert plan.target_speed_mps >= 5.0  # mock lead car is ~10m, not 0.3m
     assert -22.0 <= plan.steering_angle_deg <= 22.0
     assert 0.0 <= command.throttle <= 1.0
     assert 0.0 <= command.brake <= 1.0
@@ -28,7 +28,7 @@ def test_pipeline_synthetic_smoke() -> None:
 
 
 def test_planner_slows_for_close_vehicle() -> None:
-    pipeline, fps = build_pipeline()
+    pipeline, _config = build_pipeline()
     close_obj = TrackedObject(
         track_id=1,
         box=BoundingBox(0, 0, 100, 100, 0.9, "vehicle"),

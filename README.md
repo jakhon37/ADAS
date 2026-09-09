@@ -1,12 +1,14 @@
 # ADAS Core
 
 [![CI](https://github.com/jakhon37/ADAS/workflows/CI/badge.svg)](https://github.com/jakhon37/ADAS/actions)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 Python pipeline for adaptive cruise, lane keeping, tracking, control, and a safety monitor, with a ROS 2 bridge.
 
-**Status:** planning, control, and the safety monitor are implemented. Perception is a mock detector and a fixed lane model — replace those before using this on a vehicle. `adas-run` exercises the stack on synthetic frames.
+**Status (v0.2.0):** planning, control, tracking, and the safety monitor run natively on Python 3.8. Perception defaults to mock. On this Xavier NX, `--detector tensorrt` uses `models/yolov5n.engine` (~22 FPS on a 1280×720 clip). Lane estimation is still mock (`--lane ufld` needs an engine that is not built yet).
+
+**Paused 2026-09-09.** Pickup notes, hardware, and next work: [docs/JETSON.md](docs/JETSON.md).
 
 ## 🚗 Features
 
@@ -47,29 +49,34 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed architecture documentation.
 
 ## 📦 Installation
 
-### From PyPI (Recommended)
+### This Jetson (Xavier NX, JetPack 5, Python 3.8)
+
+`python3-venv` is not installed. Use the system interpreter and `PYTHONPATH`:
 
 ```bash
-# Install latest version
-pip install adas-core
-
-# Run synthetic test
-adas-run --frames 60
+cd /home/nvidia/myspace/ADAS
+PYTHONPATH=src python3 -m pytest tests/ -v --tb=short
+PYTHONPATH=src python3 -m adas.cli --frames 10
+PYTHONPATH=src python3 -m adas.cli \
+  --detector tensorrt \
+  --source Ultra-Fast-Lane-Detection-v2/example.mp4 \
+  --frames 200
 ```
 
-### From Source
+See [docs/JETSON.md](docs/JETSON.md) and [QUICKSTART.md](QUICKSTART.md).
+
+### From Source (editable install)
 
 ```bash
-# Clone repository
-git clone https://github.com/jakhon37/ADAS.git
+git clone --recurse-submodules https://github.com/jakhon37/ADAS.git
 cd ADAS
-
-# Install in editable mode
-pip install -e .
-
-# Run synthetic test
+pip install -e ".[dev]"   # needs Python 3.8+ and a working pip
 adas-run --frames 60
 ```
+
+### From PyPI
+
+The published `adas-core` package (if used) may lag this branch. Prefer a source checkout on the Jetson.
 
 ### Docker Deployment
 
@@ -110,7 +117,7 @@ from adas.cli import build_pipeline
 import time
 
 # Build pipeline
-pipeline, fps = build_pipeline()
+pipeline, config = build_pipeline()
 
 # Process frame
 frame = PerceptionFrame(
@@ -165,15 +172,9 @@ pytest --cov=src/adas tests/
 
 ## 📊 Performance
 
-**Current (Mock Implementations):**
-- Latency: <1ms per frame
-- Throughput: 1000+ FPS
-- Memory: <100MB
+**Mock (CPU):** <2 ms/frame, 1000+ FPS, <100 MB.
 
-**Production (TensorRT on Jetson Xavier):**
-- Latency: 30-50ms per frame
-- Throughput: 20-30 FPS
-- Memory: 500MB-2GB
+**TensorRT YOLOv5n on this Xavier NX (measured 2026-09-09):** ~45 ms/frame (~22 FPS) end-to-end; engine GPU compute ~7.3 ms. Peak process memory is well under 1 GB if DMS is not also running.
 
 ## 🛡️ Safety
 
@@ -222,12 +223,15 @@ make clean
 
 ## 📚 Documentation
 
+- [docs/JETSON.md](docs/JETSON.md) — **read this first on this board** (status, run commands, next work)
 - [ARCHITECTURE.md](ARCHITECTURE.md) - System architecture and design
-- [DEPLOYMENT.md](DEPLOYMENT.md) - Production deployment guide
-- [PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md) - Package organization guide
-- [ROS2_INTEGRATION.md](docs/ROS2_INTEGRATION.md) - ROS2 integration guide
-- [TOOLS_GUIDE.md](docs/TOOLS_GUIDE.md) - Debugging and replay tools
+- [QUICKSTART.md](QUICKSTART.md) - Commands
+- [DEPLOYMENT.md](DEPLOYMENT.md) - Deployment notes (Docker image is CPU-only)
+- [PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md) - Package layout
+- [ROS2_INTEGRATION.md](docs/ROS2_INTEGRATION.md) - ROS2 bridge (Humble in Docker here)
+- [TOOLS_GUIDE.md](docs/TOOLS_GUIDE.md) - Record/replay
 - [config.example.json](config.example.json) - Configuration template
+- [models/README.md](models/README.md) - Local engines (gitignored)
 
 ## 🤝 Contributing
 
@@ -262,6 +266,6 @@ For issues and questions:
 
 ---
 
-**Status**: Production-ready reference implementation  
-**Version**: 0.1.0  
-**Last Updated**: 2026-02-26
+**Status**: Reference implementation; perception is mock unless TensorRT engines are present  
+**Version**: 0.2.0  
+**Last Updated**: 2026-09-09
