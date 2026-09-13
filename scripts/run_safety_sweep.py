@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""Run the longitudinal safety envelope sweep and report the failure REGIONS.
+
+The sweep and its physics live in :mod:`tests.scenarios.sweep`; this is the
+command line around them.  Nothing here needs a GPU, TensorRT, a camera or the
+network, and the whole run is deterministic: the same arguments produce the same
+bytes.
+
+Examples::
+
+    # CI resolution, a few seconds, non-zero exit on any collision or phantom
+    python3 scripts/run_safety_sweep.py --profile fast \\
+        --fail-on COLLISION,MISSED,PHANTOM
+
+    # the default envelope, ~90 s, full report and a machine-readable dump
+    python3 scripts/run_safety_sweep.py --json /tmp/sweep.json
+
+    # hunt a boundary by hand at whatever resolution you like
+    python3 scripts/run_safety_sweep.py --ego 15 \\
+        --range 18,20,22,24,26,28,30,32 --rate 0 --lead-decel 0
+
+Read the output from the bottom up: the REGIONS section is the useful part.  A
+count tells you how bad it is; a region tells you what is wrong.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+from typing import List, Optional, Sequence
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _path in (os.path.join(_REPO_ROOT, "src"), _REPO_ROOT):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
+from tests.scenarios.plant import DEFAULT_PLANT  # noqa: E402
+from tests.scenarios.sweep import (  # noqa: E402
+    PROFILES,
+    SweepGrid,
+    SweepSpec,
+    Verdict,
+    region_boundaries,
+    render_grids,
+    run_sweep,
+    summarise,
+)
+
+
+def _floats(text: str) -> tuple:
+    """``"5, 10,15"`` -> ``(5.0, 10.0, 15.0)``."""
+    return tuple(float(part) for part in text.replace(" ", "").split(",") if part)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Command line."""
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--profile",
+        default="standard",
+        choices=sorted(PROFILES),
+        help="grid resolution (default: standard)",
+    )
+    axes = parser.add_argument_group(
+        "custom axes",
+        "Any axis given here overrides the profile's. Comma-separated floats.",
+    )
+    axes.add_argument("--ego", type=_floats, help="ego speeds, m/s")
+    axes.add_argument("--range", dest="ranges", type=_floats, help="initial ranges, m")
+    axes.add_argument("--rate", dest="rates", type=_floats, help="initial closing rates, m/s (negative closes)")
+    axes.add_argument("--lead-decel", dest="decels", type=_floats, help="lead decelerations, m/s^2")
+
+    spec = parser.add_argument_group("specification", "Physics and requirement constants.")
+    spec.add_argument("--dt", type=float, default=None, help="frame interval, s (default 0.05)")
+    spec.add_argument("--horizon", type=float, default=None, help="arbitration episode length, s")
+    spec.add_argument("--reaction", type=float, default=None, help="system reaction latency, s")
+    spec.add_argument("--comfort-decel", type=float, default=None, help="comfort deceleration, m/s^2")
+
+    out = parser.add_argument_group("output")
+    out.add_argument("--json", dest="json_path", help="write the full result set here")
+    out.add_argument("--no-grid", action="store_true", help="skip the ASCII grids")
+    out.add_argument("--no-cells", action="store_true", help="skip the per-cell failure listing")
+    out.add_argument("--max-cells-listed", type=int, default=40, help="cap the failure listing")
+    out.add_argument("--no-instrument", action="store_true", help="do not capture the arbiter's own demand")
+    out.add_argument("--quiet", action="store_true", help="no progress line")
+    out.add_argument(
+        "--verbose-arbiter",
+        action="store_true",
+        help="let the arbiter's own WARNING logging through. Off by default: the "
+        "sweep provokes tens of thousands of interventions on purpose and the log "
+        "would bury the report.",
+    )
+    out.add_argument(
+        "--fail-on",
+        default="",
+        help="comma-separated verdicts that make this exit non-zero, "
+        "e.g. COLLISION,MISSED,PHANTOM. Empty means always exit 0.",
+    )
+    return parser
+
+
+def _grid_from_args(args: argparse.Namespace) -> SweepGrid:
+    """Profile, with any explicitly given axis substituted in."""
+    base = PROFILES[args.profile]
+    return SweepGrid(
+        name=base.name if not any((args.ego, args.ranges, args.rates, args.decels)) else "custom",
+        ego_speeds_mps=args.ego or base.ego_speeds_mps,
+        ranges_m=args.ranges or base.ranges_m,
+        relative_rates_mps=args.rates or base.relative_rates_mps,
+        lead_decels_mps2=args.decels or base.lead_decels_mps2,
+        horizon_s=args.horizon if args.horizon is not None else base.horizon_s,
+    )
+
+
+def _spec_from_args(args: argparse.Namespace) -> SweepSpec:
+    """Defaults, with any overridden constant substituted in."""
+    fields = {}
+    if args.dt is not None:
+        fields["dt_s"] = args.dt
+    if args.horizon is not None:
+        fields["horizon_s"] = args.horizon
+    if args.reaction is not None:
+        fields["reaction_s"] = args.reaction
+    if args.comfort_decel is not None:
+        fields["comfort_decel_mps2"] = args.comfort_decel
+    return SweepSpec(**fields)
+
+
+def _progress(total: int):
+    """Single rewritten progress line on a tty, nothing on a pipe."""
+    if not sys.stderr.isatty():
+        return None
+
+    def tick(done: int, _total: int) -> None:
+        sys.stderr.write("\r  sweeping %d/%d cells" % (done, total))
+        if done == total:
+            sys.stderr.write("\n")
+        sys.stderr.flush()
+
+    return tick
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Entry point.  Returns the process exit status."""
+    args = build_parser().parse_args(argv)
+    if not args.verbose_arbiter:
+        logging.disable(logging.WARNING)
+    grid = _grid_from_args(args)
+    spec = _spec_from_args(args)
+    cells = grid.cells()
+
+    print("=" * 78)
+    print("LONGITUDINAL SAFETY ENVELOPE SWEEP")
+    print("=" * 78)
+    print("profile            : %s" % grid.name)
+    print("ego speeds   (m/s) : %s" % ", ".join("%g" % v for v in sorted(grid.ego_speeds_mps)))
+    print("ranges         (m) : %s" % ", ".join("%g" % v for v in sorted(grid.ranges_m)))
+    print("closing rates(m/s) : %s" % ", ".join("%+g" % v for v in sorted(grid.relative_rates_mps)))
+    print("lead decel (m/s^2) : %s" % ", ".join("%g" % v for v in sorted(grid.lead_decels_mps2)))
+    print("cells              : %d" % len(cells))
+    horizon = grid.horizon_s if grid.horizon_s is not None else spec.horizon_s
+    print(
+        "spec               : clearance %.1f m, comfort %.1f m/s^2, emergency %.1f "
+        "m/s^2, authority %.1f m/s^2, headway reaction %.2f s"
+        % (
+            spec.standstill_gap_m,
+            spec.comfort_decel_mps2,
+            spec.emergency_decel_mps2,
+            spec.brake_authority_mps2,
+            spec.reaction_s,
+        )
+    )
+    print(
+        "episode            : dt %.3f s, arbitration horizon %.1f s, oracle horizon %.0f s"
+        % (spec.dt_s, horizon, spec.oracle_horizon_s)
+    )
+    print(
+        "incoming command   : throttle 0.40, brake 0.00 -- every brake below is the "
+        "arbiter's own"
+    )
+    print(
+        "plant / oracle     : tests.scenarios.plant (brake rise %.2f s) and "
+        "tests.scenarios.oracle, shared with the scenario suite"
+        % DEFAULT_PLANT.brake_rise_time_s
+    )
+    print()
+
+    results = run_sweep(
+        grid,
+        spec=spec,
+        use_instrument=not args.no_instrument,
+        progress=None if args.quiet else _progress(len(cells)),
+    )
+    report = summarise(results, grid, spec)
+
+    print("-" * 78)
+    print("COUNTS")
+    print("-" * 78)
+    total_graded = report["cells_graded"]
+    for verdict in Verdict.ORDER:
+        n = report["counts"].get(verdict, 0)
+        if not n:
+            continue
+        share = (100.0 * n / total_graded) if (total_graded and verdict != Verdict.INFEASIBLE) else 0.0
+        suffix = "" if verdict == Verdict.INFEASIBLE else "  (%.1f%% of graded)" % share
+        print("  %-10s %4d%s" % (verdict, n, suffix))
+    print("  %-10s %4d" % ("FAILURES", report["failures"]))
+    print("  headway (soft response, graded separately): %s" % report["headway_counts"])
+    if report["unwarranted_on_inferred_rate"]:
+        print(
+            "  of the PHANTOM and EARLY cells, %d fired on a frame where the closing "
+            "rate was still the seeded prior, not a measurement"
+            % report["unwarranted_on_inferred_rate"]
+        )
+
+    if not args.no_grid:
+        print()
+        print("-" * 78)
+        print("GRIDS -- failure REGIONS are contiguous blocks of one letter")
+        print("-" * 78)
+        print(render_grids(results, grid))
+
+    print()
+    print("-" * 78)
+    print("REGIONS -- the boundary of each failure region")
+    print("-" * 78)
+    regions = report["regions"]
+    if not regions:
+        print("  none")
+    for verdict in Verdict.FAILURES:
+        rows = regions.get(verdict) or []
+        if not rows:
+            continue
+        print()
+        print("  %s (%d slices)" % (verdict, len(rows)))
+        for row in rows:
+            print("    " + row["statement"])
+
+    if not args.no_cells:
+        failing = [r for r in results if r.verdict in Verdict.FAILURES]
+        print()
+        print("-" * 78)
+        print("FAILING CELLS (%d; showing up to %d)" % (len(failing), args.max_cells_listed))
+        print("-" * 78)
+        for res in failing[: args.max_cells_listed]:
+            oracle = "warrant=%s mandate=%s lost=%s" % (
+                res.warrant_frame,
+                res.mandate_frame,
+                res.lost_frame,
+            )
+            print(
+                "  %-10s %s | %s | hard=%s soft=%s max_cmd_decel=%.2f max_demand=%.2f"
+                % (
+                    res.verdict,
+                    res.cell.label(),
+                    oracle,
+                    res.hard_frame,
+                    res.soft_frame,
+                    res.max_decel_open_mps2,
+                    res.max_demand_open_mps2,
+                )
+            )
+            detail: List[str] = []
+            if res.collided:
+                detail.append("closed loop min gap %.2f m" % res.min_gap_m)
+            if res.first_hard_state:
+                detail.append("first hard state %s" % res.first_hard_state)
+            if res.hard_with_inferred_rate:
+                detail.append("rate was INFERRED, not measured")
+            if res.first_hard_findings:
+                detail.append("findings " + ",".join(res.first_hard_findings)[:90])
+            for note in res.notes:
+                detail.append(note)
+            if detail:
+                print("             " + "; ".join(detail))
+
+    if args.json_path:
+        payload = {
+            "summary": report,
+            "grid": {
+                "name": grid.name,
+                "ego_speeds_mps": list(grid.ego_speeds_mps),
+                "ranges_m": list(grid.ranges_m),
+                "relative_rates_mps": list(grid.relative_rates_mps),
+                "lead_decels_mps2": list(grid.lead_decels_mps2),
+                "horizon_s": grid.horizon_s,
+            },
+            "cells": [r.to_dict() for r in results],
+        }
+        with open(args.json_path, "w") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+        print()
+        print("wrote %s" % args.json_path)
+
+    fail_on = {v.strip().upper() for v in args.fail_on.split(",") if v.strip()}
+    if fail_on:
+        hit = sorted(v for v in fail_on if report["counts"].get(v, 0))
+        if hit:
+            print()
+            print("FAIL: %s" % ", ".join("%s=%d" % (v, report["counts"][v]) for v in hit))
+            return 1
+        print()
+        print("OK: none of %s occurred" % ", ".join(sorted(fail_on)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
