@@ -21,6 +21,34 @@ in the history of this module:
 
 * **Recovery.**  Once the hazard is over, the system must return to NOMINAL
   within a bounded number of frames.
+
+And four that the first version of this file left entirely unmeasured, each of
+which let a real, measured defect through:
+
+* **Bounded jerk.**  The demanded deceleration may not change faster than an
+  occupant can brace for.  The shipped library measured 156.7 m/s^3 across a
+  single 50 ms frame and nothing failed.
+* **Never both pedals.**  Throttle and brake are never commanded together.  The
+  plant used to net them into ``2.5*throttle - 8.0*brake`` and the conflict
+  vanished into the arithmetic.
+* **The system's own findings count.**  ``ArbitrationResult.violations`` was
+  recorded, printed, and asserted on by nothing, so the arbiter could report
+  ``jerk_32.2_above_15.0`` about its own command and pass.  A self-report that
+  is a statement about the system's OWN output, or about the motion the system
+  actually produced, is now a finding here too -- see
+  :data:`ASSERTABLE_SELF_REPORTS`.
+* **The sub-emergency band.**  The phantom test asked for
+  ``commanded >= 3.5 m/s^2 or state is MRM``, so any unjustified braking below
+  AEB grade was invisible.  Proportionality is now policed over the whole range
+  of the brake: see :data:`oracle.HEADWAY_DECEL_ALLOWANCE_MPS2`.
+
+Finally, the stack is DEGRADABLE.  The arbiter's entire design rationale is that
+it is an independent backstop, and that claim is untestable while every run
+executes planner, controller and arbiter together and only ever actuates the
+arbiter's answer.  :class:`StackSpec` lets a scenario blind the planner, jam the
+controller, or strip the arbiter of its authority, so that "the arbiter alone
+can stop this vehicle" and "the primary path alone can stop this vehicle" are
+two separate, separately falsifiable claims.
 """
 
 from __future__ import annotations
@@ -33,6 +61,7 @@ from adas.core.models import (
     ArbitrationResult,
     ControlCommand,
     EgoState,
+    MotionPlan,
     PerceptionStatus,
     SafetyState,
 )
@@ -54,6 +83,8 @@ from tests.scenarios.plant import (
     RoadSpec,
     Sensor,
     WorldState,
+    lead_constant_speed,
+    lead_stationary,
     straight_road,
 )
 
@@ -78,15 +109,221 @@ A stopped vehicle holding its brake is not intervening in anything, so those
 frames are exempt from the phantom and justification tests.
 """
 
+PEDAL_CONFLICT_EPS = 0.01
+"""Smallest simultaneous throttle and brake demand that counts as a conflict.
+
+One per cent of pedal travel is below the resolution of any real actuator and
+below the quantisation of a CAN torque request, so anything smaller is
+arithmetic noise rather than a command.  Anything larger is the system asking
+the vehicle to accelerate and to decelerate at the same time, and there is no
+manoeuvre for which that is the answer: whichever pedal wins, the other one was
+wrong, and on a real vehicle the pair is a brake-drag fault that overheats the
+discs and desensitises the driver's own pedal.
+"""
+
+ASSERTABLE_SELF_REPORTS = (
+    "command_throttle_brake_conflict",
+    "command_not_finite",
+    "command_throttle_out_of_range",
+    "command_brake_out_of_range",
+    "command_steering_out_of_range",
+    "plan_target_speed_invalid",
+    "plan_steering_invalid",
+    "decision_path_exception",
+    "jerk_",
+    "measured_accel_",
+    "measured_decel_",
+)
+"""Prefixes of ``ArbitrationResult.violations`` that this harness asserts on.
+
+The rule that decides membership, stated once so that the list can be extended
+without re-arguing it:
+
+    A self-report is ASSERTABLE when it is a statement about the system's own
+    OUTPUT, or about the system's own PROPRIOCEPTION -- the vehicle's motion as
+    the vehicle bus reports it.  It is NOT assertable when it derives from
+    EXTEROCEPTION: anything the camera, the tracker or the lane estimator said.
+
+By that rule ``jerk_32.2_above_15.0`` is assertable -- it is differentiated from
+the CAN speed signal, which is the system's own sense of its own body -- and so
+is ``command_throttle_brake_conflict``, which is a defect in the bytes the
+primary path emitted.  ``gap_8.10m_below_absolute_min`` is not: it describes
+traffic, and traffic is the oracle's job.  ``perception_dropout_7`` is not: the
+scenario injected that dropout on purpose, and reporting it is the system
+working.  ``camera_uncalibrated``, ``range_jump_track1`` and the ``timing_*``
+family are all in the same position -- true statements about an input this
+harness chose.
+
+``lane_departure_*`` is the interesting exclusion, and it is why the line is
+drawn at proprioception rather than at "motion".  The arbiter computes it from
+``SafetyContext.lateral_offset_m``, which is the LANE ESTIMATOR's opinion of
+where the vehicle is, and a scenario that injects ``lane_offset_error_m`` makes
+the arbiter file 275 lane departures for a vehicle that never left its lane.
+Believing that report would be scoring the system on how thoroughly it was
+lied to.  Real lane departure is asserted from the plant's true lateral offset
+instead, through :attr:`Expectation.max_abs_lateral_offset_m`, which is ground
+truth and cannot be corrupted by a sensor spec.
+
+Matching is by PREFIX, which is what disposes of the arbiter's own excuses.  The
+arbiter files a jerk it caused itself as ``jerk_32.2_above_15.0_arbiter_induced``
+and demotes it to advisory so that it cannot change the state.  That demotion is
+sound reasoning about CONTROL -- a system must not treat its own actuator as
+fresh evidence -- and it is irrelevant to ACCEPTANCE.  The occupant's neck does
+not care which subsystem commanded the jerk.  The suffix is an attribution, and
+an attribution is not an exemption, so ``jerk_`` matches both spellings.
+"""
+
+_NON_ASSERTABLE_NOTE = (
+    "hazard, perception, timing and range findings are statements about the "
+    "world or about what the harness fed the system, and are judged by the "
+    "oracle rather than taken on the system's own word"
+)
+
 
 # --------------------------------------------------------------------------- #
 # The system under test
 # --------------------------------------------------------------------------- #
 
 
+PLANNER_REAL = "real"
+"""The shipped :class:`BehaviorPlanner`, given everything perception reported."""
+
+PLANNER_BLIND = "blind"
+"""The shipped planner, given an EMPTY object list on every frame.
+
+Perception is healthy and the arbiter still receives the real tracks; only the
+planner's view of them is gone.  This is not a contrived failure: an object list
+that is dropped, filtered out by an in-path gate, or lost to a planner-side
+exception all look exactly like this from the planner's output, and the whole
+claim being tested is that the arbiter does not need the planner to notice a
+hazard.  With this mode a scenario asks: CAN THE ARBITER ALONE STOP THE CAR?
+"""
+
+PLANNER_RUNAWAY = "runaway"
+"""The shipped planner, with its target speed overridden upward every frame.
+
+Models a planner that has decided the road is clear and wants to accelerate --
+the demand the arbiter has to veto.
+"""
+
+CONTROLLER_REAL = "real"
+"""The shipped :class:`PIDLikeLongitudinalController`."""
+
+CONTROLLER_STUCK_THROTTLE = "stuck_throttle"
+"""The primary path emits full throttle every frame, whatever the plan says.
+
+A jammed pedal, a stuck output stage, a controller that has wound its integrator
+into the stop.  The arbiter is the only thing between this and the obstacle.
+"""
+
+CONTROLLER_STUCK_BRAKE = "stuck_brake"
+"""The primary path emits full brake every frame, whatever the plan says.
+
+The mirror image, and the one this codebase actually shipped: a
+planner-originated brake demand on a clear road.  The arbiter is meant to be an
+independent authority over the longitudinal channel, so it must be able to VETO
+this, not merely pass it through.
+"""
+
+ARBITER_REAL = "real"
+"""The arbiter's command is what reaches the actuators.  How the pipeline runs."""
+
+ARBITER_BYPASS = "bypass"
+"""The PRIMARY PATH's command reaches the actuators; the arbiter is advisory.
+
+The arbiter still runs and its state and violations are still recorded -- they
+are wanted as evidence -- but its command is discarded.  With this mode a
+scenario asks the converse question: CAN THE PRIMARY PATH ALONE STOP THE CAR?
+Both answers must be yes.  A backstop that is load-bearing is not a backstop,
+and a primary path that cannot stop is one fault away from a collision.
+"""
+
+
+@dataclass(frozen=True)
+class StackSpec:
+    """Which parts of the longitudinal path are real for this scenario.
+
+    The default is the shipped configuration.  Every other combination
+    deliberately removes or corrupts one layer so that the remaining layers can
+    be held to the same physical requirement on their own.
+
+    Attributes:
+        planner: One of :data:`PLANNER_REAL`, :data:`PLANNER_BLIND`,
+            :data:`PLANNER_RUNAWAY`.
+        controller: One of :data:`CONTROLLER_REAL`,
+            :data:`CONTROLLER_STUCK_THROTTLE`, :data:`CONTROLLER_STUCK_BRAKE`.
+        arbiter: One of :data:`ARBITER_REAL`, :data:`ARBITER_BYPASS`.
+        runaway_target_factor: Multiplier on the cruise speed used by
+            :data:`PLANNER_RUNAWAY`.
+    """
+
+    planner: str = PLANNER_REAL
+    controller: str = CONTROLLER_REAL
+    arbiter: str = ARBITER_REAL
+    runaway_target_factor: float = 1.5
+
+    def __post_init__(self) -> None:
+        if self.planner not in (PLANNER_REAL, PLANNER_BLIND, PLANNER_RUNAWAY):
+            raise ValueError("unknown planner mode %r" % (self.planner,))
+        if self.controller not in (
+            CONTROLLER_REAL,
+            CONTROLLER_STUCK_THROTTLE,
+            CONTROLLER_STUCK_BRAKE,
+        ):
+            raise ValueError("unknown controller mode %r" % (self.controller,))
+        if self.arbiter not in (ARBITER_REAL, ARBITER_BYPASS):
+            raise ValueError("unknown arbiter mode %r" % (self.arbiter,))
+
+    @property
+    def label(self) -> str:
+        """Compact identifier for the report and the JSON artifact."""
+        return "planner=%s,controller=%s,arbiter=%s" % (
+            self.planner,
+            self.controller,
+            self.arbiter,
+        )
+
+    @property
+    def is_default(self) -> bool:
+        """True for the shipped configuration."""
+        return (
+            self.planner == PLANNER_REAL
+            and self.controller == CONTROLLER_REAL
+            and self.arbiter == ARBITER_REAL
+        )
+
+    @property
+    def arbiter_only(self) -> bool:
+        """True when nothing but the arbiter can produce a brake."""
+        return self.arbiter == ARBITER_REAL and self.planner in (
+            PLANNER_BLIND,
+            PLANNER_RUNAWAY,
+        )
+
+
+DEFAULT_STACK = StackSpec()
+"""Planner, controller and arbiter all real; the arbiter's command actuated."""
+
+ARBITER_ONLY_STACK = StackSpec(planner=PLANNER_BLIND)
+"""The planner cannot see the obstacle.  Only the arbiter can stop the vehicle."""
+
+PRIMARY_ONLY_STACK = StackSpec(arbiter=ARBITER_BYPASS)
+"""The arbiter has no authority.  Only the primary path can stop the vehicle."""
+
+
 @dataclass
 class FrameRecord:
-    """One frame of the closed loop: truth in, command out."""
+    """One frame of the closed loop: truth in, command out.
+
+    Three commands are kept, because with a degradable stack they are no longer
+    the same object and the difference between them IS the evidence:
+
+    * ``raw_command`` -- what the primary path (planner + controller) asked for.
+    * ``arbiter_command`` -- what the arbiter returned when handed that.
+    * ``command`` -- what the plant actually received, which is the arbiter's
+      answer under :data:`ARBITER_REAL` and the primary path's under
+      :data:`ARBITER_BYPASS`.
+    """
 
     frame: int
     t_s: float
@@ -99,11 +336,34 @@ class FrameRecord:
     command: ControlCommand
     safety_state: SafetyState
     violations: List[str] = field(default_factory=list)
+    arbiter_command: Optional[ControlCommand] = None
 
     @property
     def commanded_decel_mps2(self) -> float:
         """The deceleration the actuated command asks for, m/s^2."""
         return self.command.brake * DEFAULT_PLANT.max_brake_decel_mps2
+
+    @property
+    def raw_decel_mps2(self) -> float:
+        """The deceleration the PRIMARY PATH asked for, m/s^2."""
+        return self.raw_command.brake * DEFAULT_PLANT.max_brake_decel_mps2
+
+    @property
+    def arbiter_decel_mps2(self) -> float:
+        """The deceleration the ARBITER asked for, m/s^2.
+
+        Equal to :attr:`commanded_decel_mps2` unless the arbiter is bypassed.
+        """
+        cmd = self.arbiter_command if self.arbiter_command is not None else self.command
+        return cmd.brake * DEFAULT_PLANT.max_brake_decel_mps2
+
+    @property
+    def pedal_conflict(self) -> bool:
+        """The ACTUATED command asks for throttle and brake at the same time."""
+        return (
+            self.command.throttle > PEDAL_CONFLICT_EPS
+            and self.command.brake > PEDAL_CONFLICT_EPS
+        )
 
 
 class StackUnderTest:
@@ -121,7 +381,11 @@ class StackUnderTest:
     ``time.monotonic`` and this harness must be deterministic.
     """
 
-    def __init__(self, cruise_speed_mps: float) -> None:
+    def __init__(
+        self, cruise_speed_mps: float, spec: StackSpec = DEFAULT_STACK
+    ) -> None:
+        self.spec = spec
+        self.cruise_speed_mps = float(cruise_speed_mps)
         self.planner = BehaviorPlanner(
             cruise_speed_mps=cruise_speed_mps,
             ego_lane_half_width_frac=PLANNER_EGO_LANE_HALF_WIDTH_FRAC,
@@ -130,28 +394,68 @@ class StackUnderTest:
         self.monitor = SafetyMonitor()
         self._last_speed_mps = cruise_speed_mps
 
-    def step(self, obs: Observation, dt_s: float) -> Tuple[ControlCommand, ControlCommand, object]:
+    # -- the primary path, degradable ------------------------------------- #
+
+    def _plan(self, obs: Observation, dt_s: float) -> MotionPlan:
+        """The planner's output for this frame, under :attr:`spec`.
+
+        Under :data:`PLANNER_BLIND` the REAL planner runs against an empty
+        object list.  Perception is untouched and the arbiter is still handed
+        ``obs.tracks``: the hazard is in the world and in the arbiter's input,
+        and only the planner has lost it.
+        """
+        objects = [] if self.spec.planner == PLANNER_BLIND else obs.tracks
+        plan = self.planner.plan(
+            frame_width_px=obs.frame_width_px,
+            lane_center_px=obs.lane_center_px,
+            objects=objects,
+            ego=obs.ego,
+            perception_valid=obs.perception.ok,
+            dt_s=dt_s,
+            lane=obs.lane,
+            frame_height_px=obs.frame_height_px,
+        )
+        if self.spec.planner == PLANNER_RUNAWAY:
+            return MotionPlan(
+                target_speed_mps=self.cruise_speed_mps * self.spec.runaway_target_factor,
+                steering_angle_deg=plan.steering_angle_deg,
+                reason="runaway_planner",
+            )
+        return plan
+
+    def _primary_command(
+        self, plan: MotionPlan, obs: Observation, dt_s: float
+    ) -> ControlCommand:
+        """The primary path's actuator demand, under :attr:`spec`.
+
+        The jammed modes bypass the controller entirely rather than feeding it a
+        silly plan, because a controller with intact rate limits would smooth a
+        silly plan into something reasonable and the point is to present the
+        arbiter with a demand it must veto outright.
+        """
+        if self.spec.controller == CONTROLLER_STUCK_THROTTLE:
+            return ControlCommand(1.0, 0.0, plan.steering_angle_deg * 0.0)
+        if self.spec.controller == CONTROLLER_STUCK_BRAKE:
+            return ControlCommand(0.0, 1.0, plan.steering_angle_deg * 0.0)
+        emergency = "aeb" in (plan.reason or "") or "emergency" in (plan.reason or "")
+        return self.controller.to_command(
+            plan, obs.ego.speed_mps, dt_s=dt_s, emergency=emergency
+        )
+
+    def step(
+        self, obs: Observation, dt_s: float
+    ) -> Tuple[ControlCommand, ControlCommand, ControlCommand, object]:
         """Run one frame.
 
         Returns:
-            ``(actuated_command, raw_controller_command, arbitration_result)``.
+            ``(actuated, primary_command, arbiter_command, arbitration_result)``.
+            ``actuated`` is ``arbiter_command`` under :data:`ARBITER_REAL` and
+            ``primary_command`` under :data:`ARBITER_BYPASS`.
         """
         self._last_speed_mps = obs.ego.speed_mps
         try:
-            plan = self.planner.plan(
-                frame_width_px=obs.frame_width_px,
-                lane_center_px=obs.lane_center_px,
-                objects=obs.tracks,
-                ego=obs.ego,
-                perception_valid=obs.perception.ok,
-                dt_s=dt_s,
-                lane=obs.lane,
-                frame_height_px=obs.frame_height_px,
-            )
-            emergency = "aeb" in (plan.reason or "") or "emergency" in (plan.reason or "")
-            raw = self.controller.to_command(
-                plan, obs.ego.speed_mps, dt_s=dt_s, emergency=emergency
-            )
+            plan = self._plan(obs, dt_s)
+            raw = self._primary_command(plan, obs, dt_s)
         except Exception as exc:  # noqa: BLE001 - the pipeline's own fail-safe contract
             fail = self.fail_safe(obs.t_s, obs.ego.speed_mps, dt_s)
             result = ArbitrationResult(
@@ -162,7 +466,7 @@ class StackUnderTest:
             )
             result.plan_reason = "exception:%s" % type(exc).__name__
             result.plan_target = 0.0
-            return fail, ControlCommand(0.0, 0.0, 0.0), result
+            return fail, ControlCommand(0.0, 0.0, 0.0), fail, result
 
         ctx = SafetyContext(
             ego=obs.ego,
@@ -180,7 +484,8 @@ class StackUnderTest:
         result = self.monitor.arbitrate(plan, raw, ctx)
         result.plan_reason = plan.reason
         result.plan_target = plan.target_speed_mps
-        return result.command, raw, result
+        actuated = raw if self.spec.arbiter == ARBITER_BYPASS else result.command
+        return actuated, raw, result.command, result
 
     def fail_safe(self, t_s: float, ego_speed_mps: float, dt_s: float) -> ControlCommand:
         """The command to actuate when the decision path is gone, or at exit.
@@ -188,7 +493,22 @@ class StackUnderTest:
         The arbiter is run with no plan, a neutral command and a failed
         perception status.  Per its own contract that puts it into a
         minimum-risk manoeuvre and returns its rate-shaped braking command.
+
+        With the arbiter bypassed there is no such contract to appeal to, so the
+        primary path supplies its own: the controller is driven with a
+        zero-target emergency plan, which is the only stop the planner and
+        controller can express between them.  Borrowing the arbiter's fail-safe
+        here would smuggle back exactly the authority the scenario removed.
         """
+        if self.spec.arbiter == ARBITER_BYPASS:
+            return self.controller.to_command(
+                MotionPlan(
+                    target_speed_mps=0.0, steering_angle_deg=0.0, reason="fail_safe_stop"
+                ),
+                ego_speed_mps,
+                dt_s=dt_s,
+                emergency=True,
+            )
         ctx = SafetyContext(
             ego=EgoState(speed_mps=ego_speed_mps, valid=True, timestamp_s=t_s),
             tracks=[],
@@ -262,6 +582,31 @@ class Expectation:
             and the reason must be in the scenario's ``physics`` string.  It
             never excuses a ``phantom_intervention``: braking with no warrant at
             all is not a transient.
+        unwarranted_brake_frames_allowed: Number of frames on which the
+            commanded deceleration may exceed
+            :data:`oracle.HEADWAY_DECEL_ALLOWANCE_MPS2` while NOTHING was
+            required (the ``unwarranted_brake`` finding -- the sub-emergency
+            band).  Default zero.  Raise it only where the scenario itself
+            deliberately lies to the system about the range, and say so in
+            ``physics``.
+        allowed_self_reports: Prefixes of ``ArbitrationResult.violations`` this
+            scenario tolerates even though :data:`ASSERTABLE_SELF_REPORTS`
+            matches them.  Every entry needs an argument in ``physics``: the
+            system said something was wrong with its own output, and the
+            scenario is claiming it was right to and that it does not matter.
+        primary_must_stop: The PRIMARY path (planner + controller) must reach at
+            least :data:`oracle.EMERGENCY_DECEL_MPS2` of its own accord, before
+            the arbiter is consulted.  Set on scenarios that exist to show the
+            primary path is not relying on the backstop.
+        arbiter_must_veto_brake_below_mps2: The arbiter's own command must never
+            exceed this deceleration.  Set on scenarios where the primary path
+            is jamming the brake on and the arbiter is required to VETO it
+            rather than pass it through, which is the difference between an
+            authority and a wire.
+        max_jerk_mps3: Override on the demanded-jerk ceiling.  Leave None to use
+            :func:`oracle.jerk_limit_mps3`, which picks the comfort or the
+            emergency band per frame from the true kinematics.  An override is
+            an admission that the scenario is special; justify it in ``physics``.
     """
 
     no_collision: bool = True
@@ -277,6 +622,11 @@ class Expectation:
     max_abs_lateral_offset_m: Optional[float] = None
     require_fail_safe_exit: bool = False
     unjustified_brake_frames_allowed: int = 0
+    unwarranted_brake_frames_allowed: int = 0
+    allowed_self_reports: Tuple[str, ...] = ()
+    primary_must_stop: bool = False
+    arbiter_must_veto_brake_below_mps2: Optional[float] = None
+    max_jerk_mps3: Optional[float] = None
 
 
 _STATE_ORDER = {
@@ -312,6 +662,8 @@ class Scenario:
         perception: Sensor characteristics.
         road: Road geometry.
         expect: The requirements.
+        stack: Which layers of the longitudinal path are real.  The default runs
+            all three; see :class:`StackSpec`.
         terminate_during_run: Run the shutdown path after the loop.
     """
 
@@ -329,6 +681,7 @@ class Scenario:
     initial_lateral_offset_m: float = 0.0
     terminate_during_run: bool = False
     config: PlantConfig = DEFAULT_PLANT
+    stack: StackSpec = DEFAULT_STACK
 
 
 @dataclass
@@ -363,8 +716,16 @@ class ScenarioResult:
         decels = [r.commanded_decel_mps2 for r in self.records]
         speeds = [r.true.ego_v_mps for r in self.records]
         states = [r.safety_state.value for r in self.records]
+        cmd_jerk = [j for j in commanded_jerk_series(self.records, self.scenario.config)
+                    if j is not None]
+        got_jerk = [j for j in achieved_jerk_series(self.records, self.scenario.config)
+                    if j is not None]
+        self_reports = collect_assertable_self_reports(
+            self.records, self.scenario.expect.allowed_self_reports
+        )
         return {
             "frames": len(self.records),
+            "stack": self.scenario.stack.label,
             "min_gap_m": _round(self.verdict.min_gap_m),
             "collided": self.verdict.collided,
             "oracle_emergency": self.verdict.emergency,
@@ -373,6 +734,18 @@ class ScenarioResult:
             "oracle_hazard_clear_frame": self.verdict.hazard_clear_frame,
             "oracle_avoidable": self.verdict.avoidable,
             "max_commanded_decel_mps2": _round(max(decels) if decels else 0.0),
+            "max_primary_decel_mps2": _round(
+                max((r.raw_decel_mps2 for r in self.records), default=0.0)
+            ),
+            "max_arbiter_decel_mps2": _round(
+                max((r.arbiter_decel_mps2 for r in self.records), default=0.0)
+            ),
+            "max_commanded_jerk_mps3": _round(max(cmd_jerk) if cmd_jerk else 0.0),
+            "max_achieved_jerk_mps3": _round(max(got_jerk) if got_jerk else 0.0),
+            "pedal_conflict_frames": sum(1 for r in self.records if r.pedal_conflict),
+            "self_reported_violations": {
+                k: len(v) for k, v in sorted(self_reports.items())
+            },
             "max_required_decel_mps2": _round(
                 max((d for d in self.verdict.required_decel if math.isfinite(d)), default=0.0)
             ),
@@ -427,7 +800,8 @@ def run(scenario: Scenario, sut: Optional[StackUnderTest] = None) -> ScenarioRes
             scenario.cruise_speed_mps
             if scenario.cruise_speed_mps is not None
             else scenario.ego_speed_mps
-        )
+        ),
+        spec=scenario.stack,
     )
 
     history: List[WorldState] = []
@@ -436,7 +810,7 @@ def run(scenario: Scenario, sut: Optional[StackUnderTest] = None) -> ScenarioRes
     for _ in range(scenario.frames):
         history.append(state)
         obs = sensor.observe(state)
-        command, raw, result = system.step(obs, dt)
+        command, raw, arbiter_cmd, result = system.step(obs, dt)
         records.append(
             FrameRecord(
                 frame=state.frame,
@@ -450,6 +824,7 @@ def run(scenario: Scenario, sut: Optional[StackUnderTest] = None) -> ScenarioRes
                 command=command,
                 safety_state=getattr(result, "state", SafetyState.MIN_RISK_MANEUVER),
                 violations=list(getattr(result, "violations", []) or []),
+                arbiter_command=arbiter_cmd,
             )
         )
         state = plant.step(command.throttle, command.brake, command.steering)
@@ -547,13 +922,24 @@ def evaluate(
                     )
                 )
         elif first_emergency_cmd is None:
+            # The requirement can be +inf on every frame -- an obstacle that was
+            # never avoidable at all -- so a plain max() over the finite entries
+            # has no elements to take.  Report the infinity instead of crashing:
+            # "the physics demanded more than the vehicle has and the system
+            # asked for none of it" is the single most damning verdict this
+            # harness can return, and it must survive being printed.
+            finite = [d for d in verdict.required_decel if math.isfinite(d)]
+            need = max(finite) if finite else float("inf")
             findings.append(
                 Finding(
                     "missed_intervention",
-                    "the oracle required %.2f m/s^2 from frame %s and the system never "
-                    "commanded %.1f m/s^2 (peak %.2f m/s^2)"
+                    "the oracle required %s from frame %s and the system never commanded "
+                    "%.1f m/s^2 (peak %.2f m/s^2)"
                     % (
-                        max(d for d in verdict.required_decel if math.isfinite(d)),
+                        ("more than the vehicle's %.1f m/s^2 authority"
+                         % scenario.config.max_brake_decel_mps2)
+                        if math.isinf(need)
+                        else "%.2f m/s^2" % need,
                         verdict.first_emergency_frame,
                         truth.EMERGENCY_DECEL_MPS2,
                         max(r.commanded_decel_mps2 for r in records),
@@ -587,17 +973,27 @@ def evaluate(
     # a brake that works makes its own justification disappear.
     exempt = _completing_a_warranted_stop(records, verdict)
     phantoms: List[FrameRecord] = []
+    unwarranted: List[FrameRecord] = []
     excessive: List[FrameRecord] = []
-    for r in records:
+    for i, r in enumerate(records):
         if r.true.ego_v_mps <= STANDSTILL_MPS or not r.perception_ok:
             continue
-        quiet = verdict.is_quiet(r.frame) and not exempt[r.frame]
+        quiet = verdict.is_quiet(r.frame) and not exempt[i]
         emergency_authority = (
             r.commanded_decel_mps2 >= truth.EMERGENCY_DECEL_MPS2
             or r.safety_state is SafetyState.MIN_RISK_MANEUVER
         )
-        if quiet and emergency_authority:
-            phantoms.append(r)
+        if quiet:
+            if emergency_authority:
+                phantoms.append(r)
+            elif r.commanded_decel_mps2 > truth.HEADWAY_DECEL_ALLOWANCE_MPS2 + 1e-6:
+                # The SUB-EMERGENCY band.  Nothing in the true world required any
+                # braking, and the system is braking harder than a headway law
+                # ever needs to -- but below AEB grade, so the phantom test above
+                # cannot see it.  This is the band a "fix" for phantom braking
+                # retreats into: the MRM stops, the 8 m/s^2 stops, and the
+                # vehicle is still dragged down the motorway for no reason.
+                unwarranted.append(r)
         elif r.commanded_decel_mps2 > verdict.justified_decel_mps2(r.frame) + 1e-6:
             excessive.append(r)
 
@@ -618,6 +1014,37 @@ def evaluate(
                     first.true.gap_m,
                     first.true.closing_mps,
                     verdict.required_decel[first.frame],
+                ),
+            )
+        )
+
+    # -------------------------------------------- sub-emergency band --------
+    if len(unwarranted) > exp.unwarranted_brake_frames_allowed:
+        first = unwarranted[0]
+        peak = max(unwarranted, key=lambda r: r.commanded_decel_mps2)
+        findings.append(
+            Finding(
+                "unwarranted_brake",
+                "%d frame(s) braked above the %.1f m/s^2 a headway law may use while the "
+                "true requirement was zero (allowed %d); first at frame %d commanding "
+                "%.2f m/s^2, peak %.2f m/s^2 at frame %d (true gap %.1f m, true closing "
+                "%+.2f m/s, state=%s). This is below the %.1f m/s^2 emergency threshold, so "
+                "no AEB test can see it, and it is what a phantom brake degrades into rather "
+                "than disappearing: the ego was dragged from %.2f to %.2f m/s."
+                % (
+                    len(unwarranted),
+                    truth.HEADWAY_DECEL_ALLOWANCE_MPS2,
+                    exp.unwarranted_brake_frames_allowed,
+                    first.frame,
+                    first.commanded_decel_mps2,
+                    peak.commanded_decel_mps2,
+                    peak.frame,
+                    first.true.gap_m,
+                    first.true.closing_mps,
+                    first.safety_state.value,
+                    truth.EMERGENCY_DECEL_MPS2,
+                    records[0].true.ego_v_mps,
+                    min(r.true.ego_v_mps for r in records),
                 ),
             )
         )
@@ -645,6 +1072,160 @@ def evaluate(
                 ),
             )
         )
+
+    # --------------------------------------------------------------- jerk ---
+    jerks = commanded_jerk_series(records, scenario.config)
+    worst_jerk: Optional[Tuple[int, float, float]] = None
+    jerk_frames = 0
+    for i, jerk in enumerate(jerks):
+        if i == 0 or jerk is None:
+            continue
+        if records[i].true.ego_v_mps <= STANDSTILL_MPS and (
+            records[i - 1].true.ego_v_mps <= STANDSTILL_MPS
+        ):
+            # Stopped.  A brake demand that changes while the vehicle is already
+            # at rest moves nobody's head.
+            continue
+        limit = (
+            exp.max_jerk_mps3
+            if exp.max_jerk_mps3 is not None
+            else truth.jerk_limit_mps3(
+                verdict.emergency_warranted_at(records[i].frame) or exempt[i]
+            )
+        )
+        if jerk > limit + 1e-6:
+            jerk_frames += 1
+            if worst_jerk is None or jerk - limit > worst_jerk[1] - worst_jerk[2]:
+                worst_jerk = (records[i].frame, jerk, limit)
+    if worst_jerk is not None:
+        frame_i, jerk_v, limit_v = worst_jerk
+        findings.append(
+            Finding(
+                "excess_jerk",
+                "the demanded deceleration changed at %.1f m/s^3 at frame %d, above the "
+                "%.1f m/s^3 this situation allows, on %d frame(s). %.1f m/s^3 over a %.0f ms "
+                "frame is a step of %.2f m/s^2 in the demand. The ceiling outside an "
+                "emergency is %.1f m/s^3 (the top of the band a seated occupant does not "
+                "register) and inside one it is %.1f m/s^3 (full %.1f m/s^2 authority "
+                "reached in the 0.4 s a human panic brake takes); braking faster than that "
+                "buys no stopping distance, because the brake actuator's own rise time "
+                "filters it out, and costs a head-toss the occupant cannot brace for."
+                % (
+                    jerk_v,
+                    frame_i,
+                    limit_v,
+                    jerk_frames,
+                    jerk_v,
+                    records[min(frame_i, len(records) - 1)].true.dt_s * 1000.0,
+                    jerk_v * records[min(frame_i, len(records) - 1)].true.dt_s,
+                    truth.COMFORT_JERK_MPS3,
+                    truth.EMERGENCY_JERK_MPS3,
+                    scenario.config.max_brake_decel_mps2,
+                )
+            )
+        )
+
+    # ------------------------------------------------------ pedal conflict ---
+    conflicts = [r for r in records if r.pedal_conflict]
+    raw_conflicts = [
+        r
+        for r in records
+        if r.raw_command.throttle > PEDAL_CONFLICT_EPS
+        and r.raw_command.brake > PEDAL_CONFLICT_EPS
+    ]
+    plant_conflicts = [r for r in records if getattr(r.true, "pedal_conflict", False)]
+    if conflicts or raw_conflicts or plant_conflicts:
+        first = (conflicts or raw_conflicts or plant_conflicts)[0]
+        findings.append(
+            Finding(
+                "pedal_conflict",
+                "throttle and brake commanded together: %d actuated frame(s), %d "
+                "primary-path frame(s), %d frame(s) the plant recorded; first at frame %d "
+                "(actuated throttle %.2f / brake %.2f, primary throttle %.2f / brake %.2f). "
+                "There is no manoeuvre whose answer is both pedals: whichever one wins, the "
+                "other was wrong, and netting them into a single acceleration demand is how "
+                "the conflict stayed invisible."
+                % (
+                    len(conflicts),
+                    len(raw_conflicts),
+                    len(plant_conflicts),
+                    first.frame,
+                    first.command.throttle,
+                    first.command.brake,
+                    first.raw_command.throttle,
+                    first.raw_command.brake,
+                )
+            )
+        )
+
+    # ------------------------------------------- the system's own findings ---
+    self_reported = collect_assertable_self_reports(records, exp.allowed_self_reports)
+    if self_reported:
+        codes = sorted(self_reported)
+        first_code = codes[0]
+        first_frame = self_reported[first_code][0]
+        findings.append(
+            Finding(
+                "self_reported_violation",
+                "the system reported %d assertable finding(s) about its own output or about "
+                "the motion it produced, and nothing failed: %s. First is %r at frame %d. "
+                "These are the system's own words. A finding filed as advisory because the "
+                "arbiter caused it is still a finding: the suffix is an attribution, not an "
+                "exemption, and an occupant does not feel the attribution."
+                % (
+                    sum(len(v) for v in self_reported.values()),
+                    ", ".join(
+                        "%s x%d" % (c, len(self_reported[c])) for c in codes
+                    ),
+                    first_code,
+                    first_frame,
+                )
+            )
+        )
+
+    # ------------------------------------------------------- independence ---
+    if exp.primary_must_stop:
+        peak_raw = max(r.raw_decel_mps2 for r in records)
+        if peak_raw < truth.EMERGENCY_DECEL_MPS2:
+            findings.append(
+                Finding(
+                    "primary_path_did_not_stop",
+                    "the planner and controller together never asked for more than "
+                    "%.2f m/s^2 (needed %.1f m/s^2) even though the oracle required up to "
+                    "%.2f m/s^2. The arbiter is a BACKSTOP; a primary path that cannot stop "
+                    "the vehicle makes the backstop load-bearing, and then a single arbiter "
+                    "defect is a collision."
+                    % (
+                        peak_raw,
+                        truth.EMERGENCY_DECEL_MPS2,
+                        max(
+                            (d for d in verdict.required_decel if math.isfinite(d)),
+                            default=0.0,
+                        ),
+                    ),
+                )
+            )
+
+    if exp.arbiter_must_veto_brake_below_mps2 is not None:
+        limit = exp.arbiter_must_veto_brake_below_mps2
+        worst = max(records, key=lambda r: r.arbiter_decel_mps2)
+        if worst.arbiter_decel_mps2 > limit + 1e-6:
+            findings.append(
+                Finding(
+                    "arbiter_failed_to_veto",
+                    "the primary path demanded up to %.2f m/s^2 and the arbiter passed "
+                    "%.2f m/s^2 of it through at frame %d; this scenario requires the "
+                    "arbiter to hold it below %.2f m/s^2. An arbiter that cannot subtract "
+                    "authority from the primary path is a wire, not an authority, and the "
+                    "phantom brake it is supposed to catch originates upstream of it."
+                    % (
+                        max(r.raw_decel_mps2 for r in records),
+                        worst.arbiter_decel_mps2,
+                        worst.frame,
+                        limit,
+                    ),
+                )
+            )
 
     # ------------------------------------------------------------ ceiling ---
     if exp.max_commanded_decel_mps2 is not None:
@@ -815,6 +1396,241 @@ def evaluate(
                 )
 
     return findings
+
+
+# --------------------------------------------------------------------------- #
+# Independence: the same physics, one layer at a time
+# --------------------------------------------------------------------------- #
+#
+# These live here rather than in ``library`` because they are scenarios ABOUT
+# the stack decomposition, which is the thing this module defines.  They are
+# picked up by ``report.all_scenarios()`` and appear in the table, the JSON
+# artifact and the baseline exactly like every other case.
+
+_INDEPENDENCE_WORLD = (
+    "A stopped vehicle 40 m ahead, ego closing at 20 m/s on a straight dry road. "
+    "Keeping the 2.0 m standstill clearance leaves 38 m of usable closure, so the "
+    "constant deceleration required is 20^2 / (2 x 38) = 5.26 m/s^2 -- well above "
+    "the 3.0 m/s^2 comfort line, unmistakably an emergency, and two thirds of the "
+    "8.0 m/s^2 the vehicle has. Full braking from 20 m/s covers 25.0 m plus about "
+    "1.3 m for the 0.15 s brake rise, and one frame of sense latency adds 1.0 m, so "
+    "27.3 m of the 40 m is enough: contact here is not a hard case, it is a system "
+    "that did not brake. "
+)
+
+_INDEPENDENCE_STATIONARY = LeadSpec(40.0, 0.0, lead_stationary(), label="stopped car")
+
+DEGRADED_STACK_SCENARIOS: Tuple[Scenario, ...] = (
+    Scenario(
+        name="arbiter_alone_stops_for_stationary",
+        summary="planner blinded; only the arbiter can see the stopped car",
+        guards="arbiter independence -- the backstop must not need the primary path",
+        physics=_INDEPENDENCE_WORLD
+        + "The planner is handed an EMPTY object list every frame while perception "
+        "stays healthy and the arbiter still receives the real tracks. This is the "
+        "arbiter's entire reason to exist: it is advertised as an INDEPENDENT "
+        "backstop, and a backstop that only works when the thing it is backing up "
+        "also works is not one. The failure being tested for is structural, not "
+        "numeric -- if every brake in this stack ultimately originates in the "
+        "planner's object list, then one dropped list is one collision, and no "
+        "amount of tuning inside the arbiter changes that. REQUIRED: emergency-grade "
+        "braking before the last avoidance frame, and no contact.",
+        frames=140,
+        ego_speed_mps=20.0,
+        lead=_INDEPENDENCE_STATIONARY,
+        stack=ARBITER_ONLY_STACK,
+        expect=Expectation(
+            must_intervene=True,
+            min_clearance_m=0.5,
+            max_abs_lateral_offset_m=0.5,
+        ),
+    ),
+    Scenario(
+        name="primary_alone_stops_for_stationary",
+        summary="arbiter stripped of authority; the primary path must stop by itself",
+        guards="primary-path competence -- the backstop must not be load-bearing",
+        physics=_INDEPENDENCE_WORLD
+        + "Here the whole stack sees the car but the ARBITER'S command is discarded "
+        "and the planner-plus-controller command is actuated. This is the converse "
+        "claim and it is just as load-bearing: if the primary path cannot stop for a "
+        "stopped car, then every stop this system has ever made was the arbiter's, "
+        "the arbiter is not a backstop but the driver, and its single-point failures "
+        "are the vehicle's. It also explains the oscillation this module is being "
+        "redesigned out of: when the only brake in the system is the safety monitor, "
+        "every tuning change has to trade phantom braking against missed braking, "
+        "because there is nothing else to carry the ordinary case. REQUIRED: the "
+        "primary path reaches emergency-grade deceleration on its own, and no contact.",
+        frames=140,
+        ego_speed_mps=20.0,
+        lead=_INDEPENDENCE_STATIONARY,
+        stack=PRIMARY_ONLY_STACK,
+        expect=Expectation(
+            must_intervene=True,
+            primary_must_stop=True,
+            min_clearance_m=0.5,
+            max_abs_lateral_offset_m=0.5,
+        ),
+    ),
+    Scenario(
+        name="arbiter_vetoes_stuck_brake_on_empty_road",
+        summary="primary path jams full brake on an empty motorway; the arbiter must veto",
+        guards="round-1 phantom AEB originating UPSTREAM of the arbiter",
+        physics="Empty road, no object anywhere in the world, ego cruising at 25 m/s, and "
+        "the primary path emits brake=1.00 on every frame. The true collision-avoidance "
+        "requirement is identically zero for the whole run, so 8.0 m/s^2 here is not a "
+        "mis-tuned response to a hazard, it is a response to nothing. The consequence is "
+        "physical: a follower keeping a 2 s gap and taking 1 s to react can absorb about "
+        "5 m/s^2 of lead deceleration and cannot absorb 8, so an unwarranted full-authority "
+        "stop on a motorway does not avoid a collision, it manufactures one behind. The "
+        "arbiter holds authority over the longitudinal channel and is the last component "
+        "before the actuators, so it is the only place this can be bounded. REQUIRED: the "
+        "arbiter's own command stays under the 3.0 m/s^2 comfort line -- it must SUBTRACT "
+        "authority, not merely refrain from adding it. An arbiter that can only ever brake "
+        "harder than the plan is a wire with logging, and the phantom braking measured on "
+        "real video originates upstream of it, where it structurally cannot be vetoed.",
+        frames=120,
+        ego_speed_mps=25.0,
+        lead=None,
+        stack=StackSpec(controller=CONTROLLER_STUCK_BRAKE),
+        expect=Expectation(
+            forbid_emergency_intervention=True,
+            arbiter_must_veto_brake_below_mps2=truth.COMFORT_DECEL_MPS2,
+            min_speed_floor_mps=20.0,
+        ),
+    ),
+    Scenario(
+        name="arbiter_alone_stops_runaway_throttle",
+        summary="primary path floors the throttle at a stopped car; only the arbiter is left",
+        guards="arbiter independence against a commanding, not merely absent, primary path",
+        physics=_INDEPENDENCE_WORLD
+        + "The primary path emits throttle=1.00 every frame -- a wound-up integrator, a "
+        "jammed output stage, a planner that has concluded the road is clear. This is "
+        "strictly harder than the blinded-planner case and it is the case that decides "
+        "whether the arbiter has AUTHORITY or merely a veto on its own additions: the ego "
+        "is being accelerated toward the obstacle at 2.5 m/s^2 while the arbiter is deciding. "
+        "The obstacle is real, it is in the arbiter's own track list, and the kinematics are "
+        "not marginal. If the vehicle reaches it, the independent backstop is a label. "
+        "REQUIRED: emergency-grade braking, no contact, and no throttle surviving to the "
+        "actuators while the brake is applied.",
+        frames=160,
+        ego_speed_mps=20.0,
+        lead=_INDEPENDENCE_STATIONARY,
+        stack=StackSpec(controller=CONTROLLER_STUCK_THROTTLE),
+        expect=Expectation(
+            must_intervene=True,
+            min_clearance_m=0.5,
+            max_abs_lateral_offset_m=0.5,
+        ),
+    ),
+)
+"""Scenarios that hold ONE layer of the longitudinal path to the whole requirement.
+
+Two of them make the same physical demand -- stop for a stopped car 40 m away --
+of two disjoint halves of the stack, and both must satisfy it.  The other two
+present each half with a demand the other half must overrule.
+"""
+
+
+def commanded_jerk_series(
+    records: Sequence[FrameRecord], config: PlantConfig = DEFAULT_PLANT
+) -> List[Optional[float]]:
+    """Per-frame magnitude of the rate of change of the DEMANDED deceleration.
+
+    ``out[i]`` is ``|decel[i] - decel[i-1]| / dt`` in m/s^3, where ``dt`` is the
+    real duration of the step that separated the two commands -- not the nominal
+    period, because a 187 ms frame really did hold the previous command for
+    187 ms and the jerk when the next one lands is correspondingly smaller.
+    ``out[0]`` is None.
+
+    The DEMAND is judged rather than the achieved acceleration.  The brake
+    actuator's 0.15 s rise time smooths a step demand into something the
+    accelerometer barely notices, but that lag is a property of the plumbing and
+    not a safety feature: the same demand on a vehicle with a faster brake, or on
+    a brake-by-wire axle, arrives in full.  A specification that credits the
+    system for its actuator's sluggishness has stopped specifying the system.
+    The achieved jerk is reported alongside as a metric, and the arbiter's own
+    measurement of it is caught by :data:`ASSERTABLE_SELF_REPORTS`.
+    """
+    out: List[Optional[float]] = [None] * len(records)
+    for i in range(1, len(records)):
+        dt = records[i].true.dt_s
+        if not dt or not math.isfinite(dt) or dt <= 0.0:
+            dt = config.dt_s
+        out[i] = abs(records[i].commanded_decel_mps2 - records[i - 1].commanded_decel_mps2) / dt
+    return out
+
+
+def achieved_jerk_series(
+    records: Sequence[FrameRecord], config: PlantConfig = DEFAULT_PLANT
+) -> List[Optional[float]]:
+    """Per-frame magnitude of the rate of change of the TRUE ego acceleration.
+
+    What an accelerometer bolted to the seat rail would integrate.  Reported as
+    a metric rather than asserted on, because the assertion belongs on the
+    demand -- see :func:`commanded_jerk_series`.
+    """
+    out: List[Optional[float]] = [None] * len(records)
+    for i in range(1, len(records)):
+        dt = records[i].true.dt_s
+        if not dt or not math.isfinite(dt) or dt <= 0.0:
+            dt = config.dt_s
+        out[i] = abs(records[i].true.ego_a_mps2 - records[i - 1].true.ego_a_mps2) / dt
+    return out
+
+
+def is_assertable_self_report(code: str) -> bool:
+    """Whether one ``ArbitrationResult.violations`` entry is a finding here.
+
+    Prefix match against :data:`ASSERTABLE_SELF_REPORTS`.  See that constant for
+    the rule, and for why the ``_arbiter_induced`` and ``_arbiter_commanded``
+    suffixes do not exempt anything.
+    """
+    return any(code.startswith(prefix) for prefix in ASSERTABLE_SELF_REPORTS)
+
+
+def self_report_family(code: str) -> str:
+    """The stable family name of a self-report, with the numbers stripped.
+
+    ``jerk_32.2_above_15.0_arbiter_induced`` -> ``jerk_above_limit``.  Findings
+    carry measured values in their text, which makes them useless as dictionary
+    keys and unreadable in a diff of two report artifacts; the family is what a
+    baseline and a regression comparison need.
+    """
+    for prefix, family in (
+        ("jerk_", "jerk_above_limit"),
+        ("measured_accel_", "measured_accel_above_limit"),
+        ("measured_decel_", "measured_decel_above_limit"),
+        ("command_throttle_out_of_range", "command_throttle_out_of_range"),
+        ("command_brake_out_of_range", "command_brake_out_of_range"),
+        ("command_steering_out_of_range", "command_steering_out_of_range"),
+    ):
+        if code.startswith(prefix):
+            return family
+    return code
+
+
+def collect_assertable_self_reports(
+    records: Sequence[FrameRecord], allowed: Sequence[str] = ()
+) -> Dict[str, List[int]]:
+    """Map assertable self-report family -> the frames it was reported on.
+
+    Args:
+        records: The run.
+        allowed: Prefixes the scenario has excused; see
+            :attr:`Expectation.allowed_self_reports`.
+
+    Returns:
+        A dict, empty when the system reported nothing assertable about itself.
+    """
+    out: Dict[str, List[int]] = {}
+    for r in records:
+        for code in r.violations:
+            if not is_assertable_self_report(code):
+                continue
+            if any(code.startswith(prefix) for prefix in allowed):
+                continue
+            out.setdefault(self_report_family(code), []).append(r.frame)
+    return out
 
 
 def _completing_a_warranted_stop(

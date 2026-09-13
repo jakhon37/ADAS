@@ -12,8 +12,20 @@ Show the physics justification for every scenario, passing or failing::
 
     python -m tests.scenarios.report --verbose
 
+Rewrite the committed baseline of known-failing scenarios (see
+:data:`BASELINE_PATH` and ``docs/SAFETY_SPEC.md``)::
+
+    python -m tests.scenarios.report --write-baseline
+
 The table is the human deliverable and the JSON is the machine one; both carry
 the same diagnoses, so a CI job can diff two runs and a person can read one.
+
+The BASELINE is a third thing and it is not a suppression list.  Every scenario
+in it still fails, still prints its diagnosis, and still turns the suite red.
+What it buys is the distinction between "this is the known breakage the redesign
+exists to fix" and "something got worse today", which a bare count of 29 red
+tests cannot express.  It is also the redesign's acceptance criterion, written
+down: the job is finished when the baseline is empty.
 """
 
 from __future__ import annotations
@@ -21,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from dataclasses import asdict
 from typing import Dict, List, Optional, Sequence
@@ -29,16 +42,135 @@ from tests.scenarios import oracle as truth
 from tests.scenarios import scenario as scen
 from tests.scenarios.library import SCENARIOS
 
-SPEC_VERSION = "1.0"
+SPEC_VERSION = "1.1"
 """Bumped whenever a margin convention or an authority limit changes.
 
 A JSON artifact from a different spec version is not comparable with this one.
+
+1.1 added the four assertions that 1.0 was missing -- bounded jerk, the
+throttle/brake conflict, the system's own assertable self-reports, and
+proportionality across the sub-emergency band -- and the degradable stack.
+"""
+
+BASELINE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "baseline.json")
+"""The committed list of scenarios that are known to fail today.
+
+One entry per failing scenario, holding the sorted finding codes it fails with.
+See the module docstring for what it is and is not.
 """
 
 
+def load_baseline(path: str = BASELINE_PATH) -> Dict[str, List[str]]:
+    """Read the committed baseline, or return ``{}`` when there is not one yet.
+
+    Returns:
+        Mapping of scenario name to the sorted finding codes recorded for it.
+    """
+    if not os.path.exists(path):
+        return {}
+    with open(path) as handle:
+        payload = json.load(handle)
+    return {k: sorted(v) for k, v in payload.get("known_failures", {}).items()}
+
+
+def build_baseline(results: Sequence[scen.ScenarioResult]) -> Dict[str, object]:
+    """The baseline document for this run."""
+    known = {
+        r.scenario.name: sorted({f.code for f in r.findings})
+        for r in results
+        if not r.passed
+    }
+    codes: Dict[str, int] = {}
+    for entry in known.values():
+        for code in entry:
+            codes[code] = codes.get(code, 0) + 1
+    return {
+        "spec_version": SPEC_VERSION,
+        "purpose": (
+            "Scenarios that FAIL against the arbiter as committed today. This file "
+            "is the redesign's target: the work is done when 'known_failures' is "
+            "empty. It is NOT a suppression list -- every scenario named here still "
+            "fails, still prints its diagnosis and still makes the suite red. Its "
+            "only job is to let pytest say which failures are NEW."
+        ),
+        "how_to_regenerate": "python -m tests.scenarios.report --write-baseline",
+        "rules": [
+            "Adding a name here is an admission of a live safety defect. Say why in "
+            "the commit message.",
+            "Removing a name is the only allowed way to make this file smaller, and "
+            "it must be because the scenario now PASSES.",
+            "Never edit a scenario's expectation to get it out of this file. The "
+            "expectation is the specification.",
+        ],
+        "totals": {"scenarios": len(results), "known_failures": len(known)},
+        "diagnosis_counts": dict(sorted(codes.items())),
+        "known_failures": known,
+    }
+
+
+def write_baseline(results: Sequence[scen.ScenarioResult], path: str = BASELINE_PATH) -> None:
+    """Write the baseline document, sorted and indented so diffs are readable."""
+    with open(path, "w") as handle:
+        json.dump(build_baseline(results), handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def classify_against_baseline(
+    results: Sequence[scen.ScenarioResult], baseline: Optional[Dict[str, List[str]]] = None
+) -> Dict[str, Dict[str, List[str]]]:
+    """Split a run into new, known, worsened and fixed scenarios.
+
+    Args:
+        results: The run.
+        baseline: The committed baseline; loaded from :data:`BASELINE_PATH` when
+            omitted.
+
+    Returns:
+        ``{"new": {...}, "known": {...}, "worsened": {...}, "fixed": {...}}``,
+        each mapping a scenario name to the relevant finding codes.
+
+        * ``new`` -- fails and is not in the baseline at all.  A regression.
+        * ``worsened`` -- fails with at least one code the baseline did not
+          record.  Also a regression, and easy to miss without this split.
+        * ``known`` -- fails with exactly the codes the baseline expected.
+        * ``fixed`` -- passes but is still listed.  The baseline must shrink.
+    """
+    base = load_baseline() if baseline is None else baseline
+    out: Dict[str, Dict[str, List[str]]] = {
+        "new": {}, "known": {}, "worsened": {}, "fixed": {}
+    }
+    for r in results:
+        codes = sorted({f.code for f in r.findings})
+        if r.passed:
+            if r.scenario.name in base:
+                out["fixed"][r.scenario.name] = base[r.scenario.name]
+            continue
+        if r.scenario.name not in base:
+            out["new"][r.scenario.name] = codes
+        elif set(codes) - set(base[r.scenario.name]):
+            out["worsened"][r.scenario.name] = sorted(
+                set(codes) - set(base[r.scenario.name])
+            )
+        else:
+            out["known"][r.scenario.name] = codes
+    return out
+
+
+def all_scenarios() -> List[scen.Scenario]:
+    """Every acceptance scenario, in report order.
+
+    The library, followed by the independence cases in
+    :data:`scenario.DEGRADED_STACK_SCENARIOS`.  Those live in ``scenario``
+    because they are scenarios about the stack decomposition that module
+    defines, but they are ordinary acceptance cases in every other respect and
+    belong in the table, the JSON artifact and the baseline.
+    """
+    return list(SCENARIOS) + list(scen.DEGRADED_STACK_SCENARIOS)
+
+
 def run_all(scenarios: Optional[Sequence[scen.Scenario]] = None) -> List[scen.ScenarioResult]:
-    """Run every scenario and return the results in library order."""
-    return [scen.run(s) for s in (scenarios if scenarios is not None else SCENARIOS)]
+    """Run every scenario and return the results in report order."""
+    return [scen.run(s) for s in (scenarios if scenarios is not None else all_scenarios())]
 
 
 # --------------------------------------------------------------------------- #
@@ -86,16 +218,28 @@ def render_table(results: Sequence[scen.ScenarioResult], verbose: bool = False) 
         status = "PASS" if r.passed else "FAIL"
         m = r.metrics
         out.append(
-            "%-4s %-*s  min_gap=%-7s peak_brake=%-5s worst_state=%s"
+            "%-4s %-*s  min_gap=%-7s peak_brake=%-5s peak_jerk=%-7s pedal_conflict=%-3s "
+            "worst_state=%s"
             % (
                 status,
                 name_w,
                 r.scenario.name,
                 _fmt(m["min_gap_m"]),
                 _fmt(m["max_commanded_decel_mps2"]),
+                _fmt(m["max_commanded_jerk_mps3"]),
+                m["pedal_conflict_frames"],
                 m["worst_safety_state"],
             )
         )
+        if not r.scenario.stack.is_default:
+            out.append("       stack:  %s" % r.scenario.stack.label)
+        if m["self_reported_violations"]:
+            out.append(
+                "       system's own findings: %s"
+                % ", ".join(
+                    "%s x%d" % (k, v) for k, v in sorted(m["self_reported_violations"].items())
+                )
+            )
         if r.scenario.guards:
             out.append("       guards: %s" % r.scenario.guards)
         for f in r.findings:
@@ -107,6 +251,31 @@ def render_table(results: Sequence[scen.ScenarioResult], verbose: bool = False) 
     passed = sum(1 for r in results if r.passed)
     out.append("-" * 100)
     out.append("%d passed, %d failed, %d total" % (passed, len(results) - passed, len(results)))
+
+    split = classify_against_baseline(results)
+    if load_baseline():
+        out.append("")
+        out.append(
+            "against the committed baseline (%s): %d known, %d NEW, %d WORSENED, %d fixed"
+            % (
+                os.path.relpath(BASELINE_PATH),
+                len(split["known"]),
+                len(split["new"]),
+                len(split["worsened"]),
+                len(split["fixed"]),
+            )
+        )
+        for name in sorted(split["new"]):
+            out.append("  NEW       %-34s %s" % (name, ", ".join(split["new"][name])))
+        for name in sorted(split["worsened"]):
+            out.append("  WORSENED  %-34s %s" % (name, ", ".join(split["worsened"][name])))
+        for name in sorted(split["fixed"]):
+            out.append(
+                "  FIXED     %-34s remove it from the baseline" % name
+            )
+        if not (split["new"] or split["worsened"] or split["fixed"]):
+            out.append("  no change against the baseline; the known defects are still there")
+
     failures = [r for r in results if not r.passed]
     if failures:
         out.append("")
@@ -155,6 +324,7 @@ def to_json(results: Sequence[scen.ScenarioResult]) -> Dict[str, object]:
                 "physics": r.scenario.physics,
                 "frames": r.scenario.frames,
                 "ego_speed_mps": r.scenario.ego_speed_mps,
+                "stack": r.scenario.stack.label,
                 "lead": r.scenario.lead.label if r.scenario.lead is not None else None,
                 "road": r.scenario.road.label,
                 "expectation": {
@@ -176,6 +346,10 @@ def to_json(results: Sequence[scen.ScenarioResult]) -> Dict[str, object]:
             "comfort_decel_mps2": truth.COMFORT_DECEL_MPS2,
             "emergency_decel_mps2": truth.EMERGENCY_DECEL_MPS2,
             "negligible_decel_mps2": truth.NEGLIGIBLE_DECEL_MPS2,
+            "headway_decel_allowance_mps2": truth.HEADWAY_DECEL_ALLOWANCE_MPS2,
+            "comfort_jerk_mps3": truth.COMFORT_JERK_MPS3,
+            "emergency_jerk_mps3": truth.EMERGENCY_JERK_MPS3,
+            "pedal_conflict_eps": scen.PEDAL_CONFLICT_EPS,
             "justification_tolerance_mps2": truth.JUSTIFICATION_TOLERANCE_MPS2,
             "justification_window_frames": truth.JUSTIFICATION_WINDOW_FRAMES,
             "max_brake_authority_mps2": scen.DEFAULT_PLANT.max_brake_decel_mps2,
@@ -187,6 +361,7 @@ def to_json(results: Sequence[scen.ScenarioResult]) -> Dict[str, object]:
             "failed": len(results) - passed,
             "failing": [r.scenario.name for r in results if not r.passed],
         },
+        "baseline": classify_against_baseline(results),
         "scenarios": scenarios,
     }
 
@@ -210,6 +385,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--verbose", action="store_true", help="print the physics for every case")
     parser.add_argument("--only", metavar="NAME", action="append", help="run only these scenarios")
     parser.add_argument(
+        "--write-baseline",
+        action="store_true",
+        help="rewrite %s from this run; refuses a partial run, because a baseline "
+        "built from a subset would silently mark every unrun scenario as fixed"
+        % os.path.relpath(BASELINE_PATH),
+    )
+    parser.add_argument(
         "--log-level",
         default="ERROR",
         help="level for the adas.* loggers; the stack logs a WARNING for every "
@@ -219,10 +401,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     logging.getLogger("adas").setLevel(getattr(logging, args.log_level.upper(), logging.ERROR))
 
-    chosen = SCENARIOS
+    chosen = all_scenarios()
     if args.only:
         wanted = set(args.only)
-        chosen = [s for s in SCENARIOS if s.name in wanted]
+        chosen = [s for s in chosen if s.name in wanted]
         missing = wanted - {s.name for s in chosen}
         if missing:
             parser.error("unknown scenario(s): %s" % ", ".join(sorted(missing)))
@@ -232,6 +414,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.json:
         write_json(args.json, results)
         print("wrote %s" % args.json)
+    if args.write_baseline:
+        if args.only:
+            parser.error("--write-baseline needs the whole library, not --only")
+        write_baseline(results)
+        print("wrote %s (%d known failures)" % (BASELINE_PATH, sum(1 for r in results if not r.passed)))
+    split = classify_against_baseline(results)
+    if split["new"] or split["worsened"]:
+        return 2
     return 0 if all(r.passed for r in results) else 1
 
 

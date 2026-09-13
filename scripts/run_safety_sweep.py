@@ -1,25 +1,42 @@
 #!/usr/bin/env python3
 """Run the longitudinal safety envelope sweep and report the failure REGIONS.
 
+THIS IS THE PRIMARY LONGITUDINAL SAFETY GATE.  The hand-picked scenario library
+in :mod:`tests.scenarios.library` is the readable specification, but it missed
+both of this module's historical failures and the sweep found both, for the
+reason a sweep always beats a sample: the useful output of a sweep is not a pass
+count but a BOUNDARY.  "It brakes for any in-path track closer than 43 m at
+20 m/s" is a diagnosis; "312/336 passed" is not.
+
 The sweep and its physics live in :mod:`tests.scenarios.sweep`; this is the
 command line around them.  Nothing here needs a GPU, TensorRT, a camera or the
 network, and the whole run is deterministic: the same arguments produce the same
-bytes.
+bytes, so two runs can be diffed and the JSON artifact can be committed.
+
+Three gradings are reported, independently, because a cell can be right about
+one and wrong about another:
+
+``verdict``         emergency authority: COLLISION / MISSED / PHANTOM / LATE /
+                    EARLY / CORRECT.
+``headway_verdict`` the soft response against the RSS-style safe gap.
+``band_verdict``    the SUB-EMERGENCY band, 3.0 to 3.5 m/s^2 -- braking that is
+                    beyond comfort but below the emergency threshold, and
+                    therefore invisible to both of the other two.
 
 Examples::
 
-    # CI resolution, a few seconds, non-zero exit on any collision or phantom
-    python3 scripts/run_safety_sweep.py --profile fast \\
-        --fail-on COLLISION,MISSED,PHANTOM
+    # the CI gate: ~10 s, 96 cells straddling every measured boundary,
+    # non-zero exit on any collision, miss, phantom, lateness or band fault
+    python3 scripts/run_safety_sweep.py --gate
 
-    # the default envelope, ~90 s, full report and a machine-readable dump
-    python3 scripts/run_safety_sweep.py --json /tmp/sweep.json
+    # the default envelope, full report and a machine-readable dump
+    python3 scripts/run_safety_sweep.py --json build/safety_sweep.json
 
     # hunt a boundary by hand at whatever resolution you like
     python3 scripts/run_safety_sweep.py --ego 15 \\
         --range 18,20,22,24,26,28,30,32 --rate 0 --lead-decel 0
 
-Read the output from the bottom up: the REGIONS section is the useful part.  A
+Read the output from the bottom up: the REGIONS sections are the useful part.  A
 count tells you how bad it is; a region tells you what is wrong.
 """
 
@@ -39,15 +56,34 @@ for _path in (os.path.join(_REPO_ROOT, "src"), _REPO_ROOT):
 
 from tests.scenarios.plant import DEFAULT_PLANT  # noqa: E402
 from tests.scenarios.sweep import (  # noqa: E402
+    BAND_CHARS,
+    BAND_FAILURES,
     PROFILES,
     SweepGrid,
     SweepSpec,
     Verdict,
-    region_boundaries,
     render_grids,
     run_sweep,
     summarise,
 )
+
+GATE_FAIL_ON = "COLLISION,MISSED,PHANTOM,LATE,EARLY,BAND_UNWARRANTED"
+"""The verdicts that fail the committed gate.
+
+Every one of them is a defect and none of them is a matter of taste:
+``COLLISION`` and ``MISSED`` are the passive direction, ``PHANTOM`` and
+``EARLY`` the aggressive one, ``LATE`` is intervening after the last moment the
+vehicle could still stop with room, and ``BAND_UNWARRANTED`` is sustained
+braking above comfort with neither a hazard nor a headway deficit to correct.
+A gate that omitted either direction is how this arbiter came to oscillate
+between them.
+"""
+
+GATE_PROFILE = "fast"
+"""Grid the gate runs.  96 cells, about ten seconds, and it holds a straddling
+pair of ranges either side of every boundary the envelope is known to contain --
+which is what makes a ten-second grid worth running instead of a nine-hundred
+cell one."""
 
 
 def _floats(text: str) -> tuple:
@@ -66,6 +102,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="standard",
         choices=sorted(PROFILES),
         help="grid resolution (default: standard)",
+    )
+    parser.add_argument(
+        "--gate",
+        action="store_true",
+        help="run as the committed CI gate: the '%s' profile, no progress line, "
+        "and a non-zero exit on %s. Equivalent to "
+        "--profile %s --quiet --fail-on %s, and overrides --profile and "
+        "--fail-on so that the gate cannot be quietly weakened by a flag."
+        % (GATE_PROFILE, GATE_FAIL_ON, GATE_PROFILE, GATE_FAIL_ON),
     )
     axes = parser.add_argument_group(
         "custom axes",
@@ -149,6 +194,10 @@ def _progress(total: int):
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Entry point.  Returns the process exit status."""
     args = build_parser().parse_args(argv)
+    if args.gate:
+        args.profile = GATE_PROFILE
+        args.fail_on = GATE_FAIL_ON
+        args.quiet = True
     if not args.verbose_arbiter:
         logging.disable(logging.WARNING)
     grid = _grid_from_args(args)
@@ -212,6 +261,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("  %-10s %4d%s" % (verdict, n, suffix))
     print("  %-10s %4d" % ("FAILURES", report["failures"]))
     print("  headway (soft response, graded separately): %s" % report["headway_counts"])
+    print(
+        "  sub-emergency band %.1f-%.1f m/s^2 (graded separately): %s"
+        % (spec.comfort_decel_mps2, spec.emergency_decel_mps2, report["band_counts"])
+    )
     if report["unwarranted_on_inferred_rate"]:
         print(
             "  of the PHANTOM and EARLY cells, %d fired on a frame where the closing "
@@ -225,6 +278,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("GRIDS -- failure REGIONS are contiguous blocks of one letter")
         print("-" * 78)
         print(render_grids(results, grid))
+        if report["band_failures"]:
+            print()
+            print("  SUB-EMERGENCY BAND -- B = commanded %.1f-%.1f m/s^2 with neither a "
+                  "hazard nor an unsafe headway" % (spec.comfort_decel_mps2,
+                                                    spec.emergency_decel_mps2))
+            print(render_grids(results, grid, "band_verdict", BAND_CHARS))
 
     print()
     print("-" * 78)
@@ -241,6 +300,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("  %s (%d slices)" % (verdict, len(rows)))
         for row in rows:
             print("    " + row["statement"])
+
+    band_regions = report["band_regions"]
+    print()
+    print("-" * 78)
+    print(
+        "SUB-EMERGENCY BAND REGIONS -- %.1f to %.1f m/s^2, below the emergency "
+        "threshold and above comfort" % (spec.comfort_decel_mps2, spec.emergency_decel_mps2)
+    )
+    print("-" * 78)
+    if not any(band_regions.get(v) for v in BAND_FAILURES):
+        print("  none")
+    for verdict in BAND_FAILURES:
+        for row in band_regions.get(verdict) or []:
+            print("    " + row["statement"])
+    for res in report["worst_band"][:5]:
+        print(
+            "      peak %.2f m/s^2 held for %d frame(s) from frame %s at %s"
+            % (
+                res["max_band_decel_mps2"],
+                res["band_frames"],
+                res["first_band_frame"],
+                "ego %g m/s, range %g m, rate %+g, lead_decel %g"
+                % (
+                    res["ego_speed_mps"],
+                    res["range_m"],
+                    res["relative_rate_mps"],
+                    res["lead_decel_mps2"],
+                ),
+            )
+        )
 
     if not args.no_cells:
         failing = [r for r in results if r.verdict in Verdict.FAILURES]
@@ -298,12 +387,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print()
         print("wrote %s" % args.json_path)
 
+    counts_all = dict(report["counts"])
+    counts_all.update(report["band_counts"])
     fail_on = {v.strip().upper() for v in args.fail_on.split(",") if v.strip()}
     if fail_on:
-        hit = sorted(v for v in fail_on if report["counts"].get(v, 0))
+        hit = sorted(v for v in fail_on if counts_all.get(v, 0))
         if hit:
             print()
-            print("FAIL: %s" % ", ".join("%s=%d" % (v, report["counts"][v]) for v in hit))
+            print("FAIL: %s" % ", ".join("%s=%d" % (v, counts_all[v]) for v in hit))
             return 1
         print()
         print("OK: none of %s occurred" % ", ".join(sorted(fail_on)))

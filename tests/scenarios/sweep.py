@@ -41,6 +41,27 @@ Splitting the requirement from the vehicle this way is deliberate and follows
 asks what the *situation* demands; ``mandate`` and ``lost`` run the actual
 actuator, because they ask what the *car* can still do.
 
+Three independent gradings, not one
+-----------------------------------
+``verdict``
+    The EMERGENCY grading: did the arbiter apply emergency authority when and
+    only when the kinematics demanded it, and did the closed loop avoid contact?
+``headway_verdict``
+    The SOFT grading against :func:`safe_following_gap_m`.
+``band_verdict``
+    The SUB-EMERGENCY grading, added after the backtest found the band
+    unpoliced.  Everything between ``comfort_decel_mps2`` (3.0 m/s^2) and
+    ``emergency_decel_mps2`` (3.5 m/s^2) is invisible to the emergency grading
+    by construction -- the emergency test starts at 3.5 -- and invisible to the
+    headway grading, which only asks whether *some* response happened.  A system
+    can therefore hold 3.4 m/s^2 for a whole run against a lead that never moved
+    and score CORRECT / SOFT_OK on every cell.  Measured on the two broken
+    commits: 1ce4886 holds 3.0-3.3 m/s^2 on a constant-range follow at every gap
+    from 25 m to 45 m at 20 m/s, which is 0.2-0.3 m/s^2 under the emergency
+    threshold and entirely unreported before this grading existed.  A cell is
+    ``BAND_UNWARRANTED`` when a command in the band lands on a frame at which
+    neither an emergency nor an unsafe headway has yet arisen.
+
 The headway requirement is graded separately
 --------------------------------------------
 Following a lead at 5 m at 30 m/s with a matched speed is unsafe headway.  The
@@ -124,6 +145,9 @@ __all__ = [
     "run_sweep",
     "classify_cell",
     "classify_headway",
+    "classify_band",
+    "BAND_FAILURES",
+    "BAND_CHARS",
     "region_boundaries",
     "render_grids",
     "summarise",
@@ -165,6 +189,15 @@ class SweepSpec:
     is what a following-distance rule is written against.  It deliberately does
     NOT appear in the emergency tests: there, latency is modelled by running the
     real actuator (see ``mandate`` in the module docstring), not by a constant.
+    """
+
+    band_frames_min: int = 3
+    """Frames of sub-emergency braking before the band grading calls it a
+    policy rather than a transient.
+
+    Three frames is 0.15 s, the plant's own brake rise time: a command cannot
+    produce its deceleration faster than that, so anything shorter is the edge
+    of a ramp and anything longer is a deliberate hold.
     """
 
     soft_decel_mps2: float = 0.4
@@ -300,24 +333,42 @@ class SweepGrid:
         return out
 
 
-#: ``fast`` is the CI resolution: it keeps one point either side of every known
-#: boundary and finishes in a few seconds.  ``standard`` is the default and
-#: reproduces the historical 336-cell envelope, plus the two ranges (15 m, 25 m)
-#: the round-2 collision report named, on both lead-braking axes.  ``dense``
-#: halves the ego and range steps for boundary-finding by hand.
+#: Three resolutions, all placed against the boundaries this envelope is known
+#: to contain.  Every profile keeps at least one range either side of each
+#: measured boundary, because a grid whose sample points all sit inside (or all
+#: outside) a failure region reports its width as zero or as the width of the
+#: grid, and both are wrong.
+#:
+#: Measured boundaries the range axes straddle (see ``docs/SAFETY_SWEEP.md``):
+#:
+#: * constant-range phantom on 25e3ba5 -- fires up to 43 m at 20 m/s, 26 m at
+#:   15 m/s, 66 m at 25 m/s, and not at all beyond; hence 26/32/40/44/52/70.
+#: * lead braking at 6 m/s^2 on 1ce4886 -- avoidable contact for 11-37 m at
+#:   20 m/s (16-26 m closed loop through the full stack); hence 12/16/26/32/40.
+#: * stationary lead -- the plant's own full-authority stop is 14.70 m at
+#:   15 m/s, 25.85 m at 20 m/s and 40.13 m at 25 m/s, so contact closer than
+#:   that is arithmetic; hence 12/16/26/40/44.
+#:
+#: ``fast`` is the CI resolution: 96 cells, about ten seconds, and it contains a
+#: straddling pair for every boundary above.  ``standard`` is the default and
+#: adds the low and high ends of the envelope and the intermediate closing
+#: rates.  ``dense`` halves the ego and range steps for boundary-finding by hand.
 PROFILES: Dict[str, "SweepGrid"] = {
     "fast": SweepGrid(
         name="fast",
-        ego_speeds_mps=(10.0, 20.0, 30.0),
-        ranges_m=(8.0, 20.0, 45.0),
-        relative_rates_mps=(0.0, -2.0, -8.0),
+        ego_speeds_mps=(15.0, 20.0, 25.0),
+        ranges_m=(12.0, 16.0, 26.0, 32.0, 40.0, 44.0, 52.0, 70.0),
+        relative_rates_mps=(0.0, -8.0),
         lead_decels_mps2=(0.0, 6.0),
         horizon_s=8.0,
     ),
     "standard": SweepGrid(
         name="standard",
         ego_speeds_mps=(5.0, 10.0, 15.0, 20.0, 25.0, 30.0),
-        ranges_m=(5.0, 8.0, 12.0, 15.0, 20.0, 25.0, 30.0, 45.0, 60.0, 80.0),
+        ranges_m=(
+            5.0, 8.0, 12.0, 16.0, 20.0, 26.0, 30.0, 32.0, 40.0, 43.0, 44.0,
+            52.0, 60.0, 70.0, 80.0,
+        ),
         relative_rates_mps=(3.0, 0.0, -1.0, -2.0, -4.0, -8.0, -15.0),
         lead_decels_mps2=(0.0, 6.0),
     ),
@@ -325,8 +376,9 @@ PROFILES: Dict[str, "SweepGrid"] = {
         name="dense",
         ego_speeds_mps=(5.0, 7.5, 10.0, 12.5, 15.0, 17.5, 20.0, 22.5, 25.0, 27.5, 30.0),
         ranges_m=(
-            4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 15.0, 18.0, 20.0, 22.0, 25.0,
-            28.0, 30.0, 35.0, 40.0, 45.0, 52.0, 60.0, 70.0, 80.0,
+            4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 14.0, 15.0, 16.0, 18.0, 20.0, 22.0,
+            25.0, 26.0, 27.0, 28.0, 29.0, 30.0, 32.0, 35.0, 40.0, 42.0, 43.0,
+            44.0, 45.0, 52.0, 60.0, 66.0, 70.0, 80.0,
         ),
         relative_rates_mps=(3.0, 0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -11.0, -15.0),
         lead_decels_mps2=(0.0, 3.0, 6.0),
@@ -442,6 +494,17 @@ class CellResult:
     arbiter's closing rate was still the seeded prior, not a measurement."""
     states_seen: Dict[str, int] = field(default_factory=dict)
 
+    # ---- sub-emergency band ------------------------------------------------
+    band_frames: int = 0
+    """Frames whose commanded deceleration lay in
+    ``[comfort_decel_mps2, emergency_decel_mps2)`` without a hard state."""
+    first_band_frame: Optional[int] = None
+    """First such frame, or ``None``."""
+    max_band_decel_mps2: float = 0.0
+    """Largest deceleration commanded inside the band."""
+    band_verdict: str = "BAND_OK"
+    """Grading of the sub-emergency band; see :func:`classify_band`."""
+
     # ---- closed loop ------------------------------------------------------
     collided: bool = False
     min_gap_m: float = float("inf")
@@ -476,6 +539,10 @@ class CellResult:
             "first_hard_findings": self.first_hard_findings,
             "hard_with_inferred_rate": self.hard_with_inferred_rate,
             "states_seen": self.states_seen,
+            "band_verdict": self.band_verdict,
+            "band_frames": self.band_frames,
+            "first_band_frame": self.first_band_frame,
+            "max_band_decel_mps2": self.max_band_decel_mps2,
             "collided": self.collided,
             "min_gap_m": _finite(self.min_gap_m),
             "final_ego_speed_mps": self.final_ego_speed_mps,
@@ -680,6 +747,9 @@ def _run_open_loop(
 
     hard_frame: Optional[int] = None
     soft_frame: Optional[int] = None
+    band_frames = 0
+    first_band_frame: Optional[int] = None
+    max_band = 0.0
     max_decel = 0.0
     max_demand = -1.0
     first_state = ""
@@ -698,6 +768,11 @@ def _run_open_loop(
         max_decel = max(max_decel, decel)
         hard = name in spec.hard_states or decel >= spec.emergency_decel_mps2
         soft = hard or name == "limited" or decel > spec.soft_decel_mps2
+        if (not hard) and spec.comfort_decel_mps2 <= decel < spec.emergency_decel_mps2:
+            band_frames += 1
+            max_band = max(max_band, decel)
+            if first_band_frame is None:
+                first_band_frame = i
         if soft and soft_frame is None:
             soft_frame = i
         if hard and hard_frame is None:
@@ -723,6 +798,9 @@ def _run_open_loop(
         "first_findings": first_findings,
         "hard_inferred": hard_inferred,
         "states": seen,
+        "band_frames": band_frames,
+        "first_band_frame": first_band_frame,
+        "max_band": max_band,
     }
 
 
@@ -845,6 +923,45 @@ def classify_headway(spec: SweepSpec, result: CellResult) -> str:
     return "SOFT_OK"
 
 
+def classify_band(spec: SweepSpec, result: CellResult) -> str:
+    """Grade the SUB-EMERGENCY band: braking above comfort but below emergency.
+
+    This band is structurally invisible to the other two gradings.
+    :func:`classify_cell` only looks at commands at or above
+    ``emergency_decel_mps2``, so 3.4 m/s^2 is not an intervention to it; and
+    :func:`classify_headway` only asks whether *any* response happened, so 3.4
+    m/s^2 satisfies it. Between them a system can brake harder than any
+    passenger would tolerate, for the whole run, against a lead that never
+    moved, and be graded CORRECT on every cell. That is what the backtest of the
+    scenario library found, and it is what this grading closes.
+
+    ``BAND_UNWARRANTED``
+        A command in the band, held for at least ``spec.band_frames_min``
+        frames, first appearing on a frame at which NEITHER an emergency has
+        arisen (``warrant_frame``) NOR the headway has become unsafe
+        (``headway_unsafe_frame``). Nothing in the scene asks for more than
+        comfort at that instant, so the excess is the system's own.
+    ``BAND_OK``
+        Everything else, including a band command that follows a genuine
+        headway deficit -- opening a gap firmly is not a fault.
+
+    Args:
+        spec: The specification constants.
+        result: A cell whose oracle frames and open-loop pass have both run.
+
+    Returns:
+        One of the two strings above.
+    """
+    first = result.first_band_frame
+    if first is None or result.band_frames < spec.band_frames_min:
+        return "BAND_OK"
+    if result.warrant_frame is not None and first >= result.warrant_frame:
+        return "BAND_OK"
+    if result.headway_unsafe_frame is not None and first >= result.headway_unsafe_frame:
+        return "BAND_OK"
+    return "BAND_UNWARRANTED"
+
+
 def run_sweep(
     grid: SweepGrid,
     spec: Optional[SweepSpec] = None,
@@ -926,6 +1043,9 @@ def _run_cell(api: _Adas, spec: SweepSpec, cell: CellSpec, frames: int, instrume
     res.first_hard_findings = op["first_findings"]
     res.hard_with_inferred_rate = op["hard_inferred"]
     res.states_seen = op["states"]
+    res.band_frames = op["band_frames"]
+    res.first_band_frame = op["first_band_frame"]
+    res.max_band_decel_mps2 = op["max_band"]
 
     cl = _run_closed_loop(api, spec, cell, frames)
     res.collided = cl["collided"]
@@ -936,6 +1056,7 @@ def _run_cell(api: _Adas, spec: SweepSpec, cell: CellSpec, frames: int, instrume
 
     res.verdict = classify_cell(spec, res)
     res.headway_verdict = classify_headway(spec, res)
+    res.band_verdict = classify_band(spec, res)
     return res
 
 
@@ -962,8 +1083,18 @@ def _count(values: Iterable[str]) -> Dict[str, int]:
     return out
 
 
+BAND_FAILURES = ("BAND_UNWARRANTED",)
+"""Sub-emergency band gradings that count as a failure."""
+
+BAND_CHARS = {"BAND_OK": ".", "BAND_UNWARRANTED": "B"}
+"""Grid characters for the band grading."""
+
+
 def region_boundaries(
-    results: Iterable[CellResult], grid: SweepGrid
+    results: Iterable[CellResult],
+    grid: SweepGrid,
+    attr: str = "verdict",
+    classes: Sequence[str] = Verdict.FAILURES,
 ) -> Dict[str, List[Dict[str, object]]]:
     """Reduce failing cells to the *edges* of each failure region.
 
@@ -973,19 +1104,29 @@ def region_boundaries(
     outside the sweep and the grid needs extending, which the statement says in
     so many words rather than leaving the reader to notice.
 
-    Returns a dict keyed by verdict, each value a list of region records with a
-    ready-made ``statement``.
+    Args:
+        results: The graded cells.
+        grid: The grid they came from, for the range axis.
+        attr: Which grading to reduce -- ``"verdict"`` (the emergency grading),
+            ``"band_verdict"`` (the sub-emergency band) or
+            ``"headway_verdict"``.  Each is an independent view of the same
+            cells, and a region in one says nothing about the others.
+        classes: Which values of that grading count as failures.
+
+    Returns a dict keyed by that grading's value, each entry a list of region
+    records with a ready-made ``statement``.
     """
     all_ranges = sorted(grid.ranges_m)
     by_class: Dict[str, Dict[Tuple[float, float, float], List[CellResult]]] = {}
     for res in results:
-        if res.verdict not in Verdict.FAILURES:
+        value = getattr(res, attr)
+        if value not in classes:
             continue
         key = (res.cell.ego_speed_mps, res.cell.relative_rate_mps, res.cell.lead_decel_mps2)
-        by_class.setdefault(res.verdict, {}).setdefault(key, []).append(res)
+        by_class.setdefault(value, {}).setdefault(key, []).append(res)
 
     out: Dict[str, List[Dict[str, object]]] = {}
-    for verdict in Verdict.FAILURES:
+    for verdict in classes:
         slices = by_class.get(verdict)
         if not slices:
             continue
@@ -1030,18 +1171,30 @@ def region_boundaries(
     return out
 
 
-def render_grids(results: Sequence[CellResult], grid: SweepGrid) -> str:
+def render_grids(
+    results: Sequence[CellResult],
+    grid: SweepGrid,
+    attr: str = "verdict",
+    chars: Optional[Dict[str, str]] = None,
+) -> str:
     """ASCII grids -- rows are range, columns are ego speed, one per slice.
 
     Failure *regions* are contiguous blocks of the same letter, which is the
     whole point: a count cannot show you that everything closer than 26 m fires.
+
+    Args:
+        results: The graded cells.
+        grid: The grid they came from.
+        attr: Which grading to draw; see :func:`region_boundaries`.
+        chars: Value-to-character map, defaulting to the emergency grading's.
     """
     lines: List[str] = []
+    chars = chars or Verdict.CHARS
     egos = sorted(grid.ego_speeds_mps)
     ranges = sorted(grid.ranges_m, reverse=True)
     index = {r.cell.key: r for r in results}
     legend = "  ".join(
-        "%s=%s" % (Verdict.CHARS[v], v) for v in Verdict.ORDER if v != Verdict.INFEASIBLE
+        "%s=%s" % (chars[v], v) for v in sorted(chars) if chars[v].strip()
     )
     lines.append("legend: " + legend + "   (blank = INFEASIBLE)")
     for decel in sorted(grid.lead_decels_mps2):
@@ -1054,7 +1207,12 @@ def render_grids(results: Sequence[CellResult], grid: SweepGrid) -> str:
                 row = []
                 for ego in egos:
                     res = index.get((ego, rng, rate, decel))
-                    row.append("%5s" % (Verdict.CHARS[res.verdict] if res else "?"))
+                    if res is None:
+                        row.append("%5s" % "?")
+                    elif res.verdict == Verdict.INFEASIBLE:
+                        row.append("%5s" % " ")
+                    else:
+                        row.append("%5s" % chars.get(getattr(res, attr), "?"))
                 lines.append("  %10g  | " % rng + " ".join(row))
     return "\n".join(lines)
 
@@ -1078,6 +1236,16 @@ def summarise(
         "counts": _count(r.verdict for r in results),
         "failures": len(failures),
         "headway_counts": _count(r.headway_verdict for r in graded),
+        "band_counts": _count(r.band_verdict for r in graded),
+        "band_failures": sum(1 for r in graded if r.band_verdict in BAND_FAILURES),
+        "band_regions": region_boundaries(results, grid, "band_verdict", BAND_FAILURES),
+        "worst_band": [
+            r.to_dict()
+            for r in sorted(
+                (r for r in graded if r.band_verdict in BAND_FAILURES),
+                key=lambda r: (-r.max_band_decel_mps2, r.cell.key),
+            )[:20]
+        ],
         "unwarranted_on_inferred_rate": len(phantom_inferred),
         "regions": region_boundaries(results, grid),
         "worst_collisions": [

@@ -29,6 +29,17 @@ them:
 * :data:`NEGLIGIBLE_DECEL_MPS2` = 1.0 m/s^2.  Below this the situation is not a
   hazard at all.  Emergency-grade authority applied while the true requirement
   is below this floor is a PHANTOM intervention.
+* :data:`HEADWAY_DECEL_ALLOWANCE_MPS2` = 1.5 m/s^2.  The authority an ordinary
+  headway-keeping law may use with no kinematic hazard whatever.  It is what
+  makes the SUB-EMERGENCY band measurable: braking above it with a true
+  requirement of zero is unwarranted even though it never reaches AEB grade.
+* :data:`COMFORT_JERK_MPS3` = 2.5 m/s^3 and :data:`EMERGENCY_JERK_MPS3` =
+  20.0 m/s^3.  The rate at which the demanded deceleration may change, outside
+  and inside a genuine emergency.
+
+None of these numbers is read from :mod:`adas.control.arbiter`.  Every one of
+them is derived below from occupant tolerance, from the vehicle, or from the
+kinematics, and the derivation is in the docstring of the constant.
 
 Two different assumptions about the lead appear below, and conflating them is
 the classic way to build a harness that demands clairvoyance:
@@ -75,6 +86,71 @@ mistaken for an AEB event by rounding.
 
 NEGLIGIBLE_DECEL_MPS2 = 1.0
 """Below this true requirement there is no hazard worth the name."""
+
+HEADWAY_DECEL_ALLOWANCE_MPS2 = 1.5
+"""Deceleration a headway-keeping law may use when NOTHING is kinematically required.
+
+Derivation, from the behaviour a following law has to produce and not from any
+constant in the system under test.  The worst headway deficit an adaptive
+cruise has to close without there being a collision problem is roughly one
+second of time gap -- following at 1 s and wanting 2 s.  At 20 m/s that is 20 m
+of gap to open, and a gap only opens while the ego is slower than the lead.
+Running 2 m/s below the lead opens 20 m in 10 s, which is the slow, unobtrusive
+correction a passenger should never notice; reaching that 2 m/s offset over
+about 2 s costs 1.0 m/s^2.  Half a metre per second squared on top covers the
+transient at the start of the correction and the discretisation of a
+jerk-limited brake, giving 1.5 m/s^2 -- half of :data:`COMFORT_DECEL_MPS2`, so
+it is by construction below the level at which a passenger registers braking at
+all.
+
+Above this figure, with a true requirement of zero, the system is braking for
+something that is not in the world.  That is the whole SUB-EMERGENCY band: it
+never reaches :data:`EMERGENCY_DECEL_MPS2`, so an AEB-grade test cannot see it,
+and it is exactly the band in which a phantom that merely drags the vehicle
+down hides.
+"""
+
+COMFORT_JERK_MPS3 = 2.5
+"""Largest rate of change of demanded deceleration outside an emergency, m/s^3.
+
+Human tolerance, not a control constant.  Longitudinal jerk becomes perceptible
+to a seated occupant at roughly 2 m/s^3 and is the quantity that throws an
+unrestrained head, a standing passenger or a loose object forward; lift and
+rail ride-comfort practice caps jerk at about 2.0 m/s^3 for exactly this
+reason.  2.5 m/s^3 is the top of that band.
+
+The controllability half of the argument matters as much as the comfort half: a
+driver with hands on the wheel has to be able to interpret what the automation
+is doing.  A demand that changes faster than this reads as a fault rather than
+as a manoeuvre and provokes exactly the wrong reaction -- an override, or a
+swerve.  Outside an emergency nothing is bought by going faster, because there
+is by definition no collision to outrun.
+"""
+
+EMERGENCY_JERK_MPS3 = 20.0
+"""Largest rate of change of demanded deceleration during a genuine emergency.
+
+Derivation: full authority must be reachable at least as fast as a competent
+human panic brake, and there is nothing to be gained by being faster.  Measured
+pedal-force rise times in emergency braking studies run 0.2-0.4 s from first
+contact to maximum.  Taking the slower end, reaching the vehicle's full
+8.0 m/s^2 in 0.4 s is 20 m/s^3.
+
+Going faster does not shorten the stop.  The brake actuator's own rise time is
+0.15 s (``PlantConfig.brake_rise_time_s``), so a demand that steps from zero to
+full in one 50 ms frame -- 160 m/s^3 -- is filtered by the hydraulics into
+almost exactly the same deceleration profile as a 20 m/s^3 ramp, while the part
+that does get through is a head-toss the occupant cannot brace for and the
+following driver cannot read.  A step demand also guarantees that any
+mis-classification is delivered at full severity before it can be withdrawn,
+which is precisely how a one-frame false positive became a 42-frame
+minimum-risk manoeuvre.
+
+Note that this ceiling is deliberately MORE permissive than the arbiter's own
+jerk constant.  It is derived here from the vehicle and the occupant; if the
+system's internal limit is tighter, that is the system's choice and this
+specification does not contradict it.
+"""
 
 JUSTIFICATION_TOLERANCE_MPS2 = 0.5
 """Slack allowed between the commanded and the truly required deceleration.
@@ -319,12 +395,22 @@ class OracleVerdict:
     def justified_decel_mps2(self, frame: int) -> float:
         """The largest deceleration that is defensible at ``frame``.
 
-        Headway keeping may use anything below :data:`EMERGENCY_DECEL_MPS2`
-        without any kinematic emergency; at or above that the true requirement,
-        scaled by :data:`JUSTIFICATION_MARGIN_FACTOR` and offset by
-        :data:`JUSTIFICATION_TOLERANCE_MPS2`, is the ceiling.  ``inf`` when the
-        situation is already unavoidable, at which point any amount of braking
-        is defensible.
+        The response must be COMMENSURATE with the requirement, over the whole
+        range of the brake and not only at AEB grade.  The ceiling is the true
+        requirement scaled by :data:`JUSTIFICATION_MARGIN_FACTOR` and offset by
+        :data:`JUSTIFICATION_TOLERANCE_MPS2`, with a floor of
+        :data:`HEADWAY_DECEL_ALLOWANCE_MPS2` -- the authority a following law
+        may use when nothing at all is required.  ``inf`` when the situation is
+        already unavoidable, at which point any amount of braking is
+        defensible.
+
+        The floor used to be :data:`EMERGENCY_DECEL_MPS2`, which left the entire
+        sub-emergency band unpoliced: a system could brake at 3.4 m/s^2 for a
+        lead at constant range forever and nothing in this specification would
+        notice.  Dropping the floor to the headway allowance is what makes
+        proportionality mean something -- at a true requirement of 1.0 m/s^2,
+        the boundary of a hazard at all, the ceiling is 2.0 m/s^2, so three
+        times the required brake is a finding rather than a rounding error.
 
         The requirement is taken as the WORST over the preceding
         :data:`JUSTIFICATION_WINDOW_FRAMES` frames, not just this one.  A brake
@@ -342,9 +428,33 @@ class OracleVerdict:
         if math.isinf(need):
             return float("inf")
         return max(
-            EMERGENCY_DECEL_MPS2,
+            HEADWAY_DECEL_ALLOWANCE_MPS2,
             need * JUSTIFICATION_MARGIN_FACTOR + JUSTIFICATION_TOLERANCE_MPS2,
         )
+
+    def emergency_warranted_at(self, frame: int) -> bool:
+        """Whether a genuine emergency was live anywhere in the trailing window.
+
+        "Emergency" here means the true requirement reached
+        :data:`COMFORT_DECEL_MPS2`, the level above which braking stops being
+        headway keeping and becomes collision avoidance.  The same trailing
+        window as :meth:`justified_decel_mps2` is used, and for the same
+        reason: an intervention that is working drives its own requirement to
+        zero, and the frames in which it is still ramping the brake must be
+        judged against the emergency it is answering, not against the calm it
+        has just created.
+
+        This selects which jerk ceiling applies -- see
+        :func:`jerk_limit_mps3` -- because a rate of change of demand that
+        buys stopping distance in an emergency buys nothing but discomfort
+        outside one.
+        """
+        if not self.required_decel:
+            return False
+        hi = min(max(frame, 0), len(self.required_decel) - 1)
+        lo = max(0, hi - JUSTIFICATION_WINDOW_FRAMES)
+        return any(d >= COMFORT_DECEL_MPS2 for d in self.required_decel[lo : hi + 1])
+
 
     def warranted_at(self, frame: int) -> bool:
         """Whether braking was warranted at all on ``frame``."""
@@ -365,6 +475,20 @@ class OracleVerdict:
         hi = min(frame, len(self.required_decel) - 1)
         lo = max(0, hi - JUSTIFICATION_WINDOW_FRAMES)
         return all(d < NEGLIGIBLE_DECEL_MPS2 for d in self.required_decel[lo : hi + 1])
+
+
+def jerk_limit_mps3(emergency: bool) -> float:
+    """The ceiling on the rate of change of demanded deceleration, m/s^3.
+
+    Args:
+        emergency: True when a genuine emergency was live in the trailing
+            window, or when the system is still completing a stop that was
+            warranted when it began.
+
+    Returns:
+        :data:`EMERGENCY_JERK_MPS3` or :data:`COMFORT_JERK_MPS3`.
+    """
+    return EMERGENCY_JERK_MPS3 if emergency else COMFORT_JERK_MPS3
 
 
 def judge(

@@ -196,6 +196,27 @@ class FrameRecord:
         return self.brake_out > self.brake_in + 1e-9
 
     @property
+    def pedal_conflict(self) -> bool:
+        """True when the emitted command asks for throttle AND brake at once.
+
+        A control fault, not a compromise.  The synthetic plant used to hide
+        this by computing ``2.5*throttle - 8.0*brake``, which nets a full
+        throttle against a full brake into an unremarkable -5.5 m/s^2;
+        :class:`tests.scenarios.plant.Plant` now applies brake override and
+        records the conflict on the frame instead of absorbing it.  This
+        property asks the same question of a REAL recorded run, where there is
+        no plant to ask it of.
+
+        Uses the actuated pedals when they were captured, falling back to the
+        synthesised ones, because the actuated pair is what reaches the wheels.
+        """
+        thr = self.throttle_actuated if self.throttle_actuated is not None else self.throttle_out
+        brk = self.brake_actuated if self.brake_actuated is not None else self.brake_out
+        if thr is None or brk is None:
+            return False
+        return thr > 0.0 and brk > 0.0
+
+    @property
     def intervened_state(self) -> bool:
         """True when the state itself is a degradation (not ``nominal``)."""
         return bool(self.state) and self.state != "nominal"

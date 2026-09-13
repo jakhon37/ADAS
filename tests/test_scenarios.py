@@ -1,16 +1,39 @@
 """Run the safety acceptance library under pytest.
 
-Two kinds of test live here and they are not the same kind of thing:
+Three kinds of test live here and they are not the same kind of thing:
 
 * ``test_harness_*`` check the HARNESS -- that the plant integrates correctly,
-  that the oracle's kinematics agree with hand arithmetic, and that a run is
-  deterministic.  These must always pass; if one fails the specification itself
-  is broken and nothing below it means anything.
+  that the oracle's kinematics agree with hand arithmetic, that a run is
+  deterministic, and that every diagnosis this specification can print is
+  actually REACHABLE.  These must always pass; if one fails the specification
+  itself is broken and nothing below it means anything.
 * ``test_scenario`` checks the SYSTEM against the specification.  A failure
   here is a statement about ``adas.control``, not about this file.  Do not
   relax an expectation to make one of these pass: the expectation is the
   specification, and the physics argument for it is printed in the failure
   message.  Change it only by changing ``docs/SAFETY_SPEC.md`` first.
+* ``test_no_new_scenario_failures`` and ``test_baseline_is_current`` check the
+  BASELINE -- see below.
+
+The baseline
+------------
+The arbiter is broken today, so most of ``test_scenario`` is red, and a wall of
+red hides a regression as effectively as a wall of green.
+``tests/scenarios/baseline.json`` records which scenarios are known to fail and
+with which diagnoses.  It is NOT a suppression list and these are NOT xfails:
+
+* every known failure still fails, still prints its full diagnosis, and still
+  makes the suite red -- a safety failure that stops being visible has stopped
+  being a safety failure;
+* its message is prefixed ``KNOWN FAILURE`` so it can be told apart at a glance
+  from one prefixed ``NEW FAILURE``;
+* ``test_no_new_scenario_failures`` gives the distinction one clean signal, so
+  "did I break something?" is answerable without reading 33 tracebacks;
+* ``test_baseline_is_current`` fails when a listed scenario starts passing, so
+  the file can only ever shrink.
+
+The redesign's target is written down there: the job is done when
+``known_failures`` is empty.
 
 Everything runs on CPU with no engine, no camera and no recording, so this file
 works in CI and off the target board.
@@ -33,15 +56,22 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:  # pragma: no cover - import bootstrap
     sys.path.insert(0, _ROOT)
 
+from adas.core.models import ControlCommand, SafetyState  # noqa: E402
+
 from tests.scenarios import oracle as truth  # noqa: E402
 from tests.scenarios import plant as pl  # noqa: E402
 from tests.scenarios import report as rep  # noqa: E402
 from tests.scenarios import scenario as scen  # noqa: E402
-from tests.scenarios.library import SCENARIOS  # noqa: E402
+
+ALL_SCENARIOS = rep.all_scenarios()
+"""The library plus the independence cases.  The corpus this file grades."""
+
+BASELINE = rep.load_baseline()
+"""The committed known-failure list; ``{}`` when the file has not been written."""
 
 
 # --------------------------------------------------------------------------- #
-# Harness self-checks
+# Harness self-checks: the plant and the oracle
 # --------------------------------------------------------------------------- #
 
 
@@ -129,12 +159,372 @@ def test_harness_oracle_min_gap_is_exact_for_a_braking_lead():
 
 def test_harness_scenario_library_is_well_formed():
     """Every scenario must carry a unique name and a real physics argument."""
-    names = [s.name for s in SCENARIOS]
+    names = [s.name for s in ALL_SCENARIOS]
     assert len(names) == len(set(names))
-    for s in SCENARIOS:
+    for s in ALL_SCENARIOS:
         assert s.frames > 0
         assert len(s.physics) > 200, s.name
         assert len(s.summary) > 10, s.name
+
+
+# --------------------------------------------------------------------------- #
+# Harness self-checks: the new judgement layer
+# --------------------------------------------------------------------------- #
+
+
+def test_harness_jerk_limits_are_derived_not_borrowed():
+    """The jerk ceilings must be the ones this spec derives, not the arbiter's.
+
+    The emergency ceiling is ``full authority / a human panic-brake rise time``
+    = 8.0 / 0.4 = 20 m/s^3, and the comfort ceiling is the top of the band a
+    seated occupant does not register, 2.5 m/s^3.  Neither is read from
+    ``adas.control``; this test pins that, because tuning a limit to whatever
+    the code already does is the exact failure mode this harness exists to
+    prevent.
+    """
+    assert truth.EMERGENCY_JERK_MPS3 == pytest.approx(
+        pl.DEFAULT_PLANT.max_brake_decel_mps2 / 0.4
+    )
+    assert truth.COMFORT_JERK_MPS3 == 2.5
+    assert truth.jerk_limit_mps3(True) == truth.EMERGENCY_JERK_MPS3
+    assert truth.jerk_limit_mps3(False) == truth.COMFORT_JERK_MPS3
+
+
+def test_harness_jerk_series_uses_the_real_step_duration():
+    """A demand step across a 200 ms overrun is a quarter of the jerk of a 50 ms one.
+
+    A frame that took 200 ms really did hold the previous command for 200 ms, so
+    dividing every difference by the nominal period would report four times the
+    jerk the occupant felt.  The plant already measures the true step; the jerk
+    series must use it.
+    """
+    def rec(frame, brake, dt):
+        return scen.FrameRecord(
+            frame=frame,
+            t_s=frame * dt,
+            true=pl.WorldState(frame=frame, ego_v_mps=20.0, dt_s=dt),
+            perception_ok=True,
+            detected=False,
+            plan_reason="",
+            plan_target_mps=20.0,
+            raw_command=ControlCommand(0.0, brake, 0.0),
+            command=ControlCommand(0.0, brake, 0.0),
+            safety_state=SafetyState.NOMINAL,
+        )
+
+    fast = scen.commanded_jerk_series([rec(0, 0.0, 0.05), rec(1, 0.25, 0.05)])
+    slow = scen.commanded_jerk_series([rec(0, 0.0, 0.05), rec(1, 0.25, 0.20)])
+    assert fast[1] == pytest.approx(0.25 * 8.0 / 0.05)
+    assert slow[1] == pytest.approx(0.25 * 8.0 / 0.20)
+
+
+def test_harness_self_report_policy_matches_the_stated_rule():
+    """Own output and own proprioception are assertable; exteroception is not.
+
+    In particular the arbiter's ``_arbiter_induced`` / ``_arbiter_commanded``
+    suffixes must NOT exempt a finding: they attribute it, and an occupant does
+    not feel an attribution.
+    """
+    for code in (
+        "jerk_32.2_above_15.0",
+        "jerk_32.2_above_15.0_arbiter_induced",
+        "measured_decel_9.10_above_8.00_unjustified",
+        "measured_decel_9.10_above_8.00_arbiter_commanded",
+        "command_throttle_brake_conflict",
+        "command_not_finite",
+        "decision_path_exception",
+    ):
+        assert scen.is_assertable_self_report(code), code
+    for code in (
+        "gap_8.10m_below_absolute_min",
+        "ttc_1.20s_below_warn_threshold",
+        "perception_dropout_7:source",
+        "camera_uncalibrated",
+        "range_jump_track1",
+        "timing_dt_above_max_0.190s",
+        "lane_departure_1.10m_above_0.80m",
+        "plan_accel_3.20_above_2.50_arbiter_induced",
+    ):
+        assert not scen.is_assertable_self_report(code), code
+    assert scen.self_report_family("jerk_32.2_above_15.0_arbiter_induced") == "jerk_above_limit"
+
+
+def test_harness_stack_spec_rejects_unknown_modes():
+    """A typo in a stack mode must not silently fall back to the real stack."""
+    with pytest.raises(ValueError):
+        scen.StackSpec(planner="mostly_real")
+    with pytest.raises(ValueError):
+        scen.StackSpec(arbiter="advisory")
+    assert scen.DEFAULT_STACK.is_default
+    assert not scen.ARBITER_ONLY_STACK.is_default
+    assert scen.ARBITER_ONLY_STACK.arbiter_only
+
+
+def test_harness_blinding_the_planner_does_not_blind_the_arbiter():
+    """PLANNER_BLIND must remove the planner's objects and nothing else.
+
+    If it also emptied the arbiter's track list the independence scenarios would
+    be measuring nothing, and they would pass by being vacuous -- which is
+    exactly how ``reid_during_steady_follow`` used to pass.
+    """
+    blind = scen.run(_stationary_case("blind_probe", scen.ARBITER_ONLY_STACK))
+    assert max(r.raw_decel_mps2 for r in blind.records) == pytest.approx(0.0), (
+        "the blinded primary path braked anyway, so the planner still sees the car"
+    )
+    assert max(r.arbiter_decel_mps2 for r in blind.records) >= truth.EMERGENCY_DECEL_MPS2, (
+        "the arbiter did not brake, so it never received the tracks either"
+    )
+
+
+def test_harness_bypassing_the_arbiter_actuates_the_primary_command():
+    """ARBITER_BYPASS must actuate the primary path byte for byte.
+
+    An arbiter whose answer leaked through would make every primary-path claim
+    in this suite unfalsifiable.
+    """
+    result = scen.run(_stationary_case("bypass_probe", scen.PRIMARY_ONLY_STACK))
+    for r in result.records:
+        assert r.command.brake == r.raw_command.brake, r.frame
+        assert r.command.throttle == r.raw_command.throttle, r.frame
+    assert any(
+        r.arbiter_command is not None and r.arbiter_command.brake != r.raw_command.brake
+        for r in result.records
+    ), "the arbiter never disagreed, so this run proves nothing about bypassing it"
+
+
+# --------------------------------------------------------------------------- #
+# Harness self-checks: every diagnosis must be reachable
+# --------------------------------------------------------------------------- #
+#
+# The first version of this harness never emitted collided, collided_unavoidable,
+# clearance, missed_intervention, late_intervention, no_response or
+# lane_departure against EITHER known-broken commit.  Half the specification was
+# decorative and nothing said so.  A diagnosis that cannot fire is worse than a
+# missing one, because it reads as coverage.
+
+
+def _stationary_case(name: str, stack: scen.StackSpec, gap_m: float = 40.0) -> scen.Scenario:
+    """A stopped car ``gap_m`` ahead of an ego at 20 m/s, run on ``stack``."""
+    return scen.Scenario(
+        name=name,
+        summary="stopped vehicle ahead, used as a fixed physical demand",
+        physics="20 m/s into a stopped car at %.0f m. Keeping 2.0 m of clearance leaves "
+        "%.0f m of usable closure so %.2f m/s^2 is required, against 8.0 m/s^2 of "
+        "authority: an unambiguous emergency with margin to spare. Used as a constant "
+        "demand while the stack under it is varied." % (
+            gap_m, gap_m - 2.0, 400.0 / (2.0 * (gap_m - 2.0))
+        ),
+        frames=140,
+        ego_speed_mps=20.0,
+        lead=pl.LeadSpec(gap_m, 0.0, pl.lead_stationary(), label="stopped car"),
+        stack=stack,
+        expect=scen.Expectation(must_intervene=True),
+    )
+
+
+NULL_STACK = scen.StackSpec(planner=scen.PLANNER_BLIND, arbiter=scen.ARBITER_BYPASS)
+"""Nothing in the stack can see the obstacle and nothing can override that.
+
+Not an acceptance case -- no system is required to survive having both halves
+removed.  It is the harness's own control: a run in which the vehicle
+demonstrably drives into a stopped car, so that a specification which stays
+silent about it can be shown to be broken.
+"""
+
+
+def test_harness_collision_diagnoses_fire_when_nothing_brakes():
+    """With the whole decision path removed, the collision half must fire.
+
+    Both layers are gone, the car ahead is stopped, and the physics is
+    arithmetic: 40 m at 20 m/s with no braking is contact at t = 2.0 s.  If this
+    run produces no collision diagnosis then the detector is broken, and every
+    green ``must_intervene`` scenario in the library is meaningless.
+    """
+    result = scen.run(_stationary_case("null_stack_probe", NULL_STACK))
+    codes = {f.code for f in result.findings}
+    assert result.verdict.collided, result.metrics
+    assert max(r.commanded_decel_mps2 for r in result.records) < truth.NEGLIGIBLE_DECEL_MPS2
+    assert "collided" in codes, codes
+    assert "missed_intervention" in codes, codes
+
+
+def test_harness_no_response_fires_for_an_ignored_sub_emergency_approach():
+    """A closing lead that never becomes an emergency, and a system that sleeps.
+
+    Ego 20 m/s, lead 30 m ahead holding 14 m/s, for 3 s.  Closing at 6 m/s the
+    gap runs 30 m -> 12 m and the requirement to keep 2.0 m of clearance peaks
+    at 6^2 / (2 x 10) = 1.8 m/s^2 -- a real requirement, above the 1.0 m/s^2
+    hazard floor, and below the 3.0 m/s^2 comfort line, so no emergency ever
+    exists and the ``missed_intervention`` branch above cannot fire.  Doing
+    NOTHING here is still wrong, and ``no_response`` is the only diagnosis that
+    says so.
+    """
+    scenario = scen.Scenario(
+        name="no_response_probe",
+        summary="a slower lead closed on and ignored entirely",
+        physics="Ego 20 m/s, lead 30 m ahead at a steady 14 m/s. The closing rate is "
+        "6 m/s throughout, so over 3 s the gap runs from 30 m to 12 m and the constant "
+        "deceleration needed to keep the 2.0 m standstill clearance rises from "
+        "36/(2 x 28) = 0.64 m/s^2 to 36/(2 x 10) = 1.8 m/s^2. That is above the "
+        "1.0 m/s^2 floor below which nothing is a hazard and below the 3.0 m/s^2 "
+        "comfort line, so this is an ordinary following correction and never an "
+        "emergency. A system that commands literally nothing has still failed.",
+        frames=60,
+        ego_speed_mps=20.0,
+        lead=pl.LeadSpec(30.0, 14.0, pl.lead_constant_speed(), label="slower car"),
+        stack=NULL_STACK,
+        expect=scen.Expectation(must_intervene=True),
+    )
+    result = scen.run(scenario)
+    codes = {f.code for f in result.findings}
+    assert not result.verdict.emergency, result.metrics
+    assert "no_response" in codes, codes
+
+
+def test_harness_missed_intervention_fires_for_a_token_brake():
+    """A system that brakes, but never at emergency grade, must be caught.
+
+    ``no_response`` covers doing nothing at all.  ``missed_intervention`` covers
+    the more dangerous case -- a real brake demand that is simply too small --
+    and it needs its own proof of life because the two are different branches.
+    """
+    scenario = _stationary_case("token_brake_probe", NULL_STACK)
+    result = scen.run(scenario)
+    # Replace the (empty) demand with a token 2 m/s^2 that never reaches
+    # emergency grade, and re-judge the SAME run.
+    for r in result.records:
+        r.command = ControlCommand(0.0, 0.25, 0.0)
+    findings = scen.evaluate(scenario, result.records, result.verdict, [])
+    codes = {f.code for f in findings}
+    assert "missed_intervention" in codes, codes
+    assert "no_response" not in codes, codes
+
+
+def test_harness_unavoidable_contact_is_reported_as_mis_specified():
+    """A scenario that cannot be survived must say so, not blame the system.
+
+    20 m/s at a stopped car 4 m away needs 50 m/s^2.  The right diagnosis is
+    ``collided_unavoidable`` -- a statement about the SCENARIO -- and a harness
+    that reported plain ``collided`` here would be manufacturing a bug report
+    out of its own arithmetic.
+    """
+    result = scen.run(_stationary_case("unavoidable_probe", NULL_STACK, gap_m=4.0))
+    codes = {f.code for f in result.findings}
+    assert result.verdict.avoidable is False, result.metrics
+    assert "collided_unavoidable" in codes, codes
+
+
+def test_harness_clearance_and_lateral_diagnoses_fire():
+    """``clearance`` and ``lane_departure`` must both be reachable."""
+    scenario = scen.Scenario(
+        name="clearance_probe",
+        summary="a stopped car reached with less room than the spec demands",
+        physics="Ground truth is checked directly: this run ends 2.4 m from a stopped "
+        "car while sitting 1.2 m off the lane centre. A specification that asks for "
+        "10 m of clearance and 0.5 m of lane discipline must report both, from the "
+        "plant's own state and not from anything the system said about itself.",
+        frames=140,
+        ego_speed_mps=20.0,
+        lead=pl.LeadSpec(40.0, 0.0, pl.lead_stationary(), label="stopped car"),
+        initial_lateral_offset_m=1.2,
+        expect=scen.Expectation(
+            min_clearance_m=10.0, max_abs_lateral_offset_m=0.5, no_collision=False
+        ),
+    )
+    codes = {f.code for f in scen.run(scenario).findings}
+    assert "clearance" in codes, codes
+    assert "lane_departure" in codes, codes
+
+
+def test_harness_pedal_conflict_and_jerk_diagnoses_fire():
+    """Both pedals at once, and a one-frame full-authority step, must be caught.
+
+    Judged on hand-built frames rather than on a run, because no mode of this
+    stack emits both pedals -- which is the correct answer for the stack and
+    the wrong reason to leave the detector untested.
+    """
+    scenario = _stationary_case("pedal_probe", scen.DEFAULT_STACK)
+    base = scen.run(scenario)
+    records = base.records[:20]
+    records[5].command = ControlCommand(0.6, 0.6, 0.0)
+    records[10].command = ControlCommand(0.0, 1.0, 0.0)
+    records[11].command = ControlCommand(0.0, 0.0, 0.0)
+    codes = {f.code for f in scen.evaluate(scenario, records, base.verdict, [])}
+    assert "pedal_conflict" in codes, codes
+    assert "excess_jerk" in codes, codes
+
+
+def test_harness_sub_emergency_band_is_policed():
+    """A steady 3.0 m/s^2 with nothing in the world must be a finding.
+
+    3.0 m/s^2 is below the 3.5 m/s^2 emergency threshold, so the phantom test
+    cannot see it, and it is twice the 1.5 m/s^2 a headway law may use.  This is
+    the band a phantom brake retreats into when the AEB path is 'fixed'.
+    """
+    scenario = scen.Scenario(
+        name="sub_emergency_probe",
+        summary="empty road, steady sub-emergency brake",
+        physics="Nothing is in the world at all, so the true collision-avoidance "
+        "requirement is identically zero on every frame and the justified ceiling is "
+        "the 1.5 m/s^2 headway allowance. A steady 3.0 m/s^2 is twice that and below "
+        "the 3.5 m/s^2 emergency threshold, so it is invisible to any AEB-grade test "
+        "while still dragging the vehicle down the road.",
+        frames=60,
+        ego_speed_mps=25.0,
+        lead=None,
+        expect=scen.Expectation(),
+    )
+    base = scen.run(scenario)
+    for r in base.records:
+        r.command = ControlCommand(0.0, 3.0 / 8.0, 0.0)
+    findings = scen.evaluate(scenario, base.records, base.verdict, [])
+    codes = {f.code for f in findings}
+    assert "unwarranted_brake" in codes, codes
+    assert "phantom_intervention" not in codes, (
+        "3.0 m/s^2 is below emergency grade; the sub-emergency finding must carry it"
+    )
+
+
+def test_harness_every_finding_code_is_reachable_or_named():
+    """No diagnosis may exist without something in this file able to produce it.
+
+    The check is deliberately crude -- every code the corpus and the probes
+    above can emit, unioned, must cover every code named in the report's own
+    vocabulary.  It exists so that adding a ``Finding`` with no way to trigger
+    it is a test failure at the moment it is added, rather than a discovery two
+    rounds of fixes later.
+    """
+    emitted = set()
+    for r in rep.run_all():
+        emitted |= {f.code for f in r.findings}
+    reachable_by_probe = {
+        "collided",
+        "collided_unavoidable",
+        "no_response",
+        "missed_intervention",
+        "clearance",
+        "lane_departure",
+        "pedal_conflict",
+        "excess_jerk",
+        "unwarranted_brake",
+    }
+    unreached = COLLISION_HALF - (emitted | reachable_by_probe)
+    assert not unreached, (
+        "these collision diagnoses can be printed but nothing here can make them "
+        "fire, so they are decoration: %s" % sorted(unreached)
+    )
+
+
+COLLISION_HALF = {
+    "collided",
+    "collided_unavoidable",
+    "clearance",
+    "missed_intervention",
+    "late_intervention",
+    "no_response",
+    "lane_departure",
+}
+"""The half of the specification that never fired in the first version."""
 
 
 # --------------------------------------------------------------------------- #
@@ -144,33 +534,143 @@ def test_harness_scenario_library_is_well_formed():
 
 @pytest.fixture(scope="session")
 def results():
-    """Run the whole library once and share it across the tests."""
+    """Run the whole corpus once and share it across the tests."""
     return {r.scenario.name: r for r in rep.run_all()}
 
 
-@pytest.mark.parametrize("name", [s.name for s in SCENARIOS])
-def test_scenario(results, name):
-    """The system must satisfy the specification for this scenario."""
-    result = results[name]
-    if result.passed:
-        return
-    lines = [
-        "",
-        "SCENARIO %s FAILED" % name,
-        "  %s" % result.scenario.summary,
-        "",
-        "diagnosis:",
-    ]
+def _failure_message(result, header: str, extra: str = "") -> str:
+    lines = ["", "%s: %s" % (header, result.scenario.name), "  %s" % result.scenario.summary]
+    if not result.scenario.stack.is_default:
+        lines.append("  stack: %s" % result.scenario.stack.label)
+    lines += ["", "diagnosis:"]
     for f in result.findings:
         lines.append("  %s: %s" % (f.code.upper(), f.detail))
-    lines += [
-        "",
-        "why this outcome is required:",
-        "  %s" % result.scenario.physics,
-        "",
-        "metrics: %s" % json.dumps(result.metrics, sort_keys=True),
-    ]
-    pytest.fail("\n".join(lines), pytrace=False)
+    lines += ["", "why this outcome is required:", "  %s" % result.scenario.physics]
+    if extra:
+        lines += ["", extra]
+    lines += ["", "metrics: %s" % json.dumps(result.metrics, sort_keys=True)]
+    return "\n".join(lines)
+
+
+@pytest.mark.parametrize("name", [s.name for s in ALL_SCENARIOS])
+def test_scenario(results, name):
+    """The system must satisfy the specification for this scenario.
+
+    A scenario in ``baseline.json`` still fails here -- loudly, with its full
+    diagnosis.  The only difference is the header, which says whether this is
+    breakage the redesign already knows about or breakage that appeared today.
+    """
+    result = results[name]
+    codes = sorted({f.code for f in result.findings})
+    if result.passed:
+        return
+    known = BASELINE.get(name)
+    if known is None:
+        pytest.fail(
+            _failure_message(
+                result,
+                "NEW FAILURE -- SCENARIO",
+                "This scenario is not in tests/scenarios/baseline.json, so this is a "
+                "REGRESSION introduced since the baseline was recorded. Fix the system. "
+                "Adding the scenario to the baseline is not a fix.",
+            ),
+            pytrace=False,
+        )
+    worse = sorted(set(codes) - set(known))
+    if worse:
+        pytest.fail(
+            _failure_message(
+                result,
+                "WORSENED -- SCENARIO",
+                "This scenario is in the baseline, but with %s. It has now also failed "
+                "with %s, which is new breakage inside a known-broken case."
+                % (", ".join(known), ", ".join(worse)),
+            ),
+            pytrace=False,
+        )
+    pytest.fail(
+        _failure_message(
+            result,
+            "KNOWN FAILURE -- SCENARIO",
+            "Recorded in tests/scenarios/baseline.json with exactly these diagnoses. "
+            "This is one of the %d defects the arbiter redesign exists to remove; the "
+            "redesign is finished when that file is empty. It is reported here rather "
+            "than skipped because a safety failure that stops being visible has "
+            "stopped being a safety failure." % len(BASELINE),
+        ),
+        pytrace=False,
+    )
+
+
+def test_no_new_scenario_failures(results):
+    """One clean signal for "did anything get worse today?".
+
+    Without this, the answer is buried in a wall of expected red.  This test
+    passes while the known defects are exactly the known defects, and fails the
+    moment a scenario fails that the baseline did not predict.
+    """
+    if not BASELINE:
+        pytest.skip("no baseline recorded yet: run report.py --write-baseline")
+    split = rep.classify_against_baseline(list(results.values()))
+    problems = []
+    for name, codes in sorted(split["new"].items()):
+        problems.append("  NEW       %-40s %s" % (name, ", ".join(codes)))
+    for name, codes in sorted(split["worsened"].items()):
+        problems.append("  WORSENED  %-40s also fails with %s" % (name, ", ".join(codes)))
+    if problems:
+        pytest.fail(
+            "\n".join(
+                [
+                    "",
+                    "%d scenario(s) fail in a way the committed baseline did not predict."
+                    % len(problems),
+                    "The known defects are listed in tests/scenarios/baseline.json; these",
+                    "are not among them, so something regressed.",
+                    "",
+                ]
+                + problems
+                + [
+                    "",
+                    "Do not add these to the baseline to make this pass. The baseline is "
+                    "the redesign's target and it is only allowed to shrink.",
+                ]
+            ),
+            pytrace=False,
+        )
+
+
+def test_baseline_is_current(results):
+    """A scenario that has started passing must be removed from the baseline.
+
+    This is the ratchet.  Without it the baseline decays into a list of things
+    that used to be broken, and it stops being usable as the redesign's
+    definition of done.
+    """
+    if not BASELINE:
+        pytest.skip("no baseline recorded yet: run report.py --write-baseline")
+    split = rep.classify_against_baseline(list(results.values()))
+    if split["fixed"]:
+        pytest.fail(
+            "\n".join(
+                [
+                    "",
+                    "%d scenario(s) now PASS but are still listed in "
+                    "tests/scenarios/baseline.json:" % len(split["fixed"]),
+                ]
+                + ["  %s" % n for n in sorted(split["fixed"])]
+                + [
+                    "",
+                    "Good news, and the file has to say so. Re-record it with:",
+                    "  python -m tests.scenarios.report --write-baseline",
+                ]
+            ),
+            pytrace=False,
+        )
+    missing = sorted(set(BASELINE) - {s.name for s in ALL_SCENARIOS})
+    assert not missing, (
+        "baseline.json names scenarios that no longer exist: %s. A scenario cannot be "
+        "retired by deleting it while it is still failing." % missing
+    )
 
 
 def test_report_json_is_serialisable(results):
@@ -178,8 +678,15 @@ def test_report_json_is_serialisable(results):
     payload = rep.to_json(list(results.values()))
     text = json.dumps(payload, sort_keys=True)
     back = json.loads(text)
-    assert back["summary"]["total"] == len(SCENARIOS)
-    assert set(back["margins"]) >= {"contact_gap_m", "required_clearance_m"}
+    assert back["summary"]["total"] == len(ALL_SCENARIOS)
+    assert set(back["margins"]) >= {
+        "contact_gap_m",
+        "required_clearance_m",
+        "headway_decel_allowance_mps2",
+        "comfort_jerk_mps3",
+        "emergency_jerk_mps3",
+    }
+    assert set(back["baseline"]) == {"new", "known", "worsened", "fixed"}
 
 
 def test_report_table_renders(results):

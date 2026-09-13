@@ -6,6 +6,12 @@ braking and the false "0 frames at brake = 1.00" claim were each found by
 sweeping an envelope or by reading a real run frame by frame, never by a
 hand-written case.
 
+**The sweep is the primary longitudinal safety gate.** The hand-picked scenario
+library in `tests/scenarios/library.py` is the readable specification and it is
+enforced under pytest, but it missed both of this module's historical failures
+and the sweep found both. So `scripts/run_safety_sweep.py --gate` is what a
+change has to pass; `docs/SAFETY_SPEC.md` is what explains why.
+
 | | what it answers | needs a GPU |
 |---|---|---|
 | `scripts/run_safety_sweep.py` | over the whole operating envelope, *where* does the arbiter brake when it should not, and fail to brake when it must? | no |
@@ -23,11 +29,15 @@ suite, so there is one specification rather than two.
 ### Running it
 
 ```bash
-# CI resolution: 54 cells, ~7 s, fails the build on a collision or a phantom
-PYTHONPATH=src:. python3 scripts/run_safety_sweep.py --profile fast \
-    --fail-on COLLISION,MISSED,PHANTOM
+# THE GATE. 96 cells, ~11 s on the Xavier NX. Non-zero exit on any collision,
+# miss, phantom, early or late intervention, or sub-emergency band fault.
+PYTHONPATH=src:. python3 scripts/run_safety_sweep.py --gate
 
-# the default envelope: 840 cells, ~100 s on the Xavier NX
+# same, with the committed artifact for diffing against the previous revision
+PYTHONPATH=src:. python3 scripts/run_safety_sweep.py --gate \
+    --json build/safety_sweep_gate.json
+
+# the default envelope: 1260 cells, ~2.5 min on the Xavier NX
 PYTHONPATH=src:. python3 scripts/run_safety_sweep.py --json /tmp/sweep.json
 
 # the dense envelope, for finding a boundary precisely by hand
@@ -38,21 +48,44 @@ PYTHONPATH=src:. python3 scripts/run_safety_sweep.py --ego 15 \
     --range 12,15,18,20,22,25,28,30 --rate 0 --lead-decel 0
 ```
 
-No GPU, no TensorRT, no camera, no network. Deterministic: the same arguments
-produce the same bytes, every time. `--json` writes every cell for diffing two
-revisions of the arbiter against each other.
+`--gate` overrides `--profile` and `--fail-on` so the gate cannot be quietly
+weakened by adding a flag. It fails on
 
-### The three profiles
+```
+COLLISION, MISSED, PHANTOM, LATE, EARLY, BAND_UNWARRANTED
+```
+
+which is both directions: `COLLISION` and `MISSED` are the passive one,
+`PHANTOM`, `EARLY` and `BAND_UNWARRANTED` the aggressive one, and `LATE` is
+intervening after the last moment the vehicle could still stop with room. A gate
+that omitted either direction is how this arbiter came to oscillate between them.
+
+No GPU, no TensorRT, no camera, no network. Deterministic: the same arguments
+produce the same bytes, every time — verified by running the gate twice and
+diffing both the text and the JSON. `--json` writes every cell, so the artifact
+can be committed and two revisions of the arbiter diffed against each other.
+
+### The three profiles, and why their range axes are what they are
 
 | profile | cells | axes | time |
 |---|---|---|---|
-| `fast` | 54 | ego {10,20,30} × range {8,20,45} × rate {0,−2,−8} × lead decel {0,6} | ~7 s |
-| `standard` | 840 | ego {5..30 step 5} × range {5,8,12,15,20,25,30,45,60,80} × rate {+3,0,−1,−2,−4,−8,−15} × lead decel {0,6} | ~100 s |
-| `dense` | 6600 | halved ego and range steps, lead decel {0,3,6} | ~13 min |
+| `fast` (the gate) | 96 | ego {15,20,25} × range {12,16,26,32,40,44,52,70} × rate {0,−8} × lead decel {0,6} | ~11 s |
+| `standard` | 1260 | ego {5..30 step 5} × range {5,8,12,16,20,26,30,32,40,43,44,52,60,70,80} × rate {+3,0,−1,−2,−4,−8,−15} × lead decel {0,6} | ~2.5 min |
+| `dense` | 9900 | halved ego and range steps, 30 ranges, lead decel {0,3,6} | ~20 min |
 
-`standard` reproduces the historical 336-cell envelope and adds the two ranges
-(15 m and 25 m) that the round-2 collision report named, on both lead-braking
-axes. Every profile contains `(rate = 0, decel = 0)` — the constant-range scene
+A grid whose sample points all sit inside a failure region reports its width as
+the width of the grid, and one whose points all sit outside reports it as zero.
+Both are wrong, and the first version of the scenario library made exactly the
+second mistake. So every profile keeps **at least one range either side of every
+boundary this envelope is known to contain**:
+
+| boundary | measured on | value | straddled by |
+|---|---|---|---|
+| constant-range phantom | `25e3ba5` | 26 m at 15 m/s, 43 m at 20 m/s, 66 m at 25 m/s | 26/32 · 40/44 · 52/70 |
+| avoidable contact, lead braking at 6 m/s² | `1ce4886` | 16–26 m at 20 m/s (full stack) | 12/16 · 26/32 |
+| stopped-obstacle avoidability = the plant's own stop distance | plant | 14.70 m at 15 m/s, 25.85 m at 20 m/s, 40.13 m at 25 m/s | 12/16 · 26/32 · 40/44 |
+
+Every profile still contains `(rate = 0, decel = 0)` — the constant-range scene
 that fix round 1 phantom-braked for — and `(rate = 0, decel = 6)` — the braking
 lead that fix round 2 collided with.
 
@@ -114,11 +147,44 @@ comfort-limited ramp cannot be mistaken for an AEB) or when the state is
 | `MISSED` | `M` | an emergency arose inside the window and no emergency-grade intervention followed |
 | `INFEASIBLE` | (blank) | the implied lead speed is negative: head-on, outside a following ODD |
 
-The **headway** requirement is graded separately (`SOFT_OK`, `SOFT_PHANTOM`,
-`SOFT_MISSED`) against an RSS-style safe following gap. Following at 5 m at
-30 m/s with a matched speed is unsafe headway; the correct answer is to open the
-gap, not to brake at full authority. Conflating the two is exactly what produced
-the phantom, so a gentle deceleration is never counted as an emergency failure.
+### Three independent gradings
+
+The verdict above is one of three. Each is a different question about the same
+cells, and a cell can be right about one and wrong about another.
+
+| grading | field | values |
+|---|---|---|
+| emergency | `verdict` | `CORRECT` / `COLLISION` / `PHANTOM` / `EARLY` / `LATE` / `MISSED` / `INFEASIBLE` |
+| headway | `headway_verdict` | `SOFT_OK` / `SOFT_PHANTOM` / `SOFT_MISSED` |
+| sub-emergency band | `band_verdict` | `BAND_OK` / `BAND_UNWARRANTED` |
+
+The **headway** requirement is graded against an RSS-style safe following gap.
+Following at 5 m at 30 m/s with a matched speed is unsafe headway; the correct
+answer is to open the gap, not to brake at full authority. Conflating the two is
+exactly what produced the phantom, so a gentle deceleration is never counted as
+an emergency failure.
+
+The **sub-emergency band** is 3.0–3.5 m/s²: above `COMFORT_DECEL_MPS2`, below
+`EMERGENCY_DECEL_MPS2`. It was added after the backtest of the scenario library
+found it structurally invisible to everything else. The emergency grading starts
+at 3.5 m/s², so 3.4 m/s² is not an intervention to it; the headway grading only
+asks whether *some* response happened, so 3.4 m/s² satisfies it. Between them a
+system can brake harder than any passenger would tolerate, for a whole run,
+against a lead that never moved, and score `CORRECT` / `SOFT_OK` on every cell.
+That is not hypothetical — `1ce4886` holds 3.0–3.3 m/s² on a constant-range
+follow at every gap from 26 m to 44 m at 20 m/s, and 248 of its 1170 graded
+cells are `BAND_UNWARRANTED`.
+
+A cell is `BAND_UNWARRANTED` when a command in the band, held for at least
+`band_frames_min` frames (3, the plant's own brake rise time, so a ramp edge is
+not mistaken for a hold), first appears on a frame at which **neither** an
+emergency has arisen (`warrant`) **nor** the headway has become unsafe. Nothing
+in the scene asks for more than comfort at that instant, so the excess is the
+system's own. Braking firmly to open a genuinely short gap is `BAND_OK`.
+
+The band is closed at the bottom: a command of exactly 3.0 m/s² counts. The
+comfort limit is the largest deceleration a headway law may use, so spending all
+of it when there is no headway deficit is already the fault.
 
 ### Reading the output
 
@@ -136,6 +202,30 @@ and you should widen the axis before believing the extent.
 The **GRIDS** section prints one table per `(rate, lead decel)` slice, rows by
 range and columns by ego speed, so a failure region shows up as a contiguous
 block of one letter. That shape is the diagnosis; the count is not.
+
+A second set of grids, and a second **SUB-EMERGENCY BAND REGIONS** section,
+print the band grading the same way with `B` for `BAND_UNWARRANTED`. Reading the
+two together is the point. On `25e3ba5` at ego 20 m/s with a constant range, the
+gate prints:
+
+```
+  relative rate +0 m/s, lead braking at 0 m/s^2      SUB-EMERGENCY BAND
+  range \ ego |    15    20    25                   range \ ego |    15    20    25
+  -------------------------------                    -------------------------------
+          70  |     .     .     .                            70  |     .     .     .
+          52  |     .     .     P                            52  |     .     .     .
+          44  |     .     .     P                            44  |     .     B     .
+          40  |     .     P     P                            40  |     .     .     .
+          32  |     .     P     P                            32  |     .     .     .
+          26  |     P     P     P                            26  |     .     .     .
+          16  |     P     P     P                            16  |     .     .     .
+          12  |     P     P     P                            12  |     .     .     .
+```
+
+The emergency phantom stops at 43 m and the band picks up at 44 m. Without the
+second grid the 44 m cell reads as `CORRECT`, and the boundary looks like a
+cliff rather than what it is: full authority becoming 3.2 m/s² of unwarranted
+braking.
 
 ---
 
@@ -267,107 +357,128 @@ clean result.
 
 ---
 
-## 4. Measured results against the current arbiter
+## 4. Measured results against both broken commits
 
-Commit `1ce4886` ("Arbiter round 2: phantom AEB removed, missed-braking
-regression introduced"), Jetson Xavier NX, JetPack 5.1.6, Python 3.8.10.
-Reported verbatim.
+Jetson Xavier NX, JetPack 5.1.6, Python 3.8.10. Reported verbatim. Both commits
+were run in detached worktrees with an identical copy of the harness, so the
+only difference between the two columns is `src/adas/control/arbiter.py`:
 
-### Sweep, `--profile standard`, 840 cells (780 graded, 60 infeasible)
+* `25e3ba5` — "Fix round 1: three safety blockers fixed, three new ones found",
+  arbiter md5 `d85a8a2b`. **Phantom braking.**
+* `1ce4886` — "Arbiter round 2: phantom AEB removed, missed-braking regression
+  introduced", arbiter md5 `d517e2aa`. **Missed braking.** This is HEAD's
+  arbiter.
 
-```
-COLLISION   174  (22.3% of graded)
-PHANTOM      52  ( 6.7% of graded)
-LATE         26  ( 3.3% of graded)
-EARLY       193  (24.7% of graded)
-CORRECT     335  (42.9% of graded)
-FAILURES    445
-headway (graded separately): SOFT_OK 716, SOFT_PHANTOM 64
-of the PHANTOM and EARLY cells, 149 fired on a frame where the closing rate
-was still the seeded prior, not a measurement
-```
-
-**The phantom is not gone. It has a clean boundary at range ≈ ego speed × 1 s.**
-With a lead holding a *constant* range and a constant *opening* range alike:
+### The gate, `--gate` (96 cells, ~11 s each)
 
 ```
-PHANTOM for every in-path range <=  5 m at ego  5 m/s ...; correct from  8 m out
-PHANTOM for every in-path range <= 12 m at ego 10 m/s ...; correct from 15 m out
-PHANTOM for every in-path range <= 15 m at ego 15 m/s ...; correct from 20 m out
-PHANTOM for every in-path range <= 20 m at ego 20 m/s ...; correct from 25 m out
-PHANTOM for every in-path range <= 25 m at ego 25 m/s ...; correct from 30 m out
-PHANTOM for every in-path range <= 30 m at ego 30 m/s ...; correct from 45 m out
+25e3ba5:  FAIL: BAND_UNWARRANTED=3,  COLLISION=5,  EARLY=18, LATE=4, PHANTOM=15
+1ce4886:  FAIL: BAND_UNWARRANTED=19, COLLISION=21, EARLY=15, LATE=8, PHANTOM=7
 ```
 
-```
-  relative rate +0 m/s, lead braking at 0 m/s^2
-  range \ ego |     5    10    15    20    25    30
-  -------------------------------------------------
-          80  |     .     .     .     .     .     .
-          60  |     .     .     .     .     .     .
-          45  |     .     .     .     .     .     .
-          30  |     .     .     .     .     .     P
-          25  |     .     .     .     .     P     P
-          20  |     .     .     .     P     P     P
-          15  |     .     .     P     P     P     P
-          12  |     .     P     P     P     P     P
-           8  |     .     P     P     P     P     P
-           5  |     P     P     P     P     P     P
-```
+Both exit 1. Read the signature rather than the total: `25e3ba5` is
+phantom-heavy and `1ce4886` is collision-heavy, which is precisely what the two
+commit messages claim and what three rounds of tuning oscillated between. A
+ten-second grid separates them, because its eight ranges were chosen to straddle
+the boundaries rather than to cover the axis evenly.
 
-Every one of these fires on frame 0 with the closing rate still seeded. Isolated:
+### `--profile standard`, 1260 cells (1170 graded, 90 infeasible)
 
-```
-$ python3 scripts/run_safety_sweep.py --ego 20 --range 20 --rate 0 --lead-decel 0
-PHANTOM  ego 20.0  range 20.0  rate +0.0  lead_decel 0.0
-         warrant=None mandate=None lost=None | hard=0 soft=0
-         max_cmd_decel=5.00 max_demand=5.00
-         first hard state limited; rate was INFERRED, not measured
-         findings ttc_0.80s_below_warn_threshold, headway_20.0m_below_rss_45.3m,
-                  aeb_deferred_unmeasured_rate_-20.0m/s_track1
-```
+| | `25e3ba5` | `1ce4886` |
+|---|---|---|
+| `COLLISION` | 96 (8.2%) | **235 (20.1%)** |
+| `PHANTOM` | **98 (8.4%)** | 52 (4.4%) |
+| `LATE` | 16 (1.4%) | 47 (4.0%) |
+| `EARLY` | **333 (28.5%)** | 261 (22.3%) |
+| `CORRECT` | 627 (53.6%) | 575 (49.1%) |
+| `BAND_UNWARRANTED` | 90 | **248** |
+| `SOFT_PHANTOM` | 88 | 88 |
+| fired on a seeded, unmeasured rate | 431 | 149 |
 
-A lead sitting at a rock-steady 20 m draws 5.0 m/s² on the first frame it is
-seen, justified by a fabricated `-ego_speed` rate. Round 1's phantom commanded
-brake 1.00; this one commands 0.62. It is attenuated, not removed.
-
-**The missed braking is confirmed, and it is worse than "missed": it collides.**
-The round-2 report said the arbiter collides against a lead braking at 6 m/s² at
-ego 20 m/s from 15, 20, 25 and 30 m. The sweep found exactly that, independently:
+### Boundary 1 — the constant-range phantom, `25e3ba5`
 
 ```
-COLLISION at ego 20 m/s (rate +0, lead_decel 6) for ranges 12, 15, 20, 25, 30
-COLLISION for every in-path range <= 30 m at ego 20 m/s (rate -8, lead_decel 6); correct from 45 m out
-COLLISION for every in-path range <= 45 m at ego 25 m/s (rate -8, lead_decel 6); correct from 60 m out
-COLLISION for every in-path range <= 15 m at ego 20 m/s (rate -15, lead_decel 0); correct from 20 m out
+PHANTOM for every in-path range <=  8 m at ego  5 m/s (rate +0, lead_decel 0); correct from 12 m out
+PHANTOM for every in-path range <= 12 m at ego 10 m/s (rate +0, lead_decel 0); correct from 16 m out
+PHANTOM for every in-path range <= 26 m at ego 15 m/s (rate +0, lead_decel 0); correct from 30 m out
+PHANTOM for every in-path range <= 43 m at ego 20 m/s (rate +0, lead_decel 0); correct from 44 m out
+PHANTOM for every in-path range <= 60 m at ego 25 m/s (rate +0, lead_decel 0); correct from 70 m out
 ```
 
+Resolved to a metre with `--ego 15,20,25 --range 26,27,...`: the boundary is
+**26/27 m at 15 m/s, 43/44 m at 20 m/s, 66/67 m at 25 m/s** — a clean
+`range ≈ 2.6 × ego speed`, one point per speed, no hysteresis. Closed loop
+through the full stack the ego is dragged from 20 m/s down to 13.80, 14.83,
+15.86 and 17.27 m/s at gaps of 12, 20, 30 and 40 m, and is untouched at 52 m and
+70 m.
+
+The same measurement on `1ce4886` gives emergency authority only up to 20 m at
+20 m/s — and then a sustained 3.0–3.3 m/s² all the way out to 45 m, which is the
+`BAND_UNWARRANTED` region and which nothing in this project measured before.
+
+### Boundary 2 — avoidable contact against a lead braking at 6 m/s²
+
+Sweep, `rate +0, lead_decel 6`, both commits:
+
 ```
-  relative rate +0 m/s, lead braking at 6 m/s^2
-  range \ ego |     5    10    15    20    25    30
-  -------------------------------------------------
-          80  |     .     .     .     .     .     X
-          60  |     E     .     .     .     X     X
-          45  |     E     .     .     L     X     X
-          30  |     E     .     L     X     X     X
-          25  |     E     .     L     X     X     X
-          20  |     E     .     L     X     X     X
-          15  |     E     .     .     X     X     X
-          12  |     E     E     .     X     .     X
-           8  |     E     .     .     .     .     .
-           5  |     E     .     .     .     .     .
+25e3ba5:  COLLISION at ego 30 m/s for ranges 12, 16, 20, 26            (none at ego <= 25)
+1ce4886:  COLLISION at ego 20 m/s for ranges 12, 16, 20, 26, 30, 32
+          COLLISION at ego 25 m/s for ranges 16, 20, 26, 30, 32, 40, 43, 44, 52, 60
+          COLLISION for range 12-80 at ego 30 m/s -- reaches the top of the swept range axis
 ```
 
-Two things to notice. The collision region is *not* bounded by short range: at
-ego 30 m/s the arbiter collides from 80 m and clears at 8 m, the opposite of the
-phantom's shape. And the `L` cells directly below the `X` band are the same
-failure caught one grid step earlier — the arbiter intervenes, but after the last
-frame from which the real actuator could still stop with 2 m to spare.
+Resolved to a metre in the closed loop through the full stack (planner →
+controller → arbiter, arbiter's command actuated), with the lead braking from
+**frame 0** rather than from t = 1.0 s:
 
-The 193 `EARLY` cells are the phantom's other face: on a scene where a real
-hazard *does* eventually appear, the same seeded rate makes the arbiter brake at
-emergency authority long before comfort braking has run out. At ego 5 m/s with a
-lead closing at 4 m/s, this happens at every range up to 45 m.
+| d₀ | 14 | 16 | 17 | 20 | 26 | 27 | 28 | 30 | 32 |
+|---|---|---|---|---|---|---|---|---|---|
+| `1ce4886` min gap | +1.01 | **−0.00** | **−0.29** | **−0.65** | **−0.12** | +0.28 | +0.38 | +1.50 | +2.22 |
+| `25e3ba5` min gap | +2.79 | +0.34 | +0.31 | +0.40 | +1.56 | +1.82 | +2.12 | +2.59 | +3.11 |
+
+**Avoidable contact for d₀ = 16–26 m at 20 m/s.** The free second matters: with
+the lead braking from t = 1.0 s instead, `1ce4886` collides at 15/20/25/30 m in
+the earlier report but the *scenario* form of that case passed, because the
+extra second of matched speed let the headway law settle first. Brake the lead
+from frame 0 and the region is unambiguous.
+
+### Boundary 3 — the stopped obstacle
+
+The boundary here is the vehicle's own stop distance, measured by driving the
+plant at `brake = 1.0`: **6.67 m at 10 m/s, 14.70 m at 15 m/s, 25.85 m at
+20 m/s, 40.13 m at 25 m/s**. Closer than that, contact is arithmetic and no
+arbiter can be blamed for it. Minimum true gap, full stack, closed loop:
+
+| ego, d₀ | best available | `25e3ba5` | `1ce4886` |
+|---|---|---|---|
+| 15 m/s, 15 m | +0.30 | +0.30 | **−0.43** |
+| 20 m/s, 26 m | +0.15 | +0.15 | **−1.21** |
+| 20 m/s, 27 m | +1.15 | +1.15 | **−0.21** |
+| 20 m/s, 29 m | +3.15 | +3.15 | +1.79 |
+| 25 m/s, 41 m | +0.87 | +0.87 | **−0.83** |
+| 25 m/s, 42 m | +1.87 | +1.87 | +0.17 |
+
+`1ce4886` therefore throws away between 1.4 m and 2.0 m of clearance that the
+vehicle physically has, which is the difference between stopping and hitting at
+exactly the ranges where it matters. Both commits go to full authority for a car
+40 m and 75 m away, where 5.26 and 2.74 m/s² are all that is required.
+
+### Boundary 4 — the sub-emergency band
+
+New in this revision, so there is no historical figure to compare against.
+`1ce4886`, `--profile standard`:
+
+```
+BAND_UNWARRANTED at ego 15 m/s (rate +0, lead_decel 0) for ranges 20, 26
+BAND_UNWARRANTED at ego 20 m/s (rate +0, lead_decel 0) for ranges 26, 30, 32, 40, 43, 44
+BAND_UNWARRANTED for range 16-80 at ego 10 m/s (rate +0, lead_decel 6) -- reaches the top
+                 of the swept range axis, the real boundary is beyond 80 m
+```
+
+248 cells. The shape is the mirror image of the phantom's: where `25e3ba5`
+applied full authority out to 43 m, `1ce4886` applies 3.0–3.3 m/s² out to 44 m,
+and the second is only two-thirds less wrong than the first. It is the residue
+of "fixing" a phantom by attenuating it rather than by removing its cause.
 
 ### Real footage, 400 frames, YOLOX + UFLD, simulated ego 15 m/s
 
@@ -431,15 +542,26 @@ refuses to manufacture one out of a ±1.5 m range jitter.
 
 ## 5. For the redesign
 
-The redesign is judged against these two tools, unchanged. Concretely, a
-redesigned arbiter should reach:
+The redesign is judged against these two tools, unchanged. Concretely:
 
+* `scripts/run_safety_sweep.py --gate` **returns 0.** That is the bar, in CI, on
+  every change. It fails on `COLLISION`, `MISSED`, `PHANTOM`, `LATE`, `EARLY`
+  and `BAND_UNWARRANTED`, i.e. on both error directions at once, which is the
+  property no previous gate had.
 * `--profile standard` with **zero** `COLLISION`, **zero** `MISSED`, **zero**
-  `PHANTOM`. `EARLY` and `LATE` should shrink to isolated cells at the grid's
-  edges, not regions.
-* `--profile fast --fail-on COLLISION,MISSED,PHANTOM` returning 0, in CI.
+  `PHANTOM`, **zero** `BAND_UNWARRANTED`. `EARLY` and `LATE` should shrink to
+  isolated cells at the grid's edges, not regions.
+* `PYTHONPATH=src python3 -m pytest tests/test_scenarios.py` passing — the
+  readable form of the same requirements, with the physics argument attached to
+  each.
 * On the recorded 400-frame run: no `UNJUSTIFIED_*` verdict, and no arbiter
   demand above comfort on a frame whose closing rate is not measured.
+
+**Do not narrow the grid to make the gate pass.** The range axes in
+`PROFILES` are chosen to straddle measured boundaries (section 1); removing 16 m
+or 44 m from `fast` removes the only evidence that a boundary moved. If the
+plant changes, re-measure the boundaries first (`docs/SAFETY_SPEC.md`, section 8)
+and then move the axes to straddle the new ones.
 
 The instrumentation is written to survive the rewrite: if a hooked method is
 renamed, it is listed in `missing_hooks` and the surrounding capture still

@@ -22,8 +22,11 @@ What "justified" means here
 The verdict is computed from the *raw tracker range history*, which is the
 measurement channel, never from the arbiter's filtered range or its own closing
 rate (those are the thing under test).  A least-squares slope over the preceding
-window gives an observed closing rate; that plus the range and the ego speed
-goes into the same physics as :mod:`tests.scenarios.sweep`:
+window gives an observed closing rate -- the same estimator
+:class:`tests.scenarios.plant.Sensor` now uses to report ``velocity_mps`` in
+the synthetic world, deliberately, so that "the closing rate the measurements
+support" means one thing in both halves of the harness.  That, plus the range
+and the ego speed, goes into the same physics as :mod:`tests.scenarios.sweep`:
 
 ``JUSTIFIED``               the observed scene needs more than comfort braking.
 ``JUSTIFIED_HEADWAY``       a soft response on a gap below the safe following
