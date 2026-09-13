@@ -1,44 +1,102 @@
-version: '3.8'
+# Two profiles, because the two images do genuinely different jobs.
+#
+#   docker compose --profile ci run --rm adas-ci          # unit tests, any arch, CPU
+#   docker compose --profile jetson up                     # the vehicle runtime, arm64
+#
+# Neither is the default: `docker compose up` with no profile starts nothing, which is
+# the right behaviour for a repository whose two containers are not interchangeable.
+#
+# The previous version of this file started the CPU image with `restart:
+# unless-stopped` and `--frames 0`. On a build where 0 meant zero frames that is an
+# infinite restart loop of a container that cannot load a model in the first place.
+#
+# `version:` is deliberately absent — it has been obsolete since Compose v2 and
+# emits a warning on every invocation.
 
 services:
-  adas-core:
+
+  # ------------------------------------------------------------------ CI image
+  adas-ci:
+    profiles: ["ci"]
     build:
       context: .
       dockerfile: Dockerfile
-    image: adas-core:latest
-    container_name: adas-core
-    restart: unless-stopped
-    
+    image: adas-core:ci
+    container_name: adas-ci
+    # A test run must exit. Never restart it.
+    restart: "no"
     environment:
-      - ADAS_LOG_LEVEL=INFO
-      - ADAS_CONFIG_PATH=/app/config.json
-    
-    volumes:
-      - ./config.json:/app/config.json:ro
-      - ./logs:/logs
-      - ./data:/data
-    
-    # Resource limits
+      ADAS_LOG_LEVEL: "${ADAS_LOG_LEVEL:-INFO}"
+      ADAS_LOG_FORMAT: "text"
+    # Default command is the test suite (see the Dockerfile CMD). Override to run the
+    # mock pipeline:  docker compose --profile ci run --rm adas-ci \
+    #                   python -m adas.cli --frames 20
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     deploy:
       resources:
         limits:
-          cpus: '2'
-          memory: 2G
+          cpus: "2"
+          memory: 1G
+
+  # -------------------------------------------------------------- Jetson image
+  adas-jetson:
+    profiles: ["jetson"]
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.jetson
+    image: adas-core:jetson
+    container_name: adas-jetson
+    restart: unless-stopped
+    # This board already has `nvidia` as its default runtime, but naming it here
+    # makes the requirement explicit on a board where it is not.
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility,video"
+      ADAS_LOG_LEVEL: "${ADAS_LOG_LEVEL:-INFO}"
+      ADAS_LOG_FORMAT: "json"
+      ADAS_CONFIG_PATH: "/etc/adas/config.json"
+    volumes:
+      # Engines are built on-target and bind-mounted, never baked in: a .engine is
+      # tied to the exact TensorRT build and GPU that produced it.
+      - ./models:/opt/adas/models:ro
+      - ./config.example.json:/etc/adas/config.json:ro
+      # The durable safety-event JSONL. A named volume, so `docker compose down`
+      # does not delete the incident history.
+      - adas-state:/var/lib/adas
+      # nvarguscamerasrc talks to the Argus daemon over this socket. Harmless when
+      # there is no CSI camera; required when there is.
+      - /tmp/argus_socket:/tmp/argus_socket
+    devices:
+      # Only needed for a USB/V4L2 camera. Comment it out on a board with no
+      # /dev/video* (this one has none) or the container will refuse to start.
+      - /dev/video0:/dev/video0
+    group_add:
+      - video
+    # The health endpoint binds 127.0.0.1 inside the container by design; publish it
+    # to the host loopback only. Never 0.0.0.0 — /healthz carries live vehicle state.
+    ports:
+      - "127.0.0.1:8090:8090"
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          # Matches MemoryMax in deploy/adas.service. UFLDv2 alone is 413 MB resident.
+          memory: 3G
         reservations:
-          cpus: '1'
           memory: 512M
-    
-    # Network configuration
-    networks:
-      - adas-network
-    
-    # Logging
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
 
-networks:
-  adas-network:
-    driver: bridge
+volumes:
+  adas-state:

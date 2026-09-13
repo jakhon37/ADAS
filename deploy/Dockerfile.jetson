@@ -1,0 +1,104 @@
+# ADAS Core — Jetson runtime image.  linux/arm64 ONLY.  L4T R35 / JetPack 5.1.x.
+#
+# Base image
+# ----------
+#   nvcr.io/nvidia/l4t-jetpack:r35.4.1
+#
+# Verified on 2026-09-13 from this board with `docker manifest inspect`: the tag
+# exists and is ~5.0 GB compressed. It is the JetPack 5.1.2 image and carries CUDA
+# 11.4, cuDNN 8.6 and TensorRT 8.5.2.2 — the same versions this board runs
+# (L4T R35.6.5 / JetPack 5.1.6, same R35 series).
+#
+# NOT verified by building: pulling 5.0 GB was out of budget for the workstream that
+# wrote this file, so no image has been produced from it here. Treat the layer list
+# below as reviewed-but-unbuilt until someone runs the command in
+# deploy/README.md § "Building the Jetson image". `nvcr.io/nvidia/l4t-base:r35.4.1`
+# and `nvcr.io/nvidia/l4t-tensorrt:r8.5.2.2-runtime` were also checked and DO NOT
+# exist; `nvcr.io/nvidia/l4t-tensorrt:r8.5.2.2-devel` does (~4.9 GB) if a smaller,
+# TensorRT-only base is wanted, but it lacks the L4T OpenCV package.
+#
+# What the container needs from the host
+# --------------------------------------
+#   * the NVIDIA container runtime (this board already has `nvidia` as its DEFAULT
+#     runtime — check with `docker info | grep Runtime`); it bind-mounts the host's
+#     CUDA/TensorRT userspace and the /dev/nvhost-* nodes.
+#   * /tmp/argus_socket, for a CSI camera through nvarguscamerasrc.
+#   * the engines. They are NOT baked in: an .engine is tied to the exact TensorRT
+#     build and GPU of the machine that produced it, so shipping one inside an image
+#     is how you get a container that silently fails to deserialise on the next
+#     board. Bind-mount ./models read-only and build them on-target with
+#     scripts/build_engines.py.
+#
+# Build (on the Jetson, or with buildx --platform linux/arm64):
+#   docker build -f deploy/Dockerfile.jetson -t adas-core:jetson .
+# Run:
+#   docker compose --profile jetson up
+FROM nvcr.io/nvidia/l4t-jetpack:r35.4.1
+
+LABEL org.opencontainers.image.title="adas-core (Jetson runtime)"
+LABEL org.opencontainers.image.description="ADAS pipeline for L4T R35 / JetPack 5.1.x, arm64. CUDA 11.4 + TensorRT 8.5 from the base image."
+LABEL org.opencontainers.image.source="https://github.com/jakhon37/ADAS"
+LABEL com.adas.gpu="cuda-11.4"
+LABEL com.adas.tensorrt="8.5.2.2"
+LABEL com.adas.purpose="runtime"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/opt/adas/src \
+    ADAS_LOG_LEVEL=INFO \
+    ADAS_LOG_FORMAT=json \
+    ADAS_CONFIG_PATH=/etc/adas/config.json
+
+# System packages only. There is no pip install of torch, onnxruntime, pycuda or
+# opencv-python anywhere in this file, and there must not be: the board's TensorRT
+# and OpenCV come from L4T and a pip copy would shadow them with a build that has
+# neither CUDA nor GStreamer.
+#   python3-libnvinfer  TensorRT Python bindings (already in l4t-jetpack, listed for
+#                       the reader and so an apt-get upgrade cannot drop them)
+#   python3-opencv      the L4T OpenCV 4.5.4 with GStreamer
+#   curl                the HEALTHCHECK below
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 \
+      python3-numpy \
+      python3-opencv \
+      python3-libnvinfer \
+      curl \
+      tini \
+ && rm -rf /var/lib/apt/lists/*
+
+# Fail the build loudly if the base image ever stops carrying the runtime we need,
+# rather than shipping an image that discovers it at 60 km/h.
+RUN python3 -c "import tensorrt, cv2, numpy; print('trt', tensorrt.__version__, 'cv2', cv2.__version__, 'np', numpy.__version__)"
+
+WORKDIR /opt/adas
+COPY src/ ./src/
+COPY deploy/ ./deploy/
+COPY pyproject.toml README.md config.example.json ./
+
+RUN python3 -c "import adas, adas.io; print('adas', adas.__version__)"
+
+# The container runs as a non-root user in the video group so it can reach
+# /dev/video* and the Argus socket without CAP_SYS_ADMIN.
+RUN useradd --system --no-create-home --uid 1000 adas \
+ && usermod -aG video adas \
+ && mkdir -p /var/lib/adas /run/adas /etc/adas \
+ && chown adas:adas /var/lib/adas /run/adas
+USER adas
+
+VOLUME ["/var/lib/adas"]
+EXPOSE 8090
+
+# The real probe: /healthz answers 503 when the pipeline is not refreshing, so this
+# restarts a container whose frame loop has wedged. `import adas` — what this used to
+# check — proves only that Python can import a package.
+# start-period covers engine deserialisation (UFLDv2 alone is 413 MB).
+HEALTHCHECK --interval=15s --timeout=5s --start-period=120s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8090/healthz || exit 1
+
+# tini reaps zombies and, more importantly, forwards SIGTERM so `docker stop` is a
+# clean shutdown that releases the capture source instead of a SIGKILL that leaves
+# the Argus daemon holding the sensor.
+ENTRYPOINT ["/usr/bin/tini", "--", "python3", "-m", "adas.cli"]
+# --frames 0 means "run until stopped". See deploy/README.md § "Continuous mode".
+CMD ["--config", "/etc/adas/config.json", "--frames", "0"]

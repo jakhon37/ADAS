@@ -1,0 +1,43 @@
+# /etc/logrotate.d/adas — rotation for the ADAS safety-event JSONL.
+#
+# Two things to know before editing this file.
+#
+# 1. `size 50M` is NOT `maxsize`. Bare `size` rotates purely on size and makes `daily`
+#    inert, so `rotate 14` would mean fourteen 50 MB generations with no age bound at
+#    all — and on a quiet unit the file would never rotate, because it would never
+#    reach 50 MB. `maxsize` is the one that means "daily, but sooner if it gets big".
+#
+# 2. `copytruncate` silently loses every line written between logrotate's copy and its
+#    truncate. For a safety event log that is an evidence gap. We use `create`
+#    instead: src/adas/io/events.py re-stats its path every stat_interval_s (2 s),
+#    notices that the inode changed and reopens, and the postrotate SIGHUP makes it
+#    immediate. Nothing is lost either way — the few records written before the
+#    reopen land in the .1 file, in order.
+#
+# `rotate 4` here must stay consistent with EventLog(backups=3) in
+# src/adas/io/events.py: the writer keeps .1 .. .3 itself, logrotate keeps its own
+# dated generations, and the two must not both think they own .4.
+#
+# The real size bound is enforced in-process by EventLog(max_bytes=...) (default
+# 32 MB). logrotate runs from a daily timer and cannot bound a burst.
+
+/var/lib/adas/events.jsonl
+/run/adas/events.jsonl
+{
+    su adas adas
+    create 0640 adas adas
+    daily
+    maxsize 32M
+    rotate 4
+    maxage 30
+    dateext
+    dateformat -%Y%m%d-%s
+    compress
+    delaycompress
+    missingok
+    notifempty
+    nocopytruncate
+    postrotate
+        systemctl kill --signal=SIGHUP --kill-who=main adas.service 2>/dev/null || true
+    endscript
+}

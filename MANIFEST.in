@@ -1,37 +1,53 @@
-# Include documentation
+# Documentation
 include README.md
 include LICENSE
 include CHANGELOG.md
 include ARCHITECTURE.md
 include DEPLOYMENT.md
 include QUICKSTART.md
-
-# Include configuration examples
-include config.example.json
-
-# Include documentation directory
 recursive-include docs *.md
 
-# Exclude development files
+# Configuration reference (the BENCH profile: mock backends, synthetic source)
+include config.example.json
+
+# Deployment assets. They are data, not code, and an operator needs them from the
+# installed package: the systemd unit, the logrotate policy and the installer.
+include deploy/adas.service
+include deploy/adas.logrotate
+include deploy/setup_jetson.sh
+include deploy/README.md
+
+# Model provenance. The MANIFEST records every model's URL, sha256, licence and
+# preprocessing contract; the weights themselves are NOT distributed.
+include models/MANIFEST.json
+include models/README.md
+
+# Never ship weights or engines: they are large, they are rebuilt on the target,
+# and several carry licences (AGPL-3.0, research-only datasets) that the MIT
+# source licence does not cover. See the Licensing section of README.md.
+global-exclude *.onnx
+global-exclude *.engine
+global-exclude *.engine.build.log
+global-exclude *.engine.verify.log
+global-exclude *.pth
+global-exclude *.mp4
+
+# Development-only files
 exclude .gitignore
 exclude Makefile
 exclude RELEASE_GUIDE.md
-exclude TRANSFORMATION_SUMMARY.md
 exclude REORGANIZATION_SUMMARY.md
 exclude PHASE3_COMPLETION.md
-
-# Exclude Docker files
 exclude Dockerfile
 exclude docker-compose.yml
 exclude .dockerignore
-
-# Exclude CI/CD
+exclude deploy/Dockerfile.jetson
 recursive-exclude .github *
-
-# Exclude tests
 recursive-exclude tests *
+recursive-exclude scripts *
+recursive-exclude Ultra-Fast-Lane-Detection-v2 *
 
-# Exclude build artifacts
+# Build artefacts
 global-exclude __pycache__
 global-exclude *.py[cod]
 global-exclude *.so

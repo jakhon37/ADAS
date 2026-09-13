@@ -1,202 +1,239 @@
-# ADAS Core - Quick Start Guide
+# Quick start
 
-On the Xavier NX in this workspace, skip PyPI/`pip install` and use `PYTHONPATH`. Full board notes: [docs/JETSON.md](docs/JETSON.md).
+Everything below has been run on the target board (Jetson Xavier NX, JetPack
+5.1.6, Python 3.8.10, TensorRT 8.5.2.2) on 2026-09-13. Read
+[docs/JETSON.md](docs/JETSON.md) for the board's quirks and
+[README.md](README.md#what-is-not-production-ready) before drawing any
+conclusion from the output.
 
-```bash
-cd /home/nvidia/myspace/ADAS
-PYTHONPATH=src python3 -m pytest tests/ -v --tb=short
-PYTHONPATH=src python3 -m adas.cli --frames 10
-# TensorRT YOLO (needs models/yolov5n.engine)
-PYTHONPATH=src python3 -m adas.cli --detector tensorrt \
-  --source Ultra-Fast-Lane-Detection-v2/example.mp4 --frames 60
-```
+## On this Jetson
 
-Expected mock synthetic line (lead vehicle ~10.5 m, not emergency brake):
-
-```
-plan=follow_close_10.5m|lane_center_err_0.00, cmd=t0.47/b0.00/s0.00
-```
-
-## 🚀 Other machines
-
-### 1. Install Package
+`python3-venv` is not installed. Use the system interpreter with `PYTHONPATH`,
+and hold the board's GPU mutex for anything that loads TensorRT — other agents
+share this hardware.
 
 ```bash
-# From source
+cd ~/myspace/ADAS
+
+# 1. Tests. 743 pass; the engine-backed ones skip when a file is missing.
+flock /tmp/jetson-gpu.lock -c "PYTHONPATH=src python3 -m pytest tests/ -q"
+
+# 2. Real engines, blank frames. Proves the engines deserialise and the loop runs.
+flock /tmp/jetson-gpu.lock -c "PYTHONPATH=src python3 -m adas.cli --frames 10"
+
+# 3. Real engines on the replay clip, closed loop against a simulated plant.
+flock /tmp/jetson-gpu.lock -c "PYTHONPATH=src python3 -m adas.cli \
+  --detector yolox --lane ufld \
+  --source Ultra-Fast-Lane-Detection-v2/example.mp4 \
+  --ego-source simulated --ego-speed 15 \
+  --frames 200 --fps 0"
+```
+
+Actual output of (3):
+
+```
+frames=200 failures=0 dropped=0 reconnects=0 elapsed=13.09s
+measured=15.28 FPS busy=15.44 FPS (64.8 ms/frame) reason=completed
+  Detections:       136 (avg 0.68/frame)
+  Tracks:           154 (avg 0.77/frame)
+  Lane detected:    100.0% of frames
+```
+
+A representative per-frame line:
+
+```
+frame=198 det=1 trk=2 lane=yes lead=8.0m plan=follow_gap_8.0m|lane_center_err_0.11
+          safety=nominal cmd=t0.00/b0.12/s+0.06
+```
+
+`cmd=` is the **arbitrated** command — what the actuators would receive — not the
+controller's request. When they differ, the line is logged at WARNING with the
+violations that caused it.
+
+## Without engines, or on any other machine
+
+Mock backends fabricate their output, so they must be enabled explicitly:
+
+```bash
+PYTHONPATH=src python3 -m adas.cli --detector mock --lane mock --allow-mock --frames 20
+```
+
+Without `--allow-mock` (or `ADAS_ALLOW_MOCK=1`, or `"allow_mock": true`) that
+command exits 2 with:
+
+```
+Configuration error: detector.backend=mock and lane.backend=mock selected but
+allow_mock is false. A mock backend FABRICATES geometry that nothing downstream
+can distinguish from a measurement; ...
+```
+
+That is deliberate: the mock used to be the silent default.
+
+## Installing elsewhere
+
+```bash
 git clone --recurse-submodules https://github.com/jakhon37/ADAS.git
 cd ADAS
 pip install -e ".[dev]"
+adas-run --detector mock --lane mock --allow-mock --frames 20
 ```
 
-### 2. Run Synthetic Test
+`numpy` is the only runtime dependency pip will install. OpenCV and TensorRT are
+deliberately **not** declared: on the Jetson both come from JetPack system
+packages, and `pip install opencv-python` would shadow the board's
+GStreamer-enabled build. `rclpy` cannot be installed with pip in any working
+form — use apt and a ROS 2 underlay.
+
+## The commands you will actually use
 
 ```bash
-adas-run --frames 60
+# What did my configuration resolve to?
+PYTHONPATH=src python3 -m adas.cli --config my.json --print-config
+
+# Run until stopped (SIGTERM / Ctrl-C), the way the systemd unit does
+PYTHONPATH=src python3 -m adas.cli --config my.json --frames 0
+
+# Health and metrics while it runs
+curl -s http://127.0.0.1:8090/healthz | python3 -m json.tool
+curl -s http://127.0.0.1:8090/metrics | grep adas_safety_state
+
+# Quiet, structured logs for a log shipper
+ADAS_LOG_FORMAT=json PYTHONPATH=src python3 -m adas.cli --log-level WARNING --frames 0
+
+# Throughput, unpaced
+PYTHONPATH=src python3 -m adas.cli --fps 0 --frames 300
+
+# Replay a recorded ego speed channel alongside the clip
+printf 'timestamp_s,speed_mps\n0.0,14.0\n0.5,13.5\n1.0,13.0\n' > /tmp/speed.csv
+PYTHONPATH=src python3 -m adas.cli --detector yolox --lane ufld \
+  --source Ultra-Fast-Lane-Detection-v2/example.mp4 --ego-file /tmp/speed.csv --frames 50
 ```
 
-### 3. Customize Configuration
+A `--ego-file` channel is the only ego source that reports `measured = True`.
+Samples closer together than `ego.max_age_s` are linearly interpolated; a wider
+gap is held for `max_age_s` and then reported invalid.
 
-```bash
-# Copy example config
-cp config.example.json my-config.json
+### Flags worth knowing
 
-# Edit as needed
-vim my-config.json
+| flag | effect |
+|---|---|
+| `--frames 0` | run until stopped; anything > 0 is a bounded run |
+| `--fps 0` | do not pace; measure real throughput |
+| `--allow-mock` | permit fabricating backends. Bench only |
+| `--ego-source {none,config,simulated,file}` | where ego speed comes from; `none` keeps the planner degraded |
+| `--depth midas` | enable the independent range cross-check |
+| `--lane yolop` | YOLOP; automatically drops to `every_n_frames=4` because it costs ~59 ms |
+| `--print-config` | validate, print the resolved sections, exit |
+| `--no-health` / `--no-events` | drop the ops surface for a throwaway run |
 
-# Run with custom config
-adas-run --config my-config.json --frames 100
+## Configuration
+
+`config.example.json` is the **bench** profile — mock backends, synthetic source,
+`allow_mock: true` — and doubles as the complete key reference, because every key
+is validated and an unknown key is a hard error:
+
+```
+unknown key 'max_speed_mpsX' in config section 'safety'. Known keys: ...
 ```
 
-### 4. Run Tests
+The **vehicle** profile is in [README.md](README.md#the-vehicle-profile). The
+three settings that matter most:
 
-```bash
-# Install test dependencies
-pip install pytest
-
-# Run all tests
-pytest tests/ -v
-
-# Run specific test
-pytest tests/test_safety.py -v
-```
-
-### 5. Build Docker Image
-
-```bash
-# Build
-docker build -t adas-core:latest .
-
-# Run
-docker run --rm adas-core:latest --frames 10
-
-# Or use docker-compose
-docker-compose up
-```
-
-## 📋 Common Commands
-
-```bash
-# Run with debug logging
-adas-run --log-level DEBUG --frames 10
-
-# Run with custom FPS in config
-adas-run --config config.json
-
-# Run tests with coverage
-pytest --cov=src/adas tests/
-
-# Format code
-make format
-
-# Lint code
-make lint
-
-# Clean build artifacts
-make clean
-```
-
-## 🎯 Key Configuration Parameters
-
-### Speed Control
 ```json
-"planner": {
-  "cruise_speed_mps": 15.0,        // Target cruise speed (~54 km/h)
-  "min_follow_distance_m": 12.0,   // Minimum safe following distance
-  "time_gap_s": 2.0                // Desired time gap (2-second rule)
-}
+"camera": { "calibrated": true, "mount_height_m": 1.30, "pitch_deg": -3.87 },
+"ego":    { "source": "file", "file": "recordings/speed.csv", "max_age_s": 0.15 },
+"allow_mock": false
 ```
 
-### Safety Limits
-```json
-"safety": {
-  "max_speed_mps": 33.0,           // Maximum speed limit (~120 km/h)
-  "max_deceleration_mps2": 8.0,    // Emergency braking limit
-  "min_following_distance_m": 2.0  // Absolute minimum distance
-}
-```
+Do not set `"calibrated": true` until you have measured the mount height and
+pitch. It is the switch that tells the whole stack its metres are real, and the
+shipped defaults are measurably wrong for the one clip we have — see
+[README.md](README.md#calibration).
 
-### Controller Tuning
-```json
-"controller": {
-  "kp_speed": 0.15,                // Speed control gain
-  "steering_deadband_deg": 0.5     // Ignore small steering inputs
-}
-```
-
-## 🔍 Troubleshooting
-
-### Module Import Errors
-```bash
-# Reinstall package
-pip install --upgrade adas-core
-
-# Or from source
-pip install -e .
-```
-
-### Tests Failing
-```bash
-# Check Python version (need 3.8+)
-python3 --version
-
-# Install test dependencies
-pip install pytest
-```
-
-### Docker Build Issues
-```bash
-# Clean Docker cache
-docker system prune -a
-
-# Rebuild
-docker build --no-cache -t adas-core:latest .
-```
-
-## 📚 Next Steps
-
-- Read [ARCHITECTURE.md](ARCHITECTURE.md) for system design
-- Read [DEPLOYMENT.md](DEPLOYMENT.md) for production deployment
-- Check [README.md](README.md) for full documentation
-
-## 💡 Example Python Usage
+## Python API
 
 ```python
-from adas.cli import build_pipeline
-from adas.models import PerceptionFrame
-from adas.runtime import synthetic_frame
 import time
+from adas.cli import build_pipeline
+from adas.core.config import default_config
+from adas.core.models import EgoState, PerceptionFrame
+from adas.runtime import synthetic_frame
 
-# Build pipeline with default config
-pipeline, fps = build_pipeline()
+config = default_config()
+config.detector.backend = "mock"
+config.lane.backend = "mock"
+config.allow_mock = True
+config.__post_init__()          # re-validate after any override
 
-# Create synthetic frame
-frame_data = synthetic_frame()
-frame = PerceptionFrame(
-    frame_id=0,
-    timestamp_s=time.time(),
-    rgb=frame_data,
-    width=frame_data["width"],
-    height=frame_data["height"],
-)
-
-# Process frame (with current speed from vehicle)
-plan, command = pipeline.step(frame, current_speed_mps=15.0)
-
-# Use outputs
-print(f"Target speed: {plan.target_speed_mps:.1f} m/s")
-print(f"Steering: {plan.steering_angle_deg:.1f}°")
-print(f"Throttle: {command.throttle:.2f}")
-print(f"Brake: {command.brake:.2f}")
-print(f"Reason: {plan.reason}")
+pipeline, config = build_pipeline(config=config)
+try:
+    payload = synthetic_frame()
+    frame = PerceptionFrame(
+        frame_id=0, timestamp_s=time.monotonic(), rgb=payload,
+        width=payload["width"], height=payload["height"],
+    )
+    plan, command = pipeline.step(
+        frame, ego=EgoState(speed_mps=15.0, valid=True), dt_s=0.05
+    )
+    print(plan.reason)
+    print(command)                                  # the ARBITRATED command
+    print(pipeline.last_arbitration.state.value, pipeline.last_arbitration.violations)
+finally:
+    pipeline.close()
 ```
 
-## ⚠️ Important Notes
+Passing `ego=` (or `current_speed_mps=`) is not optional in practice: with
+neither, `EgoState.valid` is `False`, the time-gap law is undefined and the
+arbiter commands a minimum-risk manoeuvre. That is the honest degradation, not a
+bug.
 
-1. **This is a reference implementation** - Additional safety validation required for production
-2. **Mock detectors** - Replace with real TensorRT models for actual deployment
-3. **Safety critical** - Perform extensive testing before vehicle integration
-4. **Calibration needed** - Adjust camera parameters for your specific setup
+## Record and replay
 
----
+```python
+from adas.tools import DataRecorder, DataReplayer, RecordingConfig, RecordingPipeline, ReplayConfig
+from adas.tools.replayer import replay_with_pipeline
 
-**Ready to go!** Run `adas-run --frames 10` to verify installation.
+recorder = DataRecorder(RecordingConfig(output_dir="recordings", recording_name="run1"))
+recorder.start_recording()
+wrapped = RecordingPipeline(pipeline, recorder)     # drop-in; records the arbitration too
+...                                                  # run the loop against `wrapped`
+recorder.stop_recording()
+
+replayer = DataReplayer(ReplayConfig(recording_dir="recordings/run1", playback_speed=0.0))
+print(replayer.safety_timeline())                    # every arbitration state change
+for recorded, (plan, command) in replay_with_pipeline(replayer, other_pipeline):
+    ...                                              # compare old vs new decisions
+```
+
+`replay_with_pipeline` swaps in perception backends that serve the *recorded*
+detections and lanes, so tracking, planning, control and arbitration re-run on
+any machine, GPU or not.
+
+## Troubleshooting
+
+**`Cuda Runtime (out of memory)` loading the UFLD engine.** It is 413 MB and
+needs one contiguous allocation. Check `free -m`; the factory warns when
+available memory is under 1.6× the engine size. The pipeline already loads the
+largest engine first, which is what makes detector + UFLD fit at all.
+
+**`plan=degraded_ego_speed_unavailable` on every frame.** `ego.source` is `none`.
+That is the default and it is correct for a board with no vehicle bus; pass
+`--ego-source simulated` for a bench run or point `ego.file` at a recording.
+
+**`safety=min_risk_maneuver`, then `safety=disengage`, `violations=ego_state_invalid`.**
+Same cause. A missing ego state is a persistent *fault*, so after
+`safety.disengage_after_frames` (40) the arbiter latches DISENGAGE and stays
+there until `pipeline.reset()`. A bare 200-frame run with the default
+`ego.source: none` ends that way; it is the designed behaviour, not a crash.
+
+**`lane_offset_unavailable` in the arbiter reason.** There is no metric lane
+geometry, because the camera is uncalibrated or the lane is mock.
+`safety.max_lateral_offset_m` cannot be enforced without it, and the arbiter says
+so rather than passing the check silently.
+
+**Health endpoint refuses to bind.** Another process holds 8090 (DMS uses 8088).
+It fails soft and logs `HEALTH_BIND_REFUSED`; set `health.required: true` to make
+it fatal, or `--no-health`.
+
+**Tests import-error on `cv2` or `tensorrt`.** Those tests skip by design. The
+core suite needs only numpy.

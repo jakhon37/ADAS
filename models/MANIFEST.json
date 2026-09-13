@@ -1,0 +1,640 @@
+{
+  "schema": "adas/models/manifest@1",
+  "device": "jetson-xavier-nx",
+  "jetpack": "5.1.6 (L4T R35.6.5)",
+  "trt_version": "8.5.2.2",
+  "cuda_version": "11.4",
+  "generated_at": "2026-09-13T05:42:23+0900",
+  "notes": [
+    "Static fields (url, license, preprocessing, output_semantics, engine_build) are hand-authored and are the source of truth for scripts/fetch_models.sh and scripts/build_engines.py.",
+    "Dynamic fields (onnx_sha256, onnx_bytes, engine_sha256, engine_bytes, bindings, build_latency, verify) are written by scripts/build_engines.py after a real build on this board.",
+    "Latencies are GPU compute time in milliseconds measured by trtexec on this exact board at MODE_20W_6CORE. They exclude H2D/D2H copies and all CPU pre/post-processing.",
+    "Binary .onnx and .engine files are gitignored. Reproduce with scripts/fetch_models.sh then scripts/build_engines.py."
+  ],
+  "models": {
+    "yolov5n": {
+      "role": "object_detection",
+      "onnx_file": "yolov5n.onnx",
+      "engine_file": "yolov5n.engine",
+      "url": "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5n.onnx",
+      "onnx_sha256": "04f0e55c26f58d17145b36045780fe1250d5bd2187543e11568e5141d05b3262",
+      "onnx_bytes": 3981910,
+      "license": "AGPL-3.0-only",
+      "license_note": "Ultralytics YOLOv5 v7.0 weights are AGPL-3.0. ADAS declares MIT in pyproject.toml, so shipping or network-serving this engine is a licence conflict. Use yolox_nano / yolox_tiny (Apache-2.0) for any distributed build; yolov5n is retained only as a development baseline.",
+      "source_project": "https://github.com/ultralytics/yolov5",
+      "precision": "fp16",
+      "engine_build": {
+        "workspace_mib": 256,
+        "static_shapes": {}
+      },
+      "preprocessing": {
+        "input_layout": "NCHW",
+        "colour_order": "RGB",
+        "resize_mode": "letterbox_centred",
+        "pad_value": 114,
+        "target_size": [
+          640,
+          640
+        ],
+        "scale": "pixel / 255.0",
+        "mean": null,
+        "std": null,
+        "dtype": "float32"
+      },
+      "output_semantics": {
+        "output0": "(1, 25200, 85) float16. Per anchor: [cx, cy, w, h, objectness, 80 COCO class scores]. cx/cy/w/h are pixels in the 640x640 letterboxed frame; objectness and class scores are already sigmoid-activated. Final score = objectness * class_score. Decode in adas.perception.yolo.decode_yolo."
+      },
+      "engine_sha256": "4e91634fa5ec912bbd9d7da026e345cb7099755794888a3ac8c13631714f39c2",
+      "engine_bytes": 5701736,
+      "build_latency": {
+        "gpu_compute_min_ms": 7.18077,
+        "gpu_compute_max_ms": 7.43896,
+        "gpu_compute_mean_ms": 7.27619,
+        "gpu_compute_median_ms": 7.26938,
+        "end_to_end_median_ms": 7.78192,
+        "throughput_qps": 137.113,
+        "engine_build_seconds": 1541.56
+      },
+      "bindings": {
+        "inputs": [
+          {
+            "name": "images",
+            "shape": [
+              1,
+              3,
+              640,
+              640
+            ],
+            "dtype": "HALF",
+            "index": 0
+          }
+        ],
+        "outputs": [
+          {
+            "name": "output0",
+            "shape": [
+              1,
+              25200,
+              85
+            ],
+            "dtype": "HALF",
+            "index": 1
+          }
+        ],
+        "source": "tensorrt_runtime"
+      },
+      "verified": true,
+      "verify": {
+        "loaded": true,
+        "log": "models/yolov5n.engine.verify.log",
+        "gpu_compute_min_ms": 7.17596,
+        "gpu_compute_max_ms": 8.08038,
+        "gpu_compute_mean_ms": 7.24219,
+        "gpu_compute_median_ms": 7.22571,
+        "end_to_end_median_ms": 7.71558,
+        "throughput_qps": 137.712
+      },
+      "io_dtype_note": "This engine binds images and output0 as HALF (float16), unlike every other engine here, which binds FLOAT. TensorRT chose the IO format when the plan was built. adas.infer.trt_engine.TrtEngine casts on the way in and out, so callers can keep passing float32, but anything that reads the raw host buffer must expect float16."
+    },
+    "yolox_nano": {
+      "role": "object_detection",
+      "onnx_file": "yolox_nano.onnx",
+      "engine_file": "yolox_nano.engine",
+      "url": "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_nano.onnx",
+      "onnx_sha256": "c789161ed43c8269fcd4e67c67eeeb4e80c622da2eb296a20bc6007bd18a0b7d",
+      "onnx_bytes": 3659407,
+      "license": "Apache-2.0",
+      "license_note": "Licence-clean replacement for the AGPL yolov5n. Megvii YOLOX, release 0.1.1rc0.",
+      "source_project": "https://github.com/Megvii-BaseDetection/YOLOX",
+      "precision": "fp16",
+      "engine_build": {
+        "workspace_mib": 256,
+        "static_shapes": {}
+      },
+      "preprocessing": {
+        "input_layout": "NCHW",
+        "colour_order": "BGR",
+        "resize_mode": "letterbox_top_left",
+        "pad_value": 114,
+        "target_size": [
+          416,
+          416
+        ],
+        "scale": "none - raw 0..255 pixel values, NOT divided by 255",
+        "mean": null,
+        "std": null,
+        "dtype": "float32",
+        "note": "YOLOX's exported ONNX bakes no normalisation. yolox/data/data_augment.py::preproc pastes the aspect-preserving resize at the TOP-LEFT of a 114-filled canvas and keeps 0..255 BGR. Dividing by 255 or converting to RGB will silently destroy accuracy.",
+        "verified_empirically": "Verified on this board against frame 150 of Ultra-Fast-Lane-Detection-v2/example.mp4 (1280x720 dashcam), counting decoded detections above 0.30 confidence: BGR + raw 0..255 gave 10 (max conf 0.640), RGB + raw gave 9 (0.600), and BOTH /255 variants gave 0 detections. Dividing by 255 does not degrade this model, it silences it completely."
+      },
+      "output_semantics": {
+        "output": "(1, 3549, 85) float32 for the 416x416 model (3549 = 52^2 + 26^2 + 13^2 anchor points at strides 8/16/32). Per anchor: [x_offset, y_offset, log_w, log_h, objectness, 80 COCO class scores]. objectness/class are sigmoid-activated; the box is NOT decoded. Decode as: x = (x_offset + grid_x) * stride, y = (y_offset + grid_y) * stride, w = exp(log_w) * stride, h = exp(log_h) * stride, giving cx/cy/w/h in the 416x416 letterboxed frame. Then divide by the letterbox scale (no pad subtraction: padding is bottom/right only).",
+        "decode_verified": "The grid+stride decode described above was run end to end on a real frame and produced correctly placed car/truck boxes, so the formula is confirmed, not inferred."
+      },
+      "engine_sha256": "690ab4cbb1e02c16abd5ea3d68b0bbc10d6436b97e7d13526af0e715a7cbada1",
+      "engine_bytes": 3188214,
+      "verified": true,
+      "build_log": "models/yolox_nano.engine.build.log",
+      "build_latency": {
+        "gpu_compute_min_ms": 4.60815,
+        "gpu_compute_max_ms": 4.78979,
+        "gpu_compute_mean_ms": 4.69911,
+        "gpu_compute_median_ms": 4.69922,
+        "end_to_end_median_ms": 4.96875,
+        "throughput_qps": 212.446,
+        "engine_build_seconds": 1062.16
+      },
+      "build_wall_seconds": 1441.4,
+      "bindings": {
+        "inputs": [
+          {
+            "name": "images",
+            "shape": [
+              1,
+              3,
+              416,
+              416
+            ],
+            "dtype": "FLOAT",
+            "index": 0
+          }
+        ],
+        "outputs": [
+          {
+            "name": "output",
+            "shape": [
+              1,
+              3549,
+              85
+            ],
+            "dtype": "FLOAT",
+            "index": 1
+          }
+        ],
+        "source": "tensorrt_runtime"
+      },
+      "verify": {
+        "loaded": true,
+        "log": "models/yolox_nano.engine.verify.log",
+        "gpu_compute_min_ms": 4.62921,
+        "gpu_compute_max_ms": 4.78125,
+        "gpu_compute_mean_ms": 4.70651,
+        "gpu_compute_median_ms": 4.70651,
+        "end_to_end_median_ms": 4.97339,
+        "throughput_qps": 212.111
+      }
+    },
+    "yolox_tiny": {
+      "role": "object_detection",
+      "onnx_file": "yolox_tiny.onnx",
+      "engine_file": "yolox_tiny.engine",
+      "url": "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_tiny.onnx",
+      "onnx_sha256": "427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7",
+      "onnx_bytes": 20219662,
+      "license": "Apache-2.0",
+      "license_note": "Higher-accuracy Apache-2.0 detector; same pre/post-processing as yolox_nano.",
+      "source_project": "https://github.com/Megvii-BaseDetection/YOLOX",
+      "precision": "fp16",
+      "engine_build": {
+        "workspace_mib": 512,
+        "static_shapes": {}
+      },
+      "preprocessing": {
+        "input_layout": "NCHW",
+        "colour_order": "BGR",
+        "resize_mode": "letterbox_top_left",
+        "pad_value": 114,
+        "target_size": [
+          416,
+          416
+        ],
+        "scale": "none - raw 0..255 pixel values, NOT divided by 255",
+        "mean": null,
+        "std": null,
+        "dtype": "float32",
+        "verified_empirically": "Verified on this board against frame 150 of Ultra-Fast-Lane-Detection-v2/example.mp4 (1280x720 dashcam), counting decoded detections above 0.30 confidence: BGR + raw 0..255 gave 10 (max conf 0.640), RGB + raw gave 9 (0.600), and BOTH /255 variants gave 0 detections. Dividing by 255 does not degrade this model, it silences it completely."
+      },
+      "output_semantics": {
+        "output": "Identical layout to yolox_nano: (1, 3549, 85), undecoded grid/stride offsets.",
+        "decode_verified": "The grid+stride decode described above was run end to end on a real frame and produced correctly placed car/truck boxes, so the formula is confirmed, not inferred."
+      },
+      "engine_sha256": "65f23b96cc2f64a619ab8d631161cde6cc2e6b4e027defdfda3b3d4814b77305",
+      "engine_bytes": 12748001,
+      "verified": true,
+      "build_log": "models/yolox_tiny.engine.build.log",
+      "build_latency": {
+        "gpu_compute_min_ms": 6.26093,
+        "gpu_compute_max_ms": 6.49609,
+        "gpu_compute_mean_ms": 6.41967,
+        "gpu_compute_median_ms": 6.42065,
+        "end_to_end_median_ms": 6.68884,
+        "throughput_qps": 155.425,
+        "engine_build_seconds": 1096.1
+      },
+      "build_wall_seconds": 1107.4,
+      "bindings": {
+        "inputs": [
+          {
+            "name": "images",
+            "shape": [
+              1,
+              3,
+              416,
+              416
+            ],
+            "dtype": "FLOAT",
+            "index": 0
+          }
+        ],
+        "outputs": [
+          {
+            "name": "output",
+            "shape": [
+              1,
+              3549,
+              85
+            ],
+            "dtype": "FLOAT",
+            "index": 1
+          }
+        ],
+        "source": "tensorrt_runtime"
+      },
+      "verify": {
+        "loaded": true,
+        "log": "models/yolox_tiny.engine.verify.log",
+        "gpu_compute_min_ms": 6.32983,
+        "gpu_compute_max_ms": 6.50818,
+        "gpu_compute_mean_ms": 6.43273,
+        "gpu_compute_median_ms": 6.43213,
+        "end_to_end_median_ms": 6.69705,
+        "throughput_qps": 155.11
+      }
+    },
+    "yolop": {
+      "role": "panoptic_driving_perception",
+      "onnx_file": "yolop-640-640.onnx",
+      "engine_file": "yolop_640.engine",
+      "url": "https://github.com/hustvl/YOLOP/raw/main/weights/yolop-640-640.onnx",
+      "onnx_sha256": "cd66a3e0087a7258ae07768cc02cb742eed93865727ae4c9baf969b8fa190696",
+      "onnx_bytes": 35902568,
+      "license": "MIT",
+      "license_note": "hustvl/YOLOP, MIT. Trained on BDD100K; BDD100K's own dataset terms are non-commercial, which constrains redistribution of the weights but not the MIT code.",
+      "source_project": "https://github.com/hustvl/YOLOP",
+      "precision": "fp16",
+      "engine_build": {
+        "workspace_mib": 512,
+        "static_shapes": {}
+      },
+      "preprocessing": {
+        "input_layout": "NCHW",
+        "colour_order": "RGB",
+        "resize_mode": "letterbox_centred",
+        "pad_value": 114,
+        "target_size": [
+          640,
+          640
+        ],
+        "scale": "pixel / 255.0",
+        "mean": [
+          0.485,
+          0.456,
+          0.406
+        ],
+        "std": [
+          0.229,
+          0.224,
+          0.225
+        ],
+        "dtype": "float32",
+        "note": "ImageNet normalisation IS required, unlike YOLOv5."
+      },
+      "output_semantics": {
+        "det_out": "(1, 25200, 6) float32 detections: [cx, cy, w, h, objectness, car_score] in the 640x640 letterboxed frame. Single class (BDD100K vehicle). Objectness and class score are sigmoid-activated and the boxes are already decoded to pixels. Needs confidence filtering and NMS.",
+        "drive_area_seg": "(1, 2, 640, 640) float32 logits over {not-drivable, drivable}. argmax along axis 1 gives the drivable-area mask in the letterboxed frame; un-letterbox before use.",
+        "lane_line_seg": "(1, 2, 640, 640) float32 logits over {not-lane, lane}. argmax along axis 1 gives a binary lane-line mask in the letterboxed frame."
+      },
+      "scheduling_note": "Heavier than yolov5n. Intended for a lower-rate cross-check / free-space channel, not the 20 Hz detection path. Measured GPU compute time is recorded under build_latency.",
+      "engine_sha256": "87e59881b51e51fd706697cd8be34f43c534e6755b8e93b3177e9d5b2f3e88ca",
+      "engine_bytes": 20204574,
+      "verified": true,
+      "build_log": "models/yolop_640.engine.build.log",
+      "build_latency": {
+        "gpu_compute_min_ms": 26.7822,
+        "gpu_compute_max_ms": 27.1768,
+        "gpu_compute_mean_ms": 26.972,
+        "gpu_compute_median_ms": 26.9695,
+        "end_to_end_median_ms": 28.0832,
+        "throughput_qps": 36.7602,
+        "engine_build_seconds": 1077.78
+      },
+      "build_wall_seconds": 1082.7,
+      "bindings": {
+        "inputs": [
+          {
+            "name": "images",
+            "shape": [
+              1,
+              3,
+              640,
+              640
+            ],
+            "dtype": "FLOAT",
+            "index": 0
+          }
+        ],
+        "outputs": [
+          {
+            "name": "det_out",
+            "shape": [
+              1,
+              25200,
+              6
+            ],
+            "dtype": "FLOAT",
+            "index": 1
+          },
+          {
+            "name": "drive_area_seg",
+            "shape": [
+              1,
+              2,
+              640,
+              640
+            ],
+            "dtype": "FLOAT",
+            "index": 2
+          },
+          {
+            "name": "lane_line_seg",
+            "shape": [
+              1,
+              2,
+              640,
+              640
+            ],
+            "dtype": "FLOAT",
+            "index": 3
+          }
+        ],
+        "source": "tensorrt_runtime"
+      },
+      "verify": {
+        "loaded": true,
+        "log": "models/yolop_640.engine.verify.log",
+        "gpu_compute_min_ms": 26.7402,
+        "gpu_compute_max_ms": 27.2075,
+        "gpu_compute_mean_ms": 26.9819,
+        "gpu_compute_median_ms": 26.9758,
+        "end_to_end_median_ms": 28.0962,
+        "throughput_qps": 36.7416
+      }
+    },
+    "midas_v21_small": {
+      "role": "monocular_relative_depth",
+      "onnx_file": "midas_v21_small_256.onnx",
+      "engine_file": "midas_v21_small_256.engine",
+      "url": "https://github.com/isl-org/MiDaS/releases/download/v2_1/model-small.onnx",
+      "onnx_sha256": "2d8c6cb8f415229daf1eb041024208e2608c9f98e17c81cc7c6ecb449c56fd58",
+      "onnx_bytes": 66764249,
+      "license": "MIT",
+      "license_note": "Intel ISL MiDaS v2.1 small, MIT.",
+      "source_project": "https://github.com/isl-org/MiDaS",
+      "precision": "fp16",
+      "engine_build": {
+        "workspace_mib": 512,
+        "static_shapes": {}
+      },
+      "preprocessing": {
+        "input_layout": "NCHW",
+        "colour_order": "RGB",
+        "resize_mode": "stretch",
+        "pad_value": null,
+        "target_size": [
+          256,
+          256
+        ],
+        "scale": "pixel / 255.0",
+        "mean": [
+          0.485,
+          0.456,
+          0.406
+        ],
+        "std": [
+          0.229,
+          0.224,
+          0.225
+        ],
+        "dtype": "float32",
+        "note": "Aspect ratio is NOT preserved: the frame is stretched to 256x256. Depth is scale-invariant so the distortion is tolerable, but the same stretch must be applied when sampling the map at a detection box.",
+        "input_binding": "0"
+      },
+      "output_semantics": {
+        "797": "(1, 256, 256) float32 INVERSE relative depth (disparity-like), unitless, with an unknown per-frame affine scale and shift. Larger value = closer. It is NOT metres and MUST NOT be published as a metric range without a per-frame least-squares alignment against a metric reference; on its own it is only an ordering / consistency channel. Bilinearly upsample to frame size before sampling.",
+        "binding_name_warning": "The input binding is literally named \"0\" and the output binding \"797\" - the MiDaS v2.1 ONNX export kept torch's numeric tensor ids. Address them by those exact strings, or take TrtEngine.input_name / TrtEngine.output_names[0]."
+      },
+      "scheduling_note": "Independent of the pinhole box-height range estimator, so it breaks that common-mode failure. Sample the median inverse depth over the lower-central region of a detection box.",
+      "engine_sha256": "ccafa0e8f8de0946a30326037120d2a0986f8c46b3b1be3596b24a1f05a080cf",
+      "engine_bytes": 33937304,
+      "verified": true,
+      "build_log": "models/midas_v21_small_256.engine.build.log",
+      "build_latency": {
+        "gpu_compute_min_ms": 6.27258,
+        "gpu_compute_max_ms": 6.38696,
+        "gpu_compute_mean_ms": 6.31076,
+        "gpu_compute_median_ms": 6.31067,
+        "end_to_end_median_ms": 6.40381,
+        "throughput_qps": 158.112,
+        "engine_build_seconds": 340.709
+      },
+      "build_wall_seconds": 1404.4,
+      "bindings": {
+        "inputs": [
+          {
+            "name": "0",
+            "shape": [
+              1,
+              3,
+              256,
+              256
+            ],
+            "dtype": "FLOAT",
+            "index": 0
+          }
+        ],
+        "outputs": [
+          {
+            "name": "797",
+            "shape": [
+              1,
+              256,
+              256
+            ],
+            "dtype": "FLOAT",
+            "index": 1
+          }
+        ],
+        "source": "tensorrt_runtime"
+      },
+      "verify": {
+        "loaded": true,
+        "log": "models/midas_v21_small_256.engine.verify.log",
+        "gpu_compute_min_ms": 6.29077,
+        "gpu_compute_max_ms": 6.44263,
+        "gpu_compute_mean_ms": 6.33454,
+        "gpu_compute_median_ms": 6.332,
+        "end_to_end_median_ms": 6.43835,
+        "throughput_qps": 157.521
+      }
+    },
+    "ufldv2_culane_res18": {
+      "role": "lane_detection",
+      "onnx_file": "ufldv2_culane_res18_320x1600.onnx",
+      "engine_file": "ufldv2_culane_res18.engine",
+      "url": "https://s3.ap-northeast-2.wasabisys.com/pinto-model-zoo/324_Ultra-Fast-Lane-Detection-v2/resources.tar.gz",
+      "archive_member": "ufldv2_culane_res18_320x1600.onnx",
+      "onnx_sha256": "edcee747f9d800247a200ab7676c03107bb75a4490c61d4f8c473100a9aabb4f",
+      "onnx_bytes": 825194714,
+      "license": "MIT",
+      "license_note": "Ultra-Fast-Lane-Detection-v2 (cfzd), MIT. ONNX mirrored by PINTO0309/PINTO_model_zoo entry 324 (also MIT). Trained on CULane, whose dataset terms are research-only.",
+      "source_project": "https://github.com/cfzd/Ultra-Fast-Lane-Detection-v2",
+      "mirror": "https://github.com/PINTO0309/PINTO_model_zoo/tree/main/324_Ultra-Fast-Lane-Detection-v2",
+      "precision": "fp16",
+      "engine_build": {
+        "workspace_mib": 512,
+        "static_shapes": {}
+      },
+      "size_note": "The ONNX is 825 MB because UFLDv2's classification head is a single dense layer of ~186 M parameters (2048 -> (200*72 + 100*81 + 2*72 + 2*81) * 4 lanes). The FP16 engine is roughly half that on disk and must be resident in GPU memory at run time; budget for it on a 6.7 GiB board.",
+      "config": {
+        "num_row": 72,
+        "num_col": 81,
+        "num_cell_row": 200,
+        "num_cell_col": 100,
+        "num_lanes": 4,
+        "crop_ratio": 0.6,
+        "train_width": 1600,
+        "train_height": 320,
+        "row_anchor": "numpy.linspace(0.42, 1.0, 72)",
+        "col_anchor": "numpy.linspace(0.0, 1.0, 81)"
+      },
+      "preprocessing": {
+        "input_layout": "NCHW",
+        "colour_order": "RGB",
+        "resize_mode": "stretch_then_bottom_crop",
+        "pad_value": null,
+        "target_size": [
+          320,
+          1600
+        ],
+        "scale": "pixel / 255.0",
+        "mean": [
+          0.485,
+          0.456,
+          0.406
+        ],
+        "std": [
+          0.229,
+          0.224,
+          0.225
+        ],
+        "dtype": "float32",
+        "note": "Canonical UFLDv2 test transform (data/dataloader.py::get_test_loader and demo.py): stretch the WHOLE frame to height int(train_height / crop_ratio) = int(320 / 0.6) = 533 and width 1600 (aspect ratio not preserved), convert to RGB, divide by 255, apply ImageNet mean/std, THEN keep the BOTTOM 320 rows (img[:, -320:, :]). The 213 cropped rows are sky. deploy/trt_infer.py in the vendored tree uses a different, demo-only crop and no mean/std - do not copy it."
+      },
+      "output_semantics": {
+        "loc_row": "(1, 200, 72, 4) float32 logits: per row-anchor (72) and lane (4), a distribution over 200 horizontal cells. Expected cell = softmax over a window around argmax, weighted by cell index, + 0.5; x_crop = cell / (200 - 1) * 1600.",
+        "loc_col": "(1, 100, 81, 4) float32 logits: per column-anchor (81) and lane (4), a distribution over 100 vertical cells. y_crop = cell / (100 - 1) * 320.",
+        "exist_row": "(1, 2, 72, 4) float32 logits over {absent, present} per row-anchor and lane. argmax along axis 1; a row lane is used when its present-count > 72/2.",
+        "exist_col": "(1, 2, 81, 4) float32 logits over {absent, present} per column-anchor and lane. argmax along axis 1; a column lane is used when its present-count > 81/4.",
+        "lane_index_convention": "Lanes 1 and 2 are the ego-lane left and right markings and are decoded from the ROW heads. Lanes 0 and 3 are the adjacent-lane markings and are decoded from the COLUMN heads.",
+        "coordinate_frame": "Decoded points are in the 1600x320 CROPPED network frame. Map back with orig_y = (y_crop + 213) / (533 / frame_height) and orig_x = x_crop / (1600 / frame_width) - note the x and y scales differ because the resize is a stretch, not a letterbox."
+      },
+      "engine_sha256": "ecd3b4a92acafe054204090e2e3e04492836f5656f6805ec6c9571895a4d1fa8",
+      "engine_bytes": 413388935,
+      "verified": true,
+      "build_log": "models/ufldv2_culane_res18.engine.build.log",
+      "build_latency": {
+        "gpu_compute_min_ms": 16.3455,
+        "gpu_compute_max_ms": 18.8882,
+        "gpu_compute_mean_ms": 16.7382,
+        "gpu_compute_median_ms": 16.5488,
+        "end_to_end_median_ms": 16.9707,
+        "throughput_qps": 59.378,
+        "engine_build_seconds": 614.838
+      },
+      "build_wall_seconds": 1033.9,
+      "bindings": {
+        "inputs": [
+          {
+            "name": "input",
+            "shape": [
+              1,
+              3,
+              320,
+              1600
+            ],
+            "dtype": "FLOAT",
+            "index": 0
+          }
+        ],
+        "outputs": [
+          {
+            "name": "loc_row",
+            "shape": [
+              1,
+              200,
+              72,
+              4
+            ],
+            "dtype": "FLOAT",
+            "index": 1
+          },
+          {
+            "name": "loc_col",
+            "shape": [
+              1,
+              100,
+              81,
+              4
+            ],
+            "dtype": "FLOAT",
+            "index": 2
+          },
+          {
+            "name": "exist_row",
+            "shape": [
+              1,
+              2,
+              72,
+              4
+            ],
+            "dtype": "FLOAT",
+            "index": 3
+          },
+          {
+            "name": "exist_col",
+            "shape": [
+              1,
+              2,
+              81,
+              4
+            ],
+            "dtype": "FLOAT",
+            "index": 4
+          }
+        ],
+        "source": "tensorrt_runtime"
+      },
+      "verify": {
+        "loaded": true,
+        "log": "models/ufldv2_culane_res18.engine.verify.log",
+        "gpu_compute_min_ms": 16.3276,
+        "gpu_compute_max_ms": 80.5768,
+        "gpu_compute_mean_ms": 20.4741,
+        "gpu_compute_median_ms": 16.5281,
+        "end_to_end_median_ms": 16.925,
+        "throughput_qps": 47.5562
+      }
+    }
+  },
+  "blocked": {}
+}

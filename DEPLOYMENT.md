@@ -1,296 +1,254 @@
-# ADAS Core - Production Deployment Guide
+# Deployment
 
-## Overview
+> **The service in this repository has never been started, and the Jetson
+> container image has never been built.** `sudo` is unavailable in the
+> development environment, so `deploy/adas.service` is validated only by
+> `systemd-analyze verify`, a hardening-directive assertion in CI, and review.
+> Treat the first real start as a bring-up: watch it with
+> `journalctl -u adas -b -f`.
+>
+> Read [README.md](README.md#what-is-not-production-ready) before deploying this
+> anywhere near a vehicle.
 
-This guide covers production deployment of the ADAS (Advanced Driver Assistance System) Core platform.
+Everything operational lives in [`deploy/`](deploy/README.md); this file is the
+overview and the order of operations.
 
-## System Requirements
+## Requirements
 
-### Hardware Requirements
-- **CPU**: Multi-core processor (4+ cores recommended)
-- **Memory**: Minimum 2GB RAM, 4GB+ recommended
-- **GPU** (Optional): NVIDIA GPU with CUDA support for TensorRT acceleration
-- **Storage**: 10GB+ available space
+**Target board (what this was built and measured on):**
 
-### Software Requirements
-- Python 3.8 or higher (3.8 is required on JetPack 5 / this Xavier NX)
-- Docker 20.10+ (for containerized deployment)
-- Linux OS (Ubuntu 20.04+ recommended for production)
+| Item | Value |
+|---|---|
+| Board | NVIDIA Jetson Xavier NX |
+| L4T / JetPack | R35.6.5 / 5.1.6 |
+| OS | Ubuntu 20.04, aarch64, 6 cores |
+| Python | **3.8.10 only** |
+| CUDA / TensorRT / cuDNN | 11.4 / 8.5.2.2 / 8.6 |
+| OpenCV | 4.5.4 system build, GStreamer yes, CUDA no |
+| RAM | 6.7 GiB total. Keep ≥ 1.5 GiB available before loading UFLD-v2 |
+| Disk | ~1.5 GB for the model artefacts |
 
-## Deployment Options
+**Any other Linux host** can run the test suite and the mock pipeline with
+Python 3.8+ and numpy. It cannot run an engine.
 
-### Option 1: Docker Deployment (Recommended)
+Do **not** `pip install` torch, tensorflow, onnx, onnxruntime, pycuda,
+opencv-python, ultralytics or jetson-stats on the board. TensorRT, CUDA and
+OpenCV come from JetPack; a pip OpenCV shadows the GStreamer build and the
+GStreamer build is what reads the camera.
 
-#### Build Container
-```bash
-docker build -t adas-core:latest .
+## Order of operations
+
+```
+1. install the source          →  /opt/adas/releases/<sha>, symlinked as current
+2. fetch + build the engines   →  scripts/fetch_models.sh, scripts/build_engines.py
+3. calibrate the camera        →  measure mount height and pitch; set calibrated: true
+4. write the vehicle config    →  /etc/adas/config.json
+5. preflight                   →  deploy/setup_jetson.sh --dry-run, then adas.cli --frames 0
+6. install and enable the unit →  only after the preflight passes
 ```
 
-#### Run with Docker Compose
+Step 3 is not optional if you intend to use any metric output. The shipped
+camera block is an assumption and is measurably wrong for the one clip we have;
+see [README.md](README.md#calibration).
+
+## 1. Install
+
 ```bash
-# Copy example config
-cp config.example.json config.json
-
-# Edit configuration as needed
-vim config.json
-
-# Start service
-docker-compose up -d
-
-# View logs
-docker-compose logs -f adas-core
-
-# Stop service
-docker-compose down
-```
-
-#### Run Standalone Container
-```bash
-docker run -d \
-  --name adas-core \
-  -v $(pwd)/config.json:/app/config.json:ro \
-  -v $(pwd)/logs:/logs \
-  --restart unless-stopped \
-  adas-core:latest --frames 1000
-```
-
-### Option 2: Native Installation
-
-#### Install Package
-```bash
-# Create virtual environment
-python3 -m venv venv
-source venv/bin/activate
-
-# Install from PyPI (recommended)
-pip install adas-core
-
-# Or install from source
-git clone https://github.com/jakhon37/ADAS.git
+git clone --recurse-submodules https://github.com/jakhon37/ADAS.git
 cd ADAS
-pip install -e .
+PYTHONPATH=src python3 -m pytest tests/ -q          # 743 tests
 ```
 
-#### Run Service
+Or use the staged installer, which copies into
+`/opt/adas/releases/<git sha>` and only swaps the `current` symlink at the end:
+
 ```bash
-# Run with default config
-adas-run --frames 100
-
-# Run with custom config
-adas-run --config config.json --frames 100
-
-# Run with debug logging
-adas-run --log-level DEBUG --frames 50
+sudo deploy/setup_jetson.sh --dry-run    # every read-only check, for real
+sudo deploy/setup_jetson.sh
 ```
 
-### Option 3: Systemd Service
+Its distinctive feature is a continuous-mode preflight: it runs
+`adas.cli --frames 0` for 8 s and, if the process exits early, installs the unit
+but **refuses to enable it**, printing why. That is what stops a broken build
+becoming a restart loop in a vehicle.
 
-Create `/etc/systemd/system/adas-core.service`:
+## 2. Engines
 
-```ini
-[Unit]
-Description=ADAS Core Service
-After=network.target
+Engines are **not** distributed: they are gitignored, excluded from the sdist,
+and are version- and device-locked to the TensorRT and GPU they were built on.
+Build them on the target.
 
-[Service]
-Type=simple
-User=adas
-WorkingDirectory=/opt/adas-core
-Environment="PATH=/opt/adas-core/venv/bin"
-ExecStart=/opt/adas-core/venv/bin/adas-run --config /etc/adas/config.json
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Enable and start:
 ```bash
-sudo systemctl enable adas-core
-sudo systemctl start adas-core
-sudo systemctl status adas-core
+bash scripts/fetch_models.sh                 # sha256-pinned downloads
+python3 scripts/build_engines.py             # trtexec --fp16, then verify
+python3 scripts/build_engines.py --list      # what is available
 ```
 
-## Configuration
+Sizes and measured GPU compute (from `models/README.md`):
 
-### Configuration File Structure
+| engine | file | GPU median |
+|---|---|---|
+| `yolox_nano.engine` | 3.2 MB | 4.69 ms |
+| `midas_v21_small_256.engine` | 33.9 MB | 6.33 ms |
+| `yolox_tiny.engine` | 12.7 MB | 6.43 ms |
+| `yolov5n.engine` (AGPL) | 5.7 MB | 7.23 ms |
+| `ufldv2_culane_res18.engine` | **413.4 MB** | 16.53 ms |
+| `yolop_640.engine` | 20.2 MB | 26.98 ms |
 
-See `config.example.json` for complete configuration options.
+**UFLD-v2 needs 413 MB in one contiguous allocation.** The pipeline loads the
+largest engine first for exactly this reason (measured: detector-then-lane fails
+with `Cuda Runtime (out of memory)` at ~1.1 GB available; lane-then-detector
+succeeds). If you cannot guarantee the headroom, use `--lane yolop` instead and
+accept a noisier lane fit, or run without lane perception.
 
-### Key Configuration Parameters
+Building an engine needs the board idle. Other projects share it:
 
-#### Detector Configuration
-- `confidence_threshold`: Detection confidence threshold (0.0-1.0)
-- `iou_threshold`: IoU threshold for NMS (0.0-1.0)
-
-#### Planner Configuration
-- `cruise_speed_mps`: Target cruise speed in m/s
-- `min_follow_distance_m`: Minimum safe following distance
-- `time_gap_s`: Desired time gap to lead vehicle
-
-#### Safety Configuration
-- `max_speed_mps`: Maximum allowed speed
-- `max_deceleration_mps2`: Maximum deceleration limit
-- `min_following_distance_m`: Absolute minimum following distance
-
-### Environment Variables
-
-- `ADAS_LOG_LEVEL`: Override log level (DEBUG, INFO, WARNING, ERROR)
-- `ADAS_CONFIG_PATH`: Path to configuration file
-
-## Monitoring and Observability
-
-### Logging
-
-Logs are written to stdout and can be collected via:
-- Docker logs: `docker logs adas-core`
-- Systemd journal: `journalctl -u adas-core -f`
-
-Log format:
-```
-YYYY-MM-DD HH:MM:SS - module - LEVEL - message
-```
-
-### Health Checks
-
-Docker health check is built-in:
 ```bash
-docker inspect --format='{{.State.Health.Status}}' adas-core
+flock /tmp/jetson-gpu.lock -c "python3 scripts/build_engines.py --only yolox_nano"
 ```
 
-### Metrics
+## 3. Configuration
 
-Pipeline metrics are logged periodically including:
-- Frame processing rate (FPS)
-- Detection counts
-- Safety events
-- Processing latency
+`config.example.json` is the bench profile (mock backends, synthetic source,
+`allow_mock: true`) and doubles as the complete key reference. The vehicle
+profile is in [README.md](README.md#the-vehicle-profile). Validate before
+deploying:
 
-## Production Optimizations
-
-### GPU Acceleration
-
-For production deployments with NVIDIA GPUs:
-
-1. Install NVIDIA Container Toolkit
-2. Use GPU-enabled base image
-3. Replace mock detector with TensorRT implementation
-
-```dockerfile
-# Add to Dockerfile
-FROM nvcr.io/nvidia/tensorrt:22.12-py3
-
-# Install CUDA-enabled dependencies
-RUN pip install tensorrt onnxruntime-gpu
-```
-
-Run with GPU:
 ```bash
-docker run --gpus all adas-core:latest
+PYTHONPATH=src python3 -m adas.cli --config /etc/adas/config.json --print-config
 ```
 
-### Performance Tuning
+An unknown key is a hard error naming the section, and cross-section rules
+(planner ⊆ safety) are checked at load. `ADAS_CONFIG_PATH` is read when
+`--config` is absent; both container images set it.
 
-1. **Increase FPS**: Adjust `fps` in config
-2. **Reduce Latency**: Optimize detector model (quantization, pruning)
-3. **Memory**: Adjust tracker `max_missed_frames` to control track memory
+## 4. systemd
 
-### Resource Limits
+`deploy/adas.service` is `Type=notify` with `NotifyAccess=main`. The process
+sends `READY=1` only after the **first frame has completed**, so a start that
+succeeds means a frame went all the way through the pipeline.
 
-In production, set resource limits:
-
-```yaml
-# docker-compose.yml
-deploy:
-  resources:
-    limits:
-      cpus: '4'
-      memory: 4G
+```bash
+sudo install -m 0644 deploy/adas.service   /etc/systemd/system/adas.service
+sudo install -m 0644 deploy/adas.logrotate /etc/logrotate.d/adas
+sudo systemctl daemon-reload
+sudo systemctl start adas         # watch it: journalctl -u adas -b -f
+sudo systemctl enable adas        # only once you have watched a start succeed
 ```
 
-## Safety Considerations
+Key directives and why:
 
-⚠️ **IMPORTANT**: This is a reference implementation for development and testing.
+* `WatchdogSec=30` against `TimeoutStartSec=120`. `WatchdogPinger` pings only
+  when the frame id has advanced, so a wedged frame loop is killed and restarted
+  rather than sitting there looking alive.
+* `Restart=always` with `StartLimitBurst=5` — a persistent failure stops
+  restarting instead of thrashing.
+* `MemoryHigh=2500M` / `MemoryMax=3G` / `OOMPolicy=stop`.
+* `NoNewPrivileges`, `ProtectSystem=strict` with scoped `ReadWritePaths`,
+  `ProtectHome`, `PrivateTmp`, an empty `CapabilityBoundingSet`,
+  `RestrictAddressFamilies`.
+* The tighter `DevicePolicy` / `SystemCallFilter` block ships **commented out**
+  with the validation procedure written next to it: it cannot be tested without
+  root, and a sandbox that hides a `/dev/nvhost-*` node the CUDA runtime needs
+  would fail at load time, in the vehicle.
+* `TimeoutStopSec=15` matches the CLI's SIGTERM handler, which stops the loop
+  after the current frame, releases the source, logs the metrics summary and
+  flushes the event log.
 
-For production automotive deployment:
-1. Implement ISO 26262 functional safety requirements
-2. Add redundancy and fail-safe mechanisms
-3. Perform extensive validation and testing
-4. Integrate with vehicle CAN bus and safety systems
-5. Implement watchdog timers and health monitoring
-6. Add data recording for incident analysis
+`deploy/adas.logrotate` uses `maxsize` + `create` (never `copytruncate`, which
+loses records from an append-only evidence log) and `postrotate` sends SIGHUP;
+the CLI reopens the event log on SIGHUP. Even without the signal the log notices
+the inode change within `stat_interval_s` (2 s).
+
+## 5. Containers
+
+There are two images, and they do different things.
+
+**`Dockerfile` — the CI image.** `python:3.8-slim`, numpy + pinned
+`opencv-python-headless` + pytest + ruff, default `CMD` is the test suite. It
+**cannot load a TensorRT engine** and has no `HEALTHCHECK`, because a test runner
+has no steady state. Do not deploy it.
+
+```bash
+docker build -t adas-core:ci .
+docker run --rm adas-core:ci                 # runs the tests
+```
+
+**`deploy/Dockerfile.jetson` — the runtime image.** Based on
+`nvcr.io/nvidia/l4t-jetpack:r35.4.1` (existence and ~5 GB size verified with
+`docker manifest inspect`; `l4t-base:r35.4.1` and `l4t-tensorrt:r8.5.2.2-runtime`
+do **not** exist). System packages only, a build-time assertion that
+`tensorrt`, `cv2` and `numpy` import, `tini` for SIGTERM forwarding, and a
+`HEALTHCHECK` against `/healthz`. **It has never been built** — the first build
+pulls ~5 GB and may need an apt package-name correction; the import assertion is
+there so that fails the build rather than the vehicle.
+
+```bash
+docker compose --profile jetson up -d
+```
+
+The `jetson` profile sets `runtime: nvidia`, mounts the Argus socket, bind-mounts
+`./models` **read-only** (engines are never baked into an image — they are
+device-locked and large), uses a named volume for the event log, and publishes
+the health port on loopback only. `docker compose` with no profile starts
+nothing.
+
+## 6. Verifying a deployment
+
+```bash
+systemctl is-active adas
+curl -sf http://127.0.0.1:8090/readyz  && echo READY
+curl -s  http://127.0.0.1:8090/healthz | python3 -m json.tool
+curl -s  http://127.0.0.1:8090/metrics | grep -E 'adas_(safety_state|frames_processed|lane_is_mock|ego_speed_valid)'
+tail -n 20 /var/lib/adas/events.jsonl
+```
+
+What to check, in order:
+
+1. `readyz` returns 200. It requires a delivering source, no missing or failed
+   engine, `perception.ok`, at least one completed frame, and a fresh snapshot.
+2. `adas_lane_is_mock == 0` and `engines` contains no `"mock"`. A mock backend on
+   a vehicle unit is an alerting condition.
+3. `adas_ego_speed_valid == 1`. It is 1 only for an ego source that is both valid
+   **and** a measurement — a simulated or declared speed reports 0.
+4. `adas_safety_state{state="nominal"} == 1` in steady traffic. Persistent
+   `limited` means the arbiter is intervening every frame; read the event log for
+   the violation names before changing any threshold.
+5. `adas_frames_processed_total` is advancing and `adas_watchdog_skipped_total`
+   is 0.
+
+## Health and metrics
+
+| route | 200 when |
+|---|---|
+| `/livez` | the HTTP thread is alive. Always |
+| `/readyz` | everything in (1) above |
+| `/healthz` | ok and fresh. **503 when stale** even though HTTP answers; 200 when merely degraded, because `LIMITED` is a mode, not an outage |
+| `/metrics` | always; Prometheus exposition format |
+
+The endpoint binds to `127.0.0.1:8090` (DMS uses 8088). A non-loopback bind needs
+`health.allow_remote: true` set deliberately — the body carries live safety
+state, ego speed and lead range. `health.token_file` adds a bearer token on
+everything except `/livez`; read it from a root-owned file, never from the
+config.
 
 ## Troubleshooting
 
-### Common Issues
+| symptom | cause | action |
+|---|---|---|
+| unit fails at `TimeoutStartSec` | no `READY=1`: the first frame never completed | run the same command by hand; the source or an engine is the usual cause |
+| `Cuda Runtime (out of memory)` at start | UFLD-v2 needs 413 MB contiguous | `free -m`; stop the other GPU process; or `--lane yolop` |
+| every frame `plan=degraded_ego_speed_unavailable` | `ego.source: none` | wire a real speed channel; see README |
+| every frame `safety=min_risk_maneuver`, `ego_state_invalid` | same | same |
+| `HEALTH_BIND_REFUSED` | port in use | change `health.port`, or `--no-health` |
+| `/healthz` 503 with `"stale": true` | the frame loop stopped advancing | the watchdog should already have restarted it; check `journalctl` |
+| events say `disk_full` | the log hit `min_free_mb` or ENOSPC | free space; the log records how long the hole was and how many records it swallowed |
+| `adas_lane_is_mock == 1` on a vehicle | a mock backend is active | `allow_mock` is set somewhere, or an engine was missing at start |
 
-#### High CPU Usage
-- Reduce `fps` in configuration
-- Optimize detector model
-- Use GPU acceleration
+## What deployment does not cover
 
-#### Memory Leaks
-- Monitor with `docker stats`
-- Check tracker pruning settings
-- Restart service periodically
-
-#### Missing Detections
-- Lower `confidence_threshold`
-- Verify camera calibration
-- Check lighting conditions
-
-### Debug Mode
-
-Enable debug logging:
-```bash
-adas-run --log-level DEBUG --frames 10
-```
-
-## Backup and Recovery
-
-### Configuration Backup
-```bash
-# Backup config
-cp /etc/adas/config.json /backup/config.json.$(date +%Y%m%d)
-
-# Restore config
-cp /backup/config.json.20260226 /etc/adas/config.json
-```
-
-### Data Backup
-```bash
-# Backup logs and data
-tar -czf adas-backup-$(date +%Y%m%d).tar.gz logs/ data/
-```
-
-## Support and Maintenance
-
-### Updates
-
-```bash
-# Pull latest image
-docker pull adas-core:latest
-
-# Restart service
-docker-compose down
-docker-compose up -d
-```
-
-### Maintenance Schedule
-
-- **Daily**: Check logs for errors
-- **Weekly**: Review metrics and performance
-- **Monthly**: Update dependencies and security patches
-- **Quarterly**: Full system audit and testing
-
-## License and Compliance
-
-Ensure compliance with:
-- Automotive software standards (MISRA, AUTOSAR)
-- Data privacy regulations (GDPR, CCPA)
-- Safety certifications (ISO 26262)
-
----
-
-For technical support, see README.md or open an issue on the project repository.
+There is no vehicle interface in this repository. `ControlCommand` is
+`(throttle, brake, steering)` in normalised units; converting that to CAN frames,
+arbitrating against the driver, and handling actuator faults are all outside it.
+The ROS 2 bridge is the nearest thing and it has never been executed. Nothing
+here has been through ISO 26262 work of any kind.

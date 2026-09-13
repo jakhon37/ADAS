@@ -1,0 +1,143 @@
+[Unit]
+# ADAS reference pipeline — safety-relevant, must come back up on its own.
+Description=ADAS perception, planning and control pipeline (Jetson Xavier NX)
+Documentation=file:/opt/adas/current/deploy/README.md
+# nvargus-daemon owns the CSI sensor; local-fs.target guarantees /var/lib/adas exists.
+After=nvargus-daemon.service local-fs.target
+Wants=nvargus-daemon.service
+# A crash loop must land in `failed` (visible, alertable) rather than restarting for
+# ever: 5 starts in 5 minutes and systemd gives up. Pair with an OnFailure= unit when
+# the fleet has one — see deploy/README.md.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=adas
+Group=adas
+# video: /dev/video* and the nvargus socket. No gpio group — ADAS drives no pins.
+SupplementaryGroups=video
+
+# /opt/adas/current is a symlink to /opt/adas/releases/<release-id>, swapped
+# atomically by deploy/setup_jetson.sh. Rollback is one symlink change plus a restart.
+WorkingDirectory=/opt/adas/current
+# --frames 0 means "run until stopped". See deploy/README.md § "Continuous mode"
+# before enabling this unit: with a runner that still treats 0 as zero frames, this
+# command exits immediately and Restart=always turns into a restart loop.
+# setup_jetson.sh checks for that and refuses to enable the unit if it is still true.
+ExecStart=/usr/bin/python3 -m adas.cli --config /etc/adas/config.json --frames 0
+
+# The tree is installed at /opt/adas/current/src; there is no venv on this board
+# (python3-venv is unavailable and pip installs into the system interpreter are
+# forbidden by the project's dependency policy), so PYTHONPATH is how the package is
+# found. numpy and cv2 come from the L4T system packages.
+Environment=PYTHONPATH=/opt/adas/current/src
+Environment=PYTHONUNBUFFERED=1
+# The code tree is read-only under ProtectSystem=strict; writing .pyc would fail.
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/local/cuda-11.4/lib64
+# Read by adas.core.logger when the CLI does not override it.
+Environment=ADAS_LOG_LEVEL=INFO
+Environment=ADAS_LOG_FORMAT=json
+
+# --- restart and watchdog -----------------------------------------------------
+# always, not on-failure: a clean exit(0) from any code path must not silently end
+# driver assistance for the rest of the drive.
+Restart=always
+RestartSec=5
+# Deserialising the detector plus UFLDv2 (413 MB) takes ~20-30 s cold; 120 s is
+# generous and still bounded.
+TimeoutStartSec=120
+# Long enough to release the capture source and fsync the event log, short enough
+# that `systemctl stop` is not a coffee break.
+TimeoutStopSec=15
+# The watchdog deadline starts counting only after READY=1, so it is independent of
+# TimeoutStartSec. adas.io.sd_notify.WatchdogPinger pings at WatchdogSec/2 and — the
+# part that matters — only while the frame id is advancing, so a pipeline wedged on a
+# hung engine is killed and restarted instead of being reported healthy.
+WatchdogSec=30
+
+# --- resource limits ----------------------------------------------------------
+# 6.7 GiB board. UFLDv2 alone is 413 MB of engine; the design budget is < 2.5 GB RSS.
+# Without a cap this process OOMs the whole system instead of being restarted.
+MemoryHigh=2500M
+MemoryMax=3G
+OOMPolicy=stop
+TasksMax=128
+LimitNOFILE=4096
+# A core dump of this process contains road-facing frames and the vehicle's speed
+# history. Keep it off the disk.
+LimitCORE=0
+
+# --- state, runtime and log directories ---------------------------------------
+# systemd creates and chowns these; 0750 keeps the event history off every other
+# local account on the head unit (the default 0755 would not).
+StateDirectory=adas
+StateDirectoryMode=0750
+RuntimeDirectory=adas
+RuntimeDirectoryMode=0750
+LogsDirectory=adas
+LogsDirectoryMode=0750
+UMask=0027
+
+# --- sandboxing ---------------------------------------------------------------
+NoNewPrivileges=true
+# Code, engines and config are root-owned and read-only to this service: the process
+# must not be able to rewrite models/MANIFEST.json (its own integrity record) or
+# /etc/adas.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/adas /run/adas /var/log/adas
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+# AF_UNIX: $NOTIFY_SOCKET and the nvargus daemon. AF_NETLINK: NVIDIA userspace
+# queries the device list. AF_INET/AF_INET6: the loopback health endpoint on 8090.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+AmbientCapabilities=
+# NOT set: MemoryDenyWriteExecute — the CUDA/TensorRT runtime JITs and needs W+X.
+# NOT set: PrivateDevices — it would hide /dev/nvhost-*, /dev/nvmap and /dev/video*.
+
+# The directives below tighten the sandbox further but MUST be validated with a real
+# boot on a board with root before being enabled; a wrong device list or one syscall
+# the CUDA runtime needs turns into a start failure, and this repository has no root
+# access to test it. deploy/README.md § "Validating the tight sandbox" has the
+# procedure.
+#DevicePolicy=closed
+#DeviceAllow=/dev/nvhost-ctrl rw
+#DeviceAllow=/dev/nvhost-ctrl-gpu rw
+#DeviceAllow=/dev/nvhost-gpu rw
+#DeviceAllow=/dev/nvhost-as-gpu rw
+#DeviceAllow=/dev/nvhost-prof-gpu rw
+#DeviceAllow=/dev/nvhost-dbg-gpu rw
+#DeviceAllow=/dev/nvmap rw
+#DeviceAllow=/dev/nvhost-vic rw
+#DeviceAllow=/dev/nvhost-nvdec rw
+#DeviceAllow=char-video4linux rw
+#SystemCallFilter=@system-service
+#SystemCallErrorNumber=EPERM
+#SystemCallArchitectures=native
+
+# --- logging ------------------------------------------------------------------
+# With ADAS_LOG_FORMAT=json, adas.core.logger writes one JSON object per line to
+# stdout; journald keeps it as MESSAGE, so `journalctl -u adas -o cat | jq` works.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=adas
+# A burst of safety-state transitions must not be dropped by journald's default
+# 1000 messages / 30 s.
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=10000
+
+[Install]
+WantedBy=multi-user.target

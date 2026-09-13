@@ -1,48 +1,70 @@
-# Git
+# Build-context exclusions, shared by Dockerfile (CI) and deploy/Dockerfile.jetson.
+#
+# tests/ is deliberately NOT excluded: the CI image's whole job is to run them, and
+# the previous version of this file excluded them while the CI workflow claimed to
+# test the image.
+#
+# models/*.onnx and models/*.engine are excluded because they are large and because
+# an .engine is tied to the TensorRT build and GPU that produced it — baking one in
+# produces an image that silently fails to deserialise on the next board. The Jetson
+# compose profile bind-mounts ./models read-only instead.
+
+# Version control and CI metadata
 .git
 .gitignore
+.gitmodules
+.github/
 
-# Python
+# Python build and cache artefacts
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
 *.egg-info/
+src/adas_core.egg-info/
 dist/
 build/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 
-# IDE
+# Editors and OS
 .vscode/
 .idea/
 *.swp
 *.swo
+.DS_Store
+Thumbs.db
 
-# Documentation
-*.md
-!README.md
-
-# CI/CD
-.github/
-
-# Test files
-tests/
-
-# Environment
+# Environments
 .env
 .venv/
 venv/
 ENV/
 
-# Logs
-*.log
-logs/
+# Vendored upstream source (only needed to export the UFLD ONNX off-board)
+Ultra-Fast-Lane-Detection-v2/
 
-# Data
+# Model artefacts: bind-mount them, never bake them in
+models/*.onnx
+models/*.pt
+models/*.pth
+models/*.engine
+models/*.log
+
+# Runtime output that must never be shipped inside an image
 data/
-models/
-*.onnx
-*.pt
-*.pth
+recordings/
+logs/
+*.log
+*.mp4
+*.avi
+*.jsonl
+
+# Documentation the images do not need (README.md is kept: pyproject references it)
+docs/
+*.md
+!README.md

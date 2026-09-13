@@ -4,13 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adas-core"
-version = "0.2.0"
-description = "ADAS reference pipeline (ACC, LKA, tracking, safety) with optional TensorRT perception on Jetson"
+version = "0.3.0"
+description = "Camera-only ADAS reference pipeline (detection, lane, tracking, ACC/AEB, safety arbitration) with TensorRT perception on Jetson"
 readme = "README.md"
 requires-python = ">=3.8"
 authors = [{ name = "Jakhongir Nodirov", email = "jakhon37@gmail.com" }]
+# The SOURCE in this repository is MIT. Model weights are NOT distributed with it
+# (models/*.onnx and models/*.engine are gitignored) and carry their own licences,
+# which are recorded per model in models/MANIFEST.json. The default detector is
+# YOLOX-Nano (Apache-2.0). models/yolov5n.* is AGPL-3.0-only and is kept only as a
+# development baseline; a distributed build must not include it. See the Licensing
+# section of README.md.
 license = { text = "MIT" }
-keywords = ["adas", "autonomous-driving", "ros2", "jetson", "computer-vision", "acc", "lane-keeping"]
+keywords = ["adas", "autonomous-driving", "ros2", "jetson", "computer-vision", "acc", "lane-keeping", "tensorrt"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -27,6 +33,12 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
+# adas.perception, adas.tracking and adas.ros2 import numpy at module scope, so it
+# is a real runtime dependency and not an extra. OpenCV and TensorRT are NOT listed:
+# on the target board both come from the JetPack system packages and pip-installing
+# either would shadow the CUDA/GStreamer-enabled builds (see docs/JETSON.md).
+dependencies = ["numpy>=1.19"]
+
 [project.urls]
 Homepage = "https://github.com/jakhon37/ADAS"
 Documentation = "https://github.com/jakhon37/ADAS#readme"
@@ -40,15 +52,15 @@ dev = [
   "ruff>=0.3",
   "pytest-cov>=4.0",
 ]
-ros2 = [
-  "rclpy>=3.0",
-]
+# ROS 2 is NOT pip-installable in any working form. Install it from apt
+# (ros-humble-rclpy, ros-humble-vision-msgs, ros-humble-diagnostic-msgs,
+# ros-humble-sensor-msgs) and source its setup script. The bridge in adas.ros2 has
+# never been executed on the target board; see docs/ROS2_INTEGRATION.md.
 jetson = []
 all = [
   "pytest>=7.4,<8.4",
   "ruff>=0.3",
   "pytest-cov>=4.0",
-  "rclpy>=3.0",
 ]
 
 [project.scripts]
@@ -63,9 +75,29 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
-addopts = "-q"
+# The documented test command (README.md, QUICKSTART.md) already passes -q; a
+# second -q from here would make pytest read -qq and drop the pass/fail summary
+# line entirely, so the invocation in the docs must supply its own verbosity.
+addopts = ""
 cache_dir = "/tmp/adas-pytest-cache"
+markers = [
+  "engine: needs a real TensorRT engine on disk; skips when the file is absent",
+  "needs_fixture: needs a recorded tensor fixture under tests/fixtures/",
+]
 
 [tool.ruff]
 line-length = 100
 src = ["src", "tests"]
+
+[tool.ruff.lint]
+# E9 (syntax/IO errors) and F (pyflakes) are the CI hard gate. The remaining
+# default rules report ~970 findings across the tree and are being adopted
+# incrementally rather than in one unreviewable sweep; widen this list, do not
+# widen it silently.
+select = ["E4", "E7", "E9", "F", "W"]
+ignore = [
+  "E741",  # ambiguous variable names: `l` is a lane index in several decoders
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["F401", "F811"]
