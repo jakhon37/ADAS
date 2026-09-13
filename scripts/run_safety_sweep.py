@@ -25,7 +25,7 @@ one and wrong about another:
 
 Examples::
 
-    # the CI gate: ~10 s, 96 cells straddling every measured boundary,
+    # the CI gate: ~16 s, 120 cells straddling every measured boundary,
     # non-zero exit on any collision, miss, phantom, lateness or band fault
     python3 scripts/run_safety_sweep.py --gate
 
@@ -50,9 +50,27 @@ import sys
 from typing import List, Optional, Sequence
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for _path in (os.path.join(_REPO_ROOT, "src"), _REPO_ROOT):
-    if _path not in sys.path:
-        sys.path.insert(0, _path)
+
+# The repository root goes FIRST, because ``tests.scenarios`` -- the
+# specification -- must always be this working tree's.  The working tree's
+# ``src`` goes LAST, so that an explicit ``PYTHONPATH`` naming another
+# checkout's ``src`` wins and ``import adas`` resolves to the system under
+# test the caller asked for.
+#
+# It used to be the other way round, and that was a defect in the gate: an
+# earlier prepend of ``<repo>/src`` shadowed every PYTHONPATH entry, so
+# backtesting an older commit with
+# ``PYTHONPATH=<worktree>/src:. python3 scripts/run_safety_sweep.py --gate``
+# silently graded the WORKING TREE and printed a confident, wrong table.
+# Measured: the phantom commit 25e3ba5 and the missed-braking commit 1ce4886
+# both reported the identical failure line, which is impossible for two
+# arbiters with opposite defects.  ``--provenance`` below now prints which
+# arbiter actually loaded, so the same mistake cannot be silent again.
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+_SRC = os.path.join(_REPO_ROOT, "src")
+if _SRC not in sys.path:
+    sys.path.append(_SRC)
 
 from tests.scenarios.plant import DEFAULT_PLANT  # noqa: E402
 from tests.scenarios.sweep import (  # noqa: E402
@@ -80,10 +98,12 @@ between them.
 """
 
 GATE_PROFILE = "fast"
-"""Grid the gate runs.  96 cells, about ten seconds, and it holds a straddling
-pair of ranges either side of every boundary the envelope is known to contain --
-which is what makes a ten-second grid worth running instead of a nine-hundred
-cell one."""
+"""Grid the gate runs.  120 cells, about sixteen seconds, and it holds a
+straddling pair of ranges either side of every boundary the envelope is known to
+contain -- which is what makes a sixteen-second grid worth running instead of a
+fifteen-hundred cell one.  The two ranges beyond 70 m were added because the
+tool reported two failure regions running off the top of the old axis; see
+``AXIS COVERAGE`` in the output and ``PROFILES`` in tests/scenarios/sweep.py."""
 
 
 def _floats(text: str) -> tuple:
@@ -177,6 +197,82 @@ def _spec_from_args(args: argparse.Namespace) -> SweepSpec:
     return SweepSpec(**fields)
 
 
+def _arbiter_provenance() -> tuple:
+    """``(path, md5)`` of the ``adas.control.arbiter`` module that actually loaded.
+
+    Printed in the header of every run.  A sweep is only evidence about the code
+    it graded, and "which code was that" is the one question a table of numbers
+    cannot answer for itself.  It is also what makes backtesting an old commit
+    checkable at a glance: the md5 in the header must be that commit's arbiter
+    md5, and if it is the working tree's then the run graded HEAD whatever
+    ``PYTHONPATH`` said.
+
+    Any failure to resolve the module is reported in place rather than raised:
+    the sweep's job is to grade the arbiter, not to police its own header.
+    """
+    try:
+        import hashlib
+        import adas.control.arbiter as _arb
+
+        path = (_arb.__file__ or "").replace(".pyc", ".py")
+        with open(path, "rb") as handle:
+            return path, hashlib.md5(handle.read()).hexdigest()[:8]
+    except Exception as exc:  # pragma: no cover - defensive header only
+        return "<unresolved: %s>" % exc, "?"
+
+
+def _print_axis_coverage(report: dict, grid: SweepGrid) -> None:
+    """State, in one place, whether every failure region is bounded on both sides.
+
+    A region that runs to the top of the range axis has an unknown width: the
+    sweep has measured that the failure occurs at 70 m and nothing at all about
+    where it stops, so "EARLY for range 16-70" is a lower bound wearing the
+    costume of a measurement.  The individual region statements already say so,
+    but they say it in the middle of forty other lines and it was missed for a
+    whole revision.  This prints the count and names the offenders, so extending
+    the axis is a decision somebody takes rather than one nobody notices.
+
+    It is deliberately NOT part of ``--fail-on``: an unbounded region is a
+    deficiency in the GRID, not a defect in the arbiter, and conflating the two
+    would let a harness bug read as a system failure -- which is the whole
+    disease this workstream exists to treat.
+    """
+    open_ended = []
+    for source in (report["regions"], report["band_regions"]):
+        for verdict in sorted(source):
+            for row in source[verdict]:
+                if row["open_ended"]:
+                    open_ended.append((verdict, row))
+    print()
+    print("-" * 78)
+    print("AXIS COVERAGE -- is every failure region bounded on both sides?")
+    print("-" * 78)
+    if not open_ended:
+        print(
+            "  yes: every failure region closes inside the swept range axis "
+            "(top = %g m), so every reported width is a measurement."
+            % max(grid.ranges_m)
+        )
+        return
+    print(
+        "  NO -- %d region(s) run off the top of the range axis (%g m). Their widths "
+        "are LOWER BOUNDS, not measurements. Extend --range past the top, re-measure, "
+        "and move the profile's axis to straddle whatever boundary you find."
+        % (len(open_ended), max(grid.ranges_m))
+    )
+    for verdict, row in open_ended:
+        print(
+            "    %-16s ego %g m/s, rate %+g, lead_decel %g: %s m and still failing"
+            % (
+                verdict,
+                row["ego_speed_mps"],
+                row["relative_rate_mps"],
+                row["lead_decel_mps2"],
+                row["range_span"],
+            )
+        )
+
+
 def _progress(total: int):
     """Single rewritten progress line on a tty, nothing on a pipe."""
     if not sys.stderr.isatty():
@@ -238,6 +334,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "tests.scenarios.oracle, shared with the scenario suite"
         % DEFAULT_PLANT.brake_rise_time_s
     )
+    arbiter_path, arbiter_md5 = _arbiter_provenance()
+    print("arbiter under test : %s  md5 %s" % (arbiter_path, arbiter_md5))
     print()
 
     results = run_sweep(
@@ -330,6 +428,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ),
             )
         )
+
+    _print_axis_coverage(report, grid)
 
     if not args.no_cells:
         failing = [r for r in results if r.verdict in Verdict.FAILURES]

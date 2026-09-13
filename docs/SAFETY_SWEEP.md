@@ -29,7 +29,7 @@ suite, so there is one specification rather than two.
 ### Running it
 
 ```bash
-# THE GATE. 96 cells, ~11 s on the Xavier NX. Non-zero exit on any collision,
+# THE GATE. 120 cells, ~16 s on the Xavier NX. Non-zero exit on any collision,
 # miss, phantom, early or late intervention, or sub-emergency band fault.
 PYTHONPATH=src:. python3 scripts/run_safety_sweep.py --gate
 
@@ -37,7 +37,7 @@ PYTHONPATH=src:. python3 scripts/run_safety_sweep.py --gate
 PYTHONPATH=src:. python3 scripts/run_safety_sweep.py --gate \
     --json build/safety_sweep_gate.json
 
-# the default envelope: 1260 cells, ~2.5 min on the Xavier NX
+# the default envelope: 1512 cells, ~3 min on the Xavier NX
 PYTHONPATH=src:. python3 scripts/run_safety_sweep.py --json /tmp/sweep.json
 
 # the dense envelope, for finding a boundary precisely by hand
@@ -69,9 +69,9 @@ can be committed and two revisions of the arbiter diffed against each other.
 
 | profile | cells | axes | time |
 |---|---|---|---|
-| `fast` (the gate) | 96 | ego {15,20,25} × range {12,16,26,32,40,44,52,70} × rate {0,−8} × lead decel {0,6} | ~11 s |
-| `standard` | 1260 | ego {5..30 step 5} × range {5,8,12,16,20,26,30,32,40,43,44,52,60,70,80} × rate {+3,0,−1,−2,−4,−8,−15} × lead decel {0,6} | ~2.5 min |
-| `dense` | 9900 | halved ego and range steps, 30 ranges, lead decel {0,3,6} | ~20 min |
+| `fast` (the gate) | 120 | ego {15,20,25} × range {12,16,26,32,40,44,52,70,**80,90**} × rate {0,−8} × lead decel {0,6} | ~16 s |
+| `standard` | 1512 | ego {5..30 step 5} × range {5,8,12,16,20,26,30,32,40,43,44,52,60,70,80,**90,120,150**} × rate {+3,0,−1,−2,−4,−8,−15} × lead decel {0,6} | ~3 min |
+| `dense` | 11220 | halved ego and range steps, 34 ranges, lead decel {0,3,6} | ~25 min |
 
 A grid whose sample points all sit inside a failure region reports its width as
 the width of the grid, and one whose points all sit outside reports it as zero.
@@ -83,7 +83,17 @@ boundary this envelope is known to contain**:
 |---|---|---|---|
 | constant-range phantom | `25e3ba5` | 26 m at 15 m/s, 43 m at 20 m/s, 66 m at 25 m/s | 26/32 · 40/44 · 52/70 |
 | avoidable contact, lead braking at 6 m/s² | `1ce4886` | 16–26 m at 20 m/s (full stack) | 12/16 · 26/32 |
-| stopped-obstacle avoidability = the plant's own stop distance | plant | 14.70 m at 15 m/s, 25.85 m at 20 m/s, 40.13 m at 25 m/s | 12/16 · 26/32 · 40/44 |
+| stopped-obstacle avoidability, jerk-limited and charged the two-frame measurement floor | plant | 18.77 m at 15 m/s, 31.30 m at 20 m/s, 46.95 m at 25 m/s | 16/26 · 26/32 · 44/52 |
+| EARLY against a lead 8 m/s slower, no lead braking, 8 s window | both | 82 m at 20 m/s, 89 m at 25 m/s | **80/90** |
+| LATE at 25 m/s against a lead braking at 6 m/s², 8 s window | both | 76 m at rate +0, 70 m at rate −8 | **70/80** |
+| BAND_UNWARRANTED at 10 m/s against a lead braking at 6 m/s², 12 s window | both | between 120 and 140 m | **120/150** (`standard`) |
+
+The last three rows are new in this revision. They are the boundaries the tool
+had been *reporting* it could not see — "EARLY for range 16-70 at ego 20 m/s …
+the real boundary is beyond 70 m" — and the axes now straddle them, so every
+failure region the gate prints closes inside the grid and every reported width
+is a measurement rather than a lower bound. The report says so explicitly; see
+**AXIS COVERAGE** below.
 
 Every profile still contains `(rate = 0, decel = 0)` — the constant-range scene
 that fix round 1 phantom-braked for — and `(rate = 0, decel = 6)` — the braking
@@ -96,6 +106,18 @@ arbiter's image-space in-path gate sees is geometrically consistent with the
 range it is also given. The arbiter is handed
 `ControlCommand(throttle=0.4, brake=0.0)` every frame: **a cruise request with
 no brake in it at all**, so any brake in the output is the arbiter's own.
+
+The track's three numbers — range, range rate and time to contact — are now
+mutually consistent and all three mean what the production stack defines them to
+mean. `TrackedObject.velocity_mps` is a **range rate with the
+positive-when-closing convention** (`adas.tracking.tracker`,
+`MultiObjectTracker._to_tracked_object` and `time_to_collision_s`), not the
+lead's ground speed; a camera measures range and has no way to know a lead's
+speed over the ground. The sweep used to put `lead_v` — the lead's absolute
+speed — straight into that field, so on the cell that matters most, a
+matched-speed follow at true closing rate zero, the arbiter was handed "closing
+at 20 m/s" and a TTC of one second. See **the contract fix** below for what that
+did and did not change.
 
 Each cell is run twice:
 
@@ -226,6 +248,94 @@ The emergency phantom stops at 43 m and the band picks up at 44 m. Without the
 second grid the 44 m cell reads as `CORRECT`, and the boundary looks like a
 cliff rather than what it is: full authority becoming 3.2 m/s² of unwarranted
 braking.
+
+### The contract fix, and the before/after boundary table
+
+`sweep.py` set `velocity_mps=lead_v` into a field the production stack defines
+as positive-when-closing. That is a harness bug in the primary gate's own input,
+so an unknown part of the gate's numbers measured the harness rather than the
+arbiter. It is fixed (`sweep.closing_mps`, which returns `ego_v − lead_v`, and
+`sweep._ttc_s`, which fills `ttc_s` consistently instead of leaving it at
+`inf`), and **every boundary in this document was then re-measured**:
+
+| boundary | before the fix | after the fix |
+|---|---|---|
+| `25e3ba5` constant-range phantom, 15 m/s | ≤ 26 m | ≤ 26 m |
+| `25e3ba5` constant-range phantom, 20 m/s | ≤ 43 m | ≤ 43 m |
+| `25e3ba5` constant-range phantom, 25 m/s | ≤ 66 m | ≤ 66 m |
+| `25e3ba5` BAND_UNWARRANTED, 15 / 20 / 25 m/s | 27 / 44–45 / none | 27 / 44–45 / none |
+| `1ce4886` constant-range phantom, 15 / 20 / 25 m/s | ≤ 17 / ≤ 21 / ≤ 26 m | ≤ 17 / ≤ 21 / ≤ 26 m |
+| `1ce4886` BAND_UNWARRANTED, 15 / 20 / 25 m/s | 18–27 / 22–45 / 27–66 m | 18–27 / 22–45 / 27–66 m |
+| `1ce4886` COLLISION, lead braking 6 m/s², 20 m/s | 11–37 m | 11–37 m |
+| `1ce4886` COLLISION, lead braking 6 m/s², 25 m/s | 13–60 m | 13–60 m |
+| `1ce4886` COLLISION, lead braking 6 m/s², 30 m/s | 11–60 m | 11–60 m |
+| `25e3ba5` COLLISION, lead braking 6 m/s², 30 m/s | 11–26 m | 11–26 m |
+| gate, `25e3ba5` | BAND 3, COLLISION 5, EARLY 18, LATE 4, PHANTOM 15 | unchanged (on the 96-cell axis) |
+| gate, `1ce4886` | BAND 19, COLLISION 21, EARLY 15, LATE 8, PHANTOM 7 | unchanged (on the 96-cell axis) |
+
+**Nothing moved, and the reason is worth writing down rather than filing as a
+non-event.** None of the three committed arbiters reads
+`TrackedObject.velocity_mps` at all: each derives its closing rate from its own
+range filter over `distance_m`, and says so in its own module docstring. The
+three occurrences of `velocity_mps` in `25e3ba5` and in `1ce4886` are all in
+comments. So the contract was violated for three revisions without moving a
+single number — which is exactly the kind of latent harness bug that stays
+harmless until the redesign lands an arbiter that *does* use the field, and then
+silently inverts the sign of the quantity the gate is grading.
+
+The boundaries above are therefore confirmed rather than revised, and no
+scenario in `tests/scenarios/library.py` had to move because of this fix. (Two
+families did move, for a different and unrelated reason: see
+`docs/SAFETY_SPEC.md` section 3a/B3.)
+
+### A second defect found while re-measuring: the gate graded HEAD
+
+`scripts/run_safety_sweep.py` prepended `<repo>/src` to `sys.path`, which
+shadows every `PYTHONPATH` entry. Backtesting an old commit with
+
+```bash
+PYTHONPATH=/tmp/wt/src:. python3 scripts/run_safety_sweep.py --gate
+```
+
+therefore graded the **working tree** and printed a confident, wrong table. It
+was caught because `25e3ba5` and `1ce4886` reported the *identical* failure
+line, which is impossible for two arbiters with opposite defects. Fixed by
+putting the repository root first (so `tests.scenarios` is always this working
+tree's specification) and appending `<repo>/src` last (so an explicit
+`PYTHONPATH` wins). The report header now prints
+
+```
+arbiter under test : /tmp/adas-bt/wt-25e3ba5/src/adas/control/arbiter.py  md5 d85a8a2b
+```
+
+so the same mistake cannot be silent again: the md5 in the header must be the
+md5 of the commit you meant to grade.
+
+### AXIS COVERAGE
+
+Every run now ends with a one-line verdict on the grid itself:
+
+```
+AXIS COVERAGE -- is every failure region bounded on both sides?
+------------------------------------------------------------------------------
+  yes: every failure region closes inside the swept range axis (top = 90 m), so
+  every reported width is a measurement.
+```
+
+and, when it does not:
+
+```
+  NO -- 2 region(s) run off the top of the range axis (70 m). Their widths are
+  LOWER BOUNDS, not measurements. Extend --range past the top, re-measure, and
+  move the profile's axis to straddle whatever boundary you find.
+    EARLY            ego 20 m/s, rate -8, lead_decel 0: 16-70 m and still failing
+    EARLY            ego 25 m/s, rate -8, lead_decel 0: 16-70 m and still failing
+```
+
+It is deliberately **not** part of `--fail-on`. An unbounded region is a
+deficiency in the GRID, not a defect in the arbiter, and conflating the two would
+let a harness bug read as a system failure — which is the disease this whole
+revision is treating.
 
 ---
 
@@ -442,26 +552,52 @@ the earlier report but the *scenario* form of that case passed, because the
 extra second of matched speed let the headway law settle first. Brake the lead
 from frame 0 and the region is unambiguous.
 
-### Boundary 3 — the stopped obstacle
+### Boundary 3 — the stopped obstacle (RE-MEASURED; it moved)
 
-The boundary here is the vehicle's own stop distance, measured by driving the
-plant at `brake = 1.0`: **6.67 m at 10 m/s, 14.70 m at 15 m/s, 25.85 m at
-20 m/s, 40.13 m at 25 m/s**. Closer than that, contact is arithmetic and no
-arbiter can be blamed for it. Minimum true gap, full stack, closed loop:
+This one is **not** the vehicle's raw stop distance, and stating it as one is how
+five scenarios came to be placed inside a boundary no correct system can reach.
+The raw figures — 6.67 / 14.70 / 25.85 / 40.13 m at 10 / 15 / 20 / 25 m/s,
+measured by driving the plant at `brake = 1.0` from the frame the obstacle
+exists — charge neither the emergency jerk limit (a step to full pedal is
+160 m/s³ and the harness's own `excess_jerk` finding forbids it; the ramp costs
+3.45 m at 20 m/s) nor the two-frame measurement floor (at the measured 55 ms
+sense latency on a 50 ms grid, decision frames 0 and 1 both read capture 0, so
+frame 2 is the first with a range *rate*: 0.10 s and 2.00 m at 20 m/s).
 
-| ego, d₀ | best available | `25e3ba5` | `1ce4886` |
+Charging both, with `scenario.feasibility()`:
+
+| ego | raw plant stop | zero-latency, jerk-limited | **avoidability boundary** | 2.00 m first reachable at |
+|---|---|---|---|---|
+| 10 m/s | 6.67 m | 8.37 m | 9.37 m | — |
+| 15 m/s | 14.70 m | 17.27 m | **18.77 m** | 21.0 m |
+| 20 m/s | 25.85 m | 29.30 m | **31.30 m** | 33.5 m |
+| 25 m/s | 40.13 m | 44.45 m | **46.95 m** | 49.0 m |
+
+Minimum true gap, full stack, closed loop, at the re-placed ranges:
+
+| ego, d₀ | reachable | `25e3ba5` | `1ce4886` |
 |---|---|---|---|
-| 15 m/s, 15 m | +0.30 | +0.30 | **−0.43** |
-| 20 m/s, 26 m | +0.15 | +0.15 | **−1.21** |
-| 20 m/s, 27 m | +1.15 | +1.15 | **−0.21** |
-| 20 m/s, 29 m | +3.15 | +3.15 | +1.79 |
-| 25 m/s, 41 m | +0.87 | +0.87 | **−0.83** |
-| 25 m/s, 42 m | +1.87 | +1.87 | +0.17 |
+| 15 m/s, 18 m | −0.15 (unsatisfiable) | +3.26 | +1.38 |
+| 15 m/s, 22 m | +3.23 | +5.99 | +5.34 |
+| 15 m/s, 25 m | +6.23 | +6.52 | +7.34 |
+| 20 m/s, 30 m | −0.01 (unsatisfiable) | +3.87 | +1.57 |
+| 20 m/s, 36 m | +4.70 | +7.55 | +6.54 |
+| 20 m/s, 40 m | +8.70 | +8.04 | +8.32 |
+| 20 m/s, 50 m | +18.70 | +8.15 | +7.94 |
+| 25 m/s, 46 m | −0.17 (unsatisfiable) | +5.20 | +2.63 |
+| 25 m/s, 52 m | +5.05 | +8.03 | +7.59 |
 
-`1ce4886` therefore throws away between 1.4 m and 2.0 m of clearance that the
-vehicle physically has, which is the difference between stopping and hitting at
-exactly the ranges where it matters. Both commits go to full authority for a car
-40 m and 75 m away, where 5.26 and 2.74 m/s² are all that is required.
+Read the unsatisfiable rows carefully: both commits achieve MORE than the
+"reachable" figure there, because both brake on the stationary prior before the
+range rate exists. That is the point. The reachable column is what a system that
+waits for a measurement can do, and a scenario demanding more than it is a
+scenario whose only solution is the phantom.
+
+On this plant **neither commit contacts a stopped obstacle anywhere the case is
+satisfiable**, so B3 no longer discriminates on contact. It discriminates on
+over-braking: both go to 8.00 m/s² at every range, including 50 m where
+4.17 m/s² is required (justified ceiling 6.75) and 75 m where 2.74 m/s² is
+(ceiling 4.60).
 
 ### Boundary 4 — the sub-emergency band
 
@@ -558,10 +694,22 @@ The redesign is judged against these two tools, unchanged. Concretely:
   demand above comfort on a frame whose closing rate is not measured.
 
 **Do not narrow the grid to make the gate pass.** The range axes in
-`PROFILES` are chosen to straddle measured boundaries (section 1); removing 16 m
-or 44 m from `fast` removes the only evidence that a boundary moved. If the
-plant changes, re-measure the boundaries first (`docs/SAFETY_SPEC.md`, section 8)
-and then move the axes to straddle the new ones.
+`PROFILES` are chosen to straddle measured boundaries (section 1); removing 16 m,
+44 m, 80 m or 90 m from `fast` removes the only evidence that a boundary moved.
+If the plant changes, re-measure the boundaries first (`docs/SAFETY_SPEC.md`,
+section 8) and then move the axes to straddle the new ones. The **AXIS
+COVERAGE** line at the end of every run tells you when the grid has stopped
+being wide enough; it is not part of `--fail-on`, so it is your job to read it.
+
+**Do not let a fidelity feature go to zero coverage.** The scenario library's
+census lives in `library.coverage_census()` and is documented in
+`docs/SAFETY_SPEC.md` section 3b; `tests/test_scenarios.py::
+test_harness_fidelity_features_are_exercised` fails when any row of it empties.
+The sweep itself is deliberately noise-free — its job is to isolate the
+*decision* over a whole envelope, and noise would turn a boundary into a
+smear — so sensor noise, range bias, variable frame periods and multi-object
+worlds are covered by the scenario library instead. Between the two tools the
+coverage is complete; in neither tool alone is it.
 
 The instrumentation is written to survive the rewrite: if a hooked method is
 renamed, it is listed in `missing_hooks` and the surrounding capture still

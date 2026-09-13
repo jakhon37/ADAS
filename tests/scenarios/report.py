@@ -42,7 +42,7 @@ from tests.scenarios import oracle as truth
 from tests.scenarios import scenario as scen
 from tests.scenarios.library import SCENARIOS
 
-SPEC_VERSION = "1.1"
+SPEC_VERSION = "1.2"
 """Bumped whenever a margin convention or an authority limit changes.
 
 A JSON artifact from a different spec version is not comparable with this one.
@@ -50,6 +50,26 @@ A JSON artifact from a different spec version is not comparable with this one.
 1.1 added the four assertions that 1.0 was missing -- bounded jerk, the
 throttle/brake conflict, the system's own assertable self-reports, and
 proportionality across the sub-emergency band -- and the degradable stack.
+
+1.2 fixed the JUDGEMENT LAYER, which is why it is not comparable with 1.1:
+
+* Avoidability is judged against the vehicle AND the sensor the system actually
+  drives -- sense latency, rate observability, actuation dead time, brake rise
+  -- and against a jerk-limited brake demand rather than an instantaneous step,
+  because a step is 160 m/s^3 and this same specification forbids it.  The
+  avoidability boundary for a stationary obstacle therefore moved from
+  6.67 / 14.70 / 25.85 / 40.13 m to 9.37 / 18.77 / 31.30 / 46.95 m at
+  10 / 15 / 20 / 25 m/s, and five scenarios turned out to be placed inside it.
+* The plant STOPS AT CONTACT and records the impact speed.
+* ``phantom_intervention`` covers an actuated unwarranted brake only;
+  entering a state while commanding nothing is ``unwarranted_authority_state``.
+* ``excess_jerk`` assesses only a RISING demand, and takes its band from the
+  demand rather than from whether the oracle's causal requirement had already
+  become visible.
+* ``forbid_emergency_intervention`` is read.  It was set on eight scenarios and
+  asserted nothing.
+* Every scenario is now checked for SATISFIABILITY against a reference
+  controller; see ``--reference`` and ``--budgets``.
 """
 
 BASELINE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "baseline.json")
@@ -233,6 +253,20 @@ def render_table(results: Sequence[scen.ScenarioResult], verbose: bool = False) 
         )
         if not r.scenario.stack.is_default:
             out.append("       stack:  %s" % r.scenario.stack.label)
+        if m["contact"]:
+            c = m["contact"]
+            out.append(
+                "       CONTACT at frame %d (t=%.2f s) with %r: closing %.2f m/s, "
+                "ego %.2f m/s, gap %.2f m -- the run stops here"
+                % (c["frame"], c["t_s"], c["label"], c["closing_mps"],
+                   c["ego_v_mps"], c["gap_m"])
+            )
+        if not m["scenario_feasible"]:
+            out.append(
+                "       MIS-SPECIFIED: affordable decision latency %s s -- no system can "
+                "pass this scenario as written"
+                % _fmt(m["affordable_decision_latency_s"])
+            )
         if m["self_reported_violations"]:
             out.append(
                 "       system's own findings: %s"
@@ -290,10 +324,164 @@ def render_table(results: Sequence[scen.ScenarioResult], verbose: bool = False) 
     return "\n".join(out)
 
 
+def render_budgets(scenarios: Sequence[scen.Scenario]) -> str:
+    """The affordable decision latency for every scenario, as a table.
+
+    The single most useful number the redesign has.  It says, per scenario, how
+    long the system may take to decide -- measured from the first frame on which
+    the measurements it is handed could support the decision, and after the
+    pipeline's own 55 ms of sense latency and the two frames a closing rate
+    needs to exist have already been paid for.  A negative figure is a scenario
+    that demands a reaction before the information exists; the only way to pass
+    one is to brake on a prior instead of a measurement, which is the phantom
+    braking this harness punishes elsewhere, so such a scenario is MIS-SPECIFIED
+    and has to move or go.
+
+    ``ideal`` is the clearance a zero-decision-latency system holds and ``best``
+    the clearance a real one holds; both are measured through the plant with a
+    jerk-limited brake demand, because an oracle that judged avoidability
+    against a one-frame step to full authority would be requiring a manoeuvre
+    the ``excess_jerk`` finding forbids.
+    """
+    rows = [scen.feasibility(s) for s in scenarios]
+    out: List[str] = []
+    out.append("=" * 108)
+    out.append("AFFORDABLE DECISION LATENCY  (spec %s)" % SPEC_VERSION)
+    out.append(
+        "how long the system may take to decide, after the pipeline's own latency "
+        "has already been paid"
+    )
+    out.append("=" * 108)
+    name_w = max([len(s.name) for s in scenarios] + [8])
+    out.append(
+        "%-*s %9s %9s %9s %7s %9s %10s"
+        % (name_w, "scenario", "req_clr", "ideal", "best", "act@", "min_lat", "AFFORD")
+    )
+    out.append("-" * 108)
+    infeasible: List[str] = []
+    for f in rows:
+        if not f.feasible:
+            infeasible.append(f.name)
+        out.append(
+            "%-*s %9s %9s %9s %7s %9s %10s%s"
+            % (
+                name_w,
+                f.name,
+                _fmt(f.required_clearance_m),
+                _fmt(f.ideal_clearance_m),
+                _fmt(f.best_clearance_m),
+                f.earliest_actionable_frame
+                if f.earliest_actionable_frame is not None
+                else "-",
+                _fmt(f.minimum_latency_s),
+                _fmt(f.affordable_decision_latency_s),
+                "   MIS-SPECIFIED" if not f.feasible else "",
+            )
+        )
+    out.append("-" * 108)
+    if infeasible:
+        out.append(
+            "%d scenario(s) cannot be passed by ANY system as written: %s"
+            % (len(infeasible), ", ".join(infeasible))
+        )
+    else:
+        out.append("every scenario has a non-negative decision budget")
+    out.append("-" * 108)
+    return "\n".join(out)
+
+
+def render_reference(scenarios: Sequence[scen.Scenario]) -> str:
+    """Run every scenario against :class:`scenario.ReferenceController`.
+
+    THE SATISFIABILITY PROOF, and the redesign's known-achievable target.  The
+    reference controller is a constant time gap, a braking law derived from
+    required deceleration, and a jerk limiter; it pays the same sense latency
+    and the same actuator lag as the system under test, and it never brakes on a
+    closing rate it has not measured.  Every scenario must be passable by it.
+    Anything it fails with a code outside
+    :data:`scenario.SCENARIO_DEFECT_CODES` is a specification the harness cannot
+    justify; anything it fails with a code inside that set is a scenario that
+    has to be moved or deleted.
+    """
+    out: List[str] = []
+    out.append("=" * 108)
+    out.append("REFERENCE CONTROLLER  (spec %s) -- is this specification satisfiable?" % SPEC_VERSION)
+    out.append("=" * 108)
+    name_w = max([len(s.name) for s in scenarios] + [8])
+    clean = 0
+    spec_defects: Dict[str, List[str]] = {}
+    real: Dict[str, List[str]] = {}
+    for s in scenarios:
+        result = scen.run(s, scen.reference_stack(s))
+        codes = sorted({f.code for f in result.findings})
+        system_codes = [c for c in codes if c not in scen.SCENARIO_DEFECT_CODES]
+        m = result.metrics
+        if not codes:
+            tag = "PASS"
+            clean += 1
+        elif system_codes:
+            tag = "UNSATISFIABLE"
+            real[s.name] = codes
+        else:
+            tag = "SCENARIO-DEFECT"
+            spec_defects[s.name] = codes
+        out.append(
+            "%-15s %-*s min_gap=%-8s peak_brake=%-6s peak_jerk=%-7s v_min=%-6s %s"
+            % (
+                tag,
+                name_w,
+                s.name,
+                _fmt(m["min_gap_m"]),
+                _fmt(m["max_commanded_decel_mps2"]),
+                _fmt(m["max_commanded_jerk_mps3"]),
+                _fmt(m["min_ego_speed_mps"]),
+                ", ".join(codes),
+            )
+        )
+    out.append("-" * 108)
+    out.append(
+        "%d of %d scenarios are satisfied by the reference controller; "
+        "%d are mis-specified; %d are UNSATISFIABLE as written"
+        % (clean, len(scenarios), len(spec_defects), len(real))
+    )
+    for name in sorted(spec_defects):
+        out.append("  MIS-SPECIFIED  %-38s %s" % (name, ", ".join(spec_defects[name])))
+    for name in sorted(real):
+        out.append("  UNSATISFIABLE  %-38s %s" % (name, ", ".join(real[name])))
+    out.append("-" * 108)
+    return "\n".join(out)
+
+
+def render_expectation_audit() -> str:
+    """Which :class:`scenario.Expectation` fields ``evaluate`` actually reads."""
+    reads = scen.expectation_field_reads()
+    out = ["expectation fields and the number of read sites in evaluate():"]
+    for name in sorted(reads):
+        flag = "  <-- DECLARED BUT NEVER READ" if reads[name] == 0 else ""
+        out.append("  %-38s %d%s" % (name, reads[name], flag))
+    dead = scen.unread_expectation_fields()
+    out.append(
+        "no silently-ignored assertions"
+        if not dead
+        else "SILENTLY IGNORED: %s" % ", ".join(dead)
+    )
+    return "\n".join(out)
+
+
 def _fmt(value: object) -> str:
+    """Format a metric for the table, keeping the infinities distinguishable.
+
+    ``inf`` and ``-inf`` used to print as the same dash, which made a scenario
+    with an unbounded decision budget look identical to one that cannot be
+    passed at all.
+    """
     if isinstance(value, float):
-        if value != value or value in (float("inf"), float("-inf")):
-            return "-"
+        if value != value:
+            return "nan"
+        if value == float("inf"):
+            return "inf"
+        if value == float("-inf"):
+            return "-inf"
         return "%.2f" % value
     return str(value)
 
@@ -334,6 +522,13 @@ def to_json(results: Sequence[scen.ScenarioResult]) -> Dict[str, object]:
                 },
                 "passed": r.passed,
                 "findings": [{"code": f.code, "detail": f.detail} for f in r.findings],
+                "scenario_defect": bool(r.findings) and all(
+                    f.code in scen.SCENARIO_DEFECT_CODES for f in r.findings
+                ),
+                "feasibility": {
+                    k: (v if not isinstance(v, float) else _round_json(v))
+                    for k, v in asdict(scen.feasibility(r.scenario)).items()
+                },
                 "metrics": r.metrics,
             }
         )
@@ -354,7 +549,17 @@ def to_json(results: Sequence[scen.ScenarioResult]) -> Dict[str, object]:
             "justification_window_frames": truth.JUSTIFICATION_WINDOW_FRAMES,
             "max_brake_authority_mps2": scen.DEFAULT_PLANT.max_brake_decel_mps2,
             "dt_s": scen.DEFAULT_PLANT.dt_s,
+            "sense_latency_s": scen.PERFECT_PERCEPTION.sense_latency_s,
+            "brake_rise_time_s": scen.DEFAULT_PLANT.brake_rise_time_s,
+            "actuation_latency_s": scen.DEFAULT_PLANT.actuation_latency_s,
         },
+        "expectation_field_reads": scen.expectation_field_reads(),
+        "unread_expectation_fields": scen.unread_expectation_fields(),
+        "mis_specified": [
+            r.scenario.name
+            for r in results
+            if not scen.feasibility(r.scenario).feasible
+        ],
         "summary": {
             "total": len(results),
             "passed": passed,
@@ -364,6 +569,13 @@ def to_json(results: Sequence[scen.ScenarioResult]) -> Dict[str, object]:
         "baseline": classify_against_baseline(results),
         "scenarios": scenarios,
     }
+
+
+def _round_json(x: float) -> object:
+    """Floats for the artifact: rounded, with the infinities left readable."""
+    if x != x or x in (float("inf"), float("-inf")):
+        return str(x)
+    return round(float(x), 4)
 
 
 def write_json(path: str, results: Sequence[scen.ScenarioResult]) -> None:
@@ -384,6 +596,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--json", metavar="PATH", help="also write the JSON artifact here")
     parser.add_argument("--verbose", action="store_true", help="print the physics for every case")
     parser.add_argument("--only", metavar="NAME", action="append", help="run only these scenarios")
+    parser.add_argument(
+        "--budgets",
+        action="store_true",
+        help="print the affordable decision latency for every scenario and exit; "
+        "a negative figure is a scenario no system can pass",
+    )
+    parser.add_argument(
+        "--reference",
+        action="store_true",
+        help="run the reference controller instead of the system under test and "
+        "print whether this specification is satisfiable at all",
+    )
+    parser.add_argument(
+        "--audit-expectations",
+        action="store_true",
+        help="print every Expectation field and how many times evaluate() reads it",
+    )
     parser.add_argument(
         "--write-baseline",
         action="store_true",
@@ -408,6 +637,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         missing = wanted - {s.name for s in chosen}
         if missing:
             parser.error("unknown scenario(s): %s" % ", ".join(sorted(missing)))
+
+    if args.audit_expectations:
+        print(render_expectation_audit())
+        return 0 if not scen.unread_expectation_fields() else 3
+
+    if args.budgets:
+        print(render_budgets(chosen))
+        return 0 if all(scen.feasibility(s).feasible for s in chosen) else 3
+
+    if args.reference:
+        print(render_reference(chosen))
+        bad = 0
+        for s in chosen:
+            codes = {f.code for f in scen.run(s, scen.reference_stack(s)).findings}
+            if codes - set(scen.SCENARIO_DEFECT_CODES):
+                bad += 1
+            elif codes:
+                bad += 1
+        return 0 if bad == 0 else 3
 
     results = run_all(chosen)
     print(render_table(results, verbose=args.verbose))

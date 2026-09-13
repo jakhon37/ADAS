@@ -22,6 +22,27 @@ silently stop catching either commit, and the suite would go GREENER, not
 redder.  This file is the tripwire: if the specification stops detecting a
 defect somebody already measured, this test goes red and names it.
 
+Proved by mutation, not asserted
+--------------------------------
+The previous revision of this file did NOT have that property, and a family-only
+check is why.  Three mutations were applied to the working tree, ``pytest
+tests/test_backtest.py`` was run against each, and the result recorded:
+
+===================================================  ==================  ==================
+mutation                                             before these tests  after them
+===================================================  ==================  ==================
+move the constant_range family off the phantom
+boundary (12/20/30/40 -> 55/60/65/68 m)              8 passed            FAILED
+weaken a diagnosis: drop ``collided`` from the
+codes the missed-braking commit must report          8 passed            FAILED
+delete a scenario: remove ``constant_range_12m``     8 passed            FAILED
+===================================================  ==================  ==================
+
+Each mutation was reverted afterwards and the suite returned to its recorded
+state.  The verbatim output of all three runs is in the workstream report; the
+point of the table is that every row's left-hand column is the reason the
+right-hand column had to be built.
+
 What it costs and when it skips
 -------------------------------
 Each commit means one ``git worktree add`` and one full harness run -- about
@@ -172,6 +193,88 @@ def test_the_collision_half_of_the_spec_fires_on_the_missed_braking_commit(outco
         "no collision diagnosis fired anywhere in the library against the commit that "
         "collides at 15, 20, 25 and 30 m. Everything that did fire: %s" % sorted(fired)
     )
+
+
+@pytest.mark.parametrize("sha", [c.sha for c in bt.KNOWN_BROKEN], ids=lambda s: s)
+def test_named_scenarios_still_produce_their_named_diagnosis(outcomes, sha):
+    """The pins: THIS scenario must report THIS diagnosis on THIS commit.
+
+    The family check above is satisfied by any one member reporting any one of a
+    set of codes, and that is too weak to be a regression test.  Verified by
+    mutation before these pins existed: moving the whole ``constant_range``
+    family off the phantom boundary to 55/60/65/68 m left this file at
+    "8 passed", because at 55 m the phantom commit still tripped the softer
+    ``unwarranted_brake`` and the family count of one was met.
+
+    What is pinned, and why each one:
+
+    * ``25e3ba5`` -- ``constant_range_12m/20m/30m/40m`` must each report
+      ``phantom_intervention``.  Four cases spanning 12 to 40 m, so a boundary
+      that moves in by any amount fails at least one of them by name.
+    * ``25e3ba5`` -- ``noisy_range_40m_030m_noise`` must too: the +/-0.30 m
+      range-noise case is the one the arbiter's corroboration window was written
+      against, and a harness that stops reproducing that false positive cannot
+      certify a fix for it.
+    * ``25e3ba5`` -- ``out_of_lane_vehicle_at_12m`` must too: braking at
+      5.0 m/s^2 for a car one lane over is the in-path gate failing, and it is
+      the only case in the library that says so.
+    * ``1ce4886`` -- ``lead_brakes_6mps2_ego20_at_16m/20m/26m`` and
+      ``lead_brakes_6mps2_ego25_at_30m`` must each report ``collided``.  Not
+      "some collision code": ``collided``.  A run that ends 0.4 m short is a
+      different measurement from one that ends in contact, and the whole point
+      of these four is that they end in contact.
+
+    Do not adjust the pins to make this pass.  A pin failing means a scenario
+    was renamed, deleted, or moved off the boundary it was placed on.
+    """
+    outcome = outcomes[sha]
+    assert not outcome.pinned_failures, "\n" + outcome.describe()
+    assert len(outcome.pinned_ok) == len(outcome.commit.required_by_scenario), (
+        "\n" + outcome.describe()
+    )
+
+
+@pytest.mark.parametrize("sha", [c.sha for c in bt.KNOWN_BROKEN], ids=lambda s: s)
+def test_the_far_side_of_each_boundary_is_still_clean(outcomes, sha):
+    """The other edge: the cases OUTSIDE the region must NOT report it.
+
+    A failure region has two edges and the previous revision of this file
+    asserted only one.  "The phantom fires up to 43 m at 20 m/s" is a claim
+    about ``constant_range_52m`` and ``constant_range_70m`` PASSING on
+    ``25e3ba5`` exactly as much as it is a claim about ``constant_range_40m``
+    failing, and a family that fails at every range has measured the width of
+    the grid rather than the width of the defect.
+
+    This is also what makes the family impossible to move quietly.  Push the
+    constant-range cases outwards and the pins above go red; pull them inwards
+    and these go red.
+    """
+    outcome = outcomes[sha]
+    assert not outcome.straddle_failures, "\n" + outcome.describe()
+
+
+def test_the_pins_actually_pin_something(outcomes):
+    """Guard against the pins being emptied instead of satisfied.
+
+    A pin list that is empty passes every assertion above.  This is the
+    ratchet: both commits must carry pins, and between them they must cover both
+    edges of both boundaries.
+    """
+    for commit in bt.KNOWN_BROKEN:
+        assert commit.required_by_scenario, (
+            "%s carries no per-scenario pins. Deleting them turns this file back into "
+            "the family-only check that survived moving a whole family off its "
+            "boundary." % commit.sha
+        )
+        assert commit.forbidden_by_scenario, (
+            "%s carries no straddle scenarios, so only one edge of its boundary is "
+            "asserted and the region has no measured width." % commit.sha
+        )
+        assert commit.min_caught >= 2, (
+            "%s requires only %d family member(s) to catch the defect; one is what the "
+            "old check accepted and it was not enough."
+            % (commit.sha, commit.min_caught)
+        )
 
 
 def test_the_phantom_family_sits_on_the_phantom_boundary(outcomes):

@@ -147,9 +147,20 @@ is inside the sub-emergency band and was invisible to every assertion in the
 first version of this harness.
 
 **Scenarios straddling B1:** `constant_range_12m`, `_20m`, `_30m`, `_40m`
-(inside), `_52m`, `_70m` (outside), plus `reid_during_steady_follow` at 40 m and
-`range_jump_during_steady_follow`, whose −10 m step lands the apparent range at
-42 m, one metre inside the boundary.
+(inside), `_52m`, `_70m` (outside), plus five cases that reach the same boundary
+through a different channel — `track_id_churn_during_steady_follow_40m` (three
+re-identifications at 40 m), `range_jump_during_steady_follow` (a −10 m step
+landing the apparent range at 42 m, one metre inside),
+`noisy_range_40m_030m_noise` and `hostile_sensor_constant_range_40m` (the same
+40 m seen through ±0.30 m of range noise, and through every noise channel at
+once with the production tracker in the loop), and
+`range_bias_near_10pct_constant_range_47m`, whose TRUE 47 m is outside the
+region and whose REPORTED 42.3 m is inside it.
+
+`constant_range_12m/20m/30m/40m` and `noisy_range_40m_030m_noise` are pinned by
+name in `tests/scenarios/backtest.py`: each must report `phantom_intervention`
+on `25e3ba5`, and `constant_range_52m` and `_70m` must report neither phantom
+code. Both edges, by name, so the family cannot be moved quietly.
 
 ### B2 — Lead braking at 6 m/s² from a matched-speed follow (`1ce4886`)
 
@@ -176,29 +187,75 @@ collide for d₀ = 25–40 m.
 
 ### B3 — Stopped obstacle: the avoidability boundary
 
-The boundary is the measured stop distance from section 2. Minimum true gap:
+**RE-MEASURED, and it moved — the previous figures were wrong in the dangerous
+direction.** B3 used to be stated as the plant's raw stopping distance: drive
+`Plant` at `brake = 1.0` from the frame the obstacle exists and see how far it
+goes. That is 6.67 / 14.70 / 25.85 / 40.13 m at 10 / 15 / 20 / 25 m/s and it is
+still true, but it is **not a boundary any system can reach**, because it
+charges neither of the two costs every real system pays:
 
-| Ego, d₀ | best physically available | `25e3ba5` | `1ce4886` |
+* the brake must be **built at the emergency jerk limit**, not stepped to full
+  in one frame. A step is 160 m/s³ and this specification's own `excess_jerk`
+  requirement (R4) forbids it, so judging avoidability against a step places
+  scenarios on a boundary no compliant system is *permitted* to reach. At
+  20 m/s the ramp costs 3.45 m.
+* the decision cannot be taken before the **second distinct capture** of the
+  obstacle. At the measured 55 ms sense latency on a 50 ms grid, decision frames
+  0 and 1 both read capture 0; frame 2 is the first with a range *rate*. That is
+  0.10 s, and 2.00 m at 20 m/s. Acting sooner means acting on the stationary
+  prior — which is precisely the constant-range phantom of B1. A scenario
+  passable only by braking on that prior is not testing competence, it is
+  rewarding the defect.
+
+Charging both, measured with `scenario.feasibility()`:
+
+| Ego | zero-latency, jerk-limited | **avoidability boundary** (`library.AVOIDABILITY_M`) | first range where 2.00 m of clearance is reachable |
 |---|---|---|---|
-| 15 m/s, 14 m | −0.70 (unavoidable) | −0.70 | −1.43 |
-| 15 m/s, **15 m** | +0.30 | +0.30 | **−0.43** |
-| 20 m/s, 25 m | −0.85 (unavoidable) | −0.85 | −2.21 |
-| 20 m/s, **26 m** | +0.15 | +0.15 | **−1.21** |
-| 20 m/s, 27 m | +1.15 | +1.15 | **−0.21** |
-| 20 m/s, **29 m** | +3.15 | +3.15 | +1.79 (below the 2.0 m required) |
-| 25 m/s, 40 m | −0.13 (unavoidable) | −0.13 | −1.83 |
-| 25 m/s, **42 m** | +1.87 | +1.87 | +0.17 |
+| 10 m/s | 8.37 m | 9.37 m | — |
+| 15 m/s | 17.27 m | **18.77 m** | 21.0 m |
+| 20 m/s | 29.30 m | **31.30 m** | 33.5 m |
+| 25 m/s | 44.45 m | **46.95 m** | 49.0 m |
 
-`1ce4886` therefore makes **avoidable** contact at 15 m/s from 15 m, at 20 m/s
-from 26–27 m and at 25 m/s from 41 m, and misses the required clearance out to
-about 31 m at 20 m/s. Both commits apply full authority to a car 40 m and 75 m
-away, where 5.26 and 2.74 m/s² respectively are all that is required.
+Five committed scenarios were **inside** that boundary, i.e. demanding a
+clearance no correct system could hold:
 
-**Scenarios straddling B3:** `stationary_15mps_at_15m`, `stationary_20mps_at_26m`,
-`stationary_25mps_at_42m` (one metre inside the avoidable side of the boundary),
-`stationary_20mps_at_29m` (just outside, decided on the 2.0 m clearance),
-`stationary_20mps_at_40m` (clear control), `stationary_20mps_at_75m` (the
-over-braking control, where the requirement is below comfort).
+| scenario | demanded | reachable |
+|---|---|---|
+| `stationary_15mps_at_15m` | 0.25 m | −0.21 m |
+| `stationary_20mps_at_26m` | 0.10 m | −0.30 m |
+| `stationary_20mps_at_29m` | 2.00 m | −0.23 m |
+| `stationary_25mps_at_42m` | 1.00 m | −0.17 m |
+| `lane_error_with_closing_lead` | 2.00 m | −0.01 m |
+
+This is the converse trap to relaxing an expectation, and it is just as
+destructive: **the only way to pass an unsatisfiable case is the misbehaviour
+the harness punishes elsewhere.** All five have been re-placed, and
+`test_harness_every_scenario_is_physically_satisfiable` plus
+`test_harness_every_scenario_has_decision_slack` now fail the suite if any
+scenario drifts back inside the boundary or leaves less than one frame of
+decision latency.
+
+**Scenarios straddling B3, after re-placement.** Minimum true gap, full stack,
+closed loop, with the reachable clearance for comparison:
+
+| scenario | reachable | slack | `25e3ba5` | `1ce4886` |
+|---|---|---|---|---|
+| `stationary_15mps_at_24m` | 5.23 m | 4 frames | +5.99 (at 22 m) | +5.34 (at 22 m) |
+| `stationary_20mps_at_36m` | 4.70 m | 2 frames | +7.55 | +6.54 |
+| `stationary_20mps_at_40m` | 8.70 m | 6 frames | +8.04 | +8.32 |
+| `stationary_25mps_at_52m` | 5.05 m | 2 frames | +8.03 | +7.59 |
+| `stationary_20mps_at_50m` | 18.70 m | 16 frames | +8.15 | +7.94 |
+| `stationary_20mps_at_75m` | 43.70 m | 41 frames | clear | clear |
+
+On this plant **neither commit contacts a stopped obstacle anywhere the case is
+satisfiable**, so the family no longer discriminates on contact. It
+discriminates on **over-braking** instead, and that is now stated rather than
+implied: both commits go to 8.00 m/s² at every range, including 50 m where
+4.17 m/s² is required and the justified ceiling is 6.75, and 75 m where
+2.74 m/s² is required and the ceiling is 4.60. `stationary_20mps_at_50m` was
+added for exactly that: without a case whose ceiling is below full authority,
+the whole family is satisfied by braking flat out at every range, which is the
+behaviour that moves the collision to the vehicle behind.
 
 ### Both directions, in every family
 
@@ -214,10 +271,127 @@ the same family that carries that direction**:
 |---|---|---|
 | constant range | `final_speed` / `failed_to_recover`: never letting go | `phantom_intervention`, `over_braked` at the 3.0 m/s² comfort ceiling, `speed_loss` |
 | lead braking at 6 m/s² | `collided`, `clearance` | `disproportionate_brake` beyond ten frames — full authority before the lead has shed the speed that warrants it |
-| stopped obstacle, boundary cases | `collided`, `clearance` | not detectable; carried by `stationary_20mps_at_75m` |
-| stopped obstacle, clear cases | `clearance` | `disproportionate_brake`, `over_braked` above 4.6 m/s² |
+| stopped obstacle, boundary cases | `collided`, `clearance` | not detectable; carried by `stationary_20mps_at_50m` and `_at_75m` |
+| stopped obstacle, clear cases | `clearance` | `disproportionate_brake`, `over_braked` above 6.8 m/s² (50 m) and 4.6 m/s² (75 m) |
+| sensor noise | `clearance` on `noisy_stationary_36m_030m_noise` | `phantom_intervention` on the two `noisy_range_*` cases and on `hostile_sensor_constant_range_40m` |
+| range bias | `collided`, `clearance` on `range_bias_far_10pct_stationary_36m` | `phantom_intervention` on `range_bias_near_10pct_constant_range_47m` |
+| frame period | `clearance` on `frame_overrun_during_stationary_approach` | `phantom_intervention` on `variable_dt_constant_range_40m` |
+| laterality | `clearance` on `lane_error_with_closing_lead` and `in_lane_and_out_of_lane_hazards` | `phantom_intervention`, `over_braked`, `speed_loss` on the three `out_of_lane_*` cases |
+| re-identification | `collided`, `clearance` on `reid_during_closing_approach` | `disproportionate_brake` on the same case, from the seeded −ego_speed prior |
 | cut-in | `clearance` | `over_braked`, `disproportionate_brake` after five frames |
 | dropouts and bends | `failed_to_recover`, `lane_departure` | `disengaged`, `over_authority_state` |
+
+---
+
+## 3b. Fidelity coverage census
+
+`tests/scenarios/plant.py` models sensor noise, systematic range bias, a
+variable frame period, multi-object worlds, re-identification, detection misses,
+lane errors and the production tracker. The previous revision of the library
+**used none of the first four**. A programmatic count over all 37 scenarios
+found `range_noise_m > 0` in 0, `range_bias_frac != 0` in 0, `dt != 0.05` in 0
+and more than one object in 0, and nothing in the repository said so, because
+nothing counted.
+
+A capability with no coverage is worse than an absent one: it reads as fidelity
+in the plant's own docstrings and delivers none. The concrete consequence was
+that the arbiter's corroboration window — which exists because of a false
+positive measured at **±0.30 m of range noise** — could not be certified by the
+harness that is supposed to certify it.
+
+The census is now computed by `library.coverage_census()` and enforced by
+`tests/test_scenarios.py::test_harness_fidelity_features_are_exercised`, which
+fails when any row is empty. Counted over `report.all_scenarios()` (52 cases):
+
+| feature | scenarios | which |
+|---|---|---|
+| `range_noise_m > 0` | 4 | `noisy_range_20m_030m_noise`, `noisy_range_40m_030m_noise`, `noisy_stationary_36m_030m_noise`, `hostile_sensor_constant_range_40m` |
+| `range_bias_frac != 0` | 2 | `range_bias_far_10pct_stationary_36m`, `range_bias_near_10pct_constant_range_47m` |
+| `lateral_noise_m > 0` | 1 | `hostile_sensor_constant_range_40m` |
+| `box_noise_px > 0` | 1 | `hostile_sensor_constant_range_40m` |
+| `ego_speed_noise_mps > 0` | 1 | `hostile_sensor_constant_range_40m` |
+| `dt != 0.05 s` | 2 | `frame_overrun_during_stationary_approach`, `variable_dt_constant_range_40m` |
+| frame overrun schedule | 2 | the same two |
+| multiple objects | 2 | `out_of_lane_vehicle_overtaken`, `in_lane_and_out_of_lane_hazards` |
+| out-of-lane object | 4 | the two above plus `out_of_lane_vehicle_at_12m`, `out_of_lane_vehicle_dragged_in_by_lane_error` |
+| `use_real_tracker` | 2 | `real_tracker_constant_range_40m`, `hostile_sensor_constant_range_40m` |
+| `reid_frames` | 2 | `track_id_churn_during_steady_follow_40m`, `reid_during_closing_approach` |
+| `range_jump_at` | 1 | `range_jump_during_steady_follow` |
+| `miss_frames` | 1 | `dropout_mid_approach` |
+| `failed_frames` | 2 | `empty_road_dropout`, `bend_mrm_and_recover` |
+| `source_lost_from_frame` | 1 | `source_loss_mid_run` |
+| `lane_offset_error_m != 0` | 1 | `out_of_lane_vehicle_dragged_in_by_lane_error` |
+| `lane_center_bias_px != 0` | 1 | `lane_error_with_closing_lead` |
+| `lane_is_mock` | 1 | `lane_error_with_closing_lead` |
+| uncalibrated camera | 1 | `uncalibrated_camera_stationary_40m` |
+| curved road | 2 | `bend_nominal`, `bend_mrm_and_recover` |
+| `terminate_during_run` | 1 | `terminate_during_emergency` |
+| non-default stack | 4 | the four independence cases |
+
+### The new cases are ON boundaries, and each is provably passable
+
+A census is satisfied by any scenario that sets the field. These are placed
+where the feature changes the answer, and each carries the arithmetic that shows
+a correct system can pass it:
+
+* **`noisy_range_20m/40m_030m_noise`** — matched-speed follow at 20 m and 40 m,
+  both inside the `25e3ba5` phantom region, with the historic ±0.30 m. A
+  least-squares slope over the 5-sample, 0.25 s rate window has standard error
+  `σ / sqrt(dt² n(n²−1)/12) = 0.30 / sqrt(0.025) = 1.90 m/s`, so three standard
+  errors of *pure noise* is a spurious 5.69 m/s of closure. Holding 2.0 m
+  against that needs **0.90 m/s² at 20 m and 0.43 m/s² at 40 m** — under the
+  3.0 m/s² comfort limit. A system that believed every noisy sample completely
+  would still not be entitled to emergency authority, so the case is passable
+  and is not a demand for clairvoyance.
+* **`hostile_sensor_constant_range_40m`** — the same 40 m with every channel
+  noisy at once and the production tracker in the loop. Box jitter enters the
+  range through the pinhole: 0.3 px on a 1.5 m car at 40 m (33.75 px) is 0.36 m,
+  which adds in quadrature to 0.30 m for σ = 0.47 m, SE = 2.96 m/s, and a 3σ
+  spurious closure of 8.9 m/s still needs only **1.04 m/s²**.
+* **`noisy_stationary_36m_030m_noise`** — the mirror. Noise must not suppress a
+  brake either, and a system can be made noise-proof by ignoring the sensor.
+  4.70 m is reachable, 2.00 m demanded, and the requirement is an emergency
+  under *every* draw: ±3σ moves the reported range by 0.9 m and the apparent
+  requirement stays between 6.29 and 6.70 m/s².
+* **`range_bias_near_10pct_constant_range_47m`** — a TRUE 47 m, outside the
+  phantom region, **reported at 42.3 m, inside it**. A multiplicative bias on a
+  constant range is still a constant, so the reported closing rate is exactly
+  zero: the only way to fire is to brake on range alone with no closure.
+* **`range_bias_far_10pct_stationary_36m`** — a TRUE 36 m reported at 39.6 m.
+  The requirement from the *reported* scene is 400 / (2 × 37.6) = 5.32 m/s², an
+  emergency on the first frame, so a system that trusts its range completely is
+  still obliged to brake and is not being asked to guess that it is being lied
+  to. What it *is* being asked is to carry margin for range error: the reported
+  avoidability boundary of 31.30 m is a true 28.5 m, which is already past the
+  point of no return.
+* **`frame_overrun_during_stationary_approach`** — 40 m with the production
+  log's own 187.7 ms frame, this board's 174.3 ms maximum, and a 100 ms dropped
+  frame. Together they steal 0.362 s, 7.24 m at 20 m/s; 8.70 m is reachable and
+  2.00 m demanded, so even a system that decided nothing during all three
+  overruns arrives with room.
+* **`variable_dt_constant_range_40m`** — the whole run at 50→125 ms, on the
+  phantom boundary. The true range difference is exactly zero on every interval,
+  so an estimator that divides by the nominal period instead of the elapsed one
+  inflates zero to zero: a system that fires here cannot blame the timing, it
+  has fabricated the rate from something other than the range.
+* **`out_of_lane_vehicle_at_12m`** and
+  **`out_of_lane_vehicle_dragged_in_by_lane_error`** — a car one lane over,
+  12 m ahead, matching speed. Far inside the 52 m policy spacing, so a laterally
+  blind system opens the gap by 40 m and loses several m/s, while a correct one
+  holds 20 m/s and does nothing. The second adds a 0.86 m lane error — exactly
+  the threshold at which a 1.8 m car at 3.5 m is dragged inside the *reported*
+  ego lane — so `in_ego_lane` and the lane polynomials are consistently,
+  confidently wrong while the box, which is projected relative to the ego and
+  not to the lane, is unchanged. R11 made executable.
+* **`out_of_lane_vehicle_overtaken`** and **`in_lane_and_out_of_lane_hazards`** —
+  the multi-object pair. The first has an empty ego lane and a slower car beside
+  it that the ego closes on at 8 m/s and passes; the second puts the real
+  hazard in the lane at 26 m braking at 6 m/s² with a *nearer* distractor beside
+  it at 18 m, so selecting a lead by range alone selects the wrong object.
+* **`uncalibrated_camera_stationary_40m`** — README records this board as "Real,
+  UNCALIBRATED by default" and no scenario ran that path. Losing the metric lane
+  must not lose the obstacle.
+* **`reid_during_closing_approach`** — see section 6.
 
 ---
 
@@ -442,17 +616,55 @@ range they moved from.
 |---|---|---|
 | Advisory monitor: the pipeline actuated commands the monitor had rejected | build | The harness actuates the **arbiter's** command in every scenario; nothing else can be actuated. |
 | Phantom full-authority AEB for a lead at constant range (42/400 MRM frames, 6 frames at brake = 1.00; closed loop 20 m/s → 0 behind a car that never moved) | round 1 | `constant_range_12m`, `_20m`, `_30m`, `_40m` inside the measured 43 m boundary; `_52m`, `_70m` outside it *(moved: the single previous case sat at 52 m, outside the region, and passed on the phantom commit)* |
-| Phantom AEB on the first frame of a new track (range-rate seeded at the ego speed) | round 1 | `reid_during_steady_follow` at 40 m *(moved from 52 m)*, and the frame-0 phantom check in every matched-speed scenario |
+| Phantom AEB on the first frame of a new track (range-rate seeded at the ego speed) | round 1 | `reid_during_closing_approach` — a re-id in the middle of a REAL 8 m/s closure, where a seeded rate, no rate and the true rate are three different numbers with three different consequences; plus `track_id_churn_during_steady_follow_40m` *(renamed from `reid_during_steady_follow`, which was vacuous: see below)* and the frame-0 phantom check in every matched-speed scenario |
 | Phantom AEB after a range re-seed | round 1 | `range_jump_during_steady_follow` — the −10 m step puts the apparent range at 42 m, one metre inside the boundary |
 | DISENGAGE on an empty road with a valid ego state | round 1 | `empty_road_nominal`, `empty_road_dropout`, `source_loss_mid_run` |
-| A mock lane centre hides a real lead | round 1 | `lane_error_with_closing_lead` at 30 m *(moved from 65 m, where 39 m of margin let a system ignore the obstacle for two seconds and still pass)* |
+| A mock lane centre hides a real lead | round 1 | `lane_error_with_closing_lead` at 36 m *(moved OUT from 30 m, where the 2.00 m demanded was unreachable — see B3 — and IN from the original 65 m, where 39 m of margin let a system ignore the obstacle for two seconds and still pass)* |
+| A lane error CREATES a hazard: braking for a car in the next lane | round 1, untested until now | `out_of_lane_vehicle_at_12m`, `out_of_lane_vehicle_dragged_in_by_lane_error` (0.86 m of lane error, exactly the threshold that drags a 1.8 m car at 3.5 m inside the reported lane), `out_of_lane_vehicle_overtaken` (8 m/s of closure onto a car that is not in the way) |
+| Selecting a lead by range instead of by in-path range | round 1, untested until now | `in_lane_and_out_of_lane_hazards`: the real hazard at 26 m braking at 6 m/s², a nearer distractor beside it at 18 m |
 | Missed braking against a lead braking at 6 m/s² | round 2 | `lead_brakes_6mps2_ego20_at_16m`, `_at_20m`, `_at_26m` inside the measured contact region; `_at_32m` outside it; `ego15_at_15m` decided on clearance; `ego25_at_30m`, which **both** commits fail *(moved: the previous four cases braked the lead at t = 1.0 s, which lifted the whole family out of the failing region and made all four pass on the commit that collides)* |
-| Missed braking against a stopped obstacle | rounds 1–2 | `stationary_15mps_at_15m`, `stationary_20mps_at_26m`, `stationary_25mps_at_42m` one metre inside the avoidable side of the boundary; `stationary_20mps_at_29m` just outside it *(moved: 25/45/60/75 m, 16–32 m clear of the boundary)* |
-| Braking beyond comfort with nothing to correct, below the emergency threshold | round 2, undetected until now | Every case with `max_commanded_decel_mps2 = 3.0`: the whole constant-range family, `lead_brakes_gently_2mps2`, `lead_accelerates_away`, `cutin_moderate_at_25m`, `reid_during_steady_follow`, `range_jump_during_steady_follow`; plus `BAND_UNWARRANTED` in the sweep |
-| Over-braking: full authority where the kinematics ask for a third of it | rounds 1–2 | `stationary_20mps_at_75m` (requirement 2.74 m/s², ceiling 4.6 m/s²), `stationary_20mps_at_40m`, `dropout_mid_approach`, `lead_brakes_gently_2mps2` |
-| Self-sustaining loop: `steering_rate -> plan_accel -> lane_departure` | rounds 1–3 | Every scenario with `recover_within_frames`: the four inside-region `constant_range_*` cases, `lead_brakes_then_leaves_lane`, `cutin_close_at_12m`, `cutin_moderate_at_25m`, `empty_road_dropout`, `bend_mrm_and_recover`, `reid_during_steady_follow`, `range_jump_during_steady_follow` |
+| Missed braking against a stopped obstacle | rounds 1–2 | `stationary_15mps_at_24m`, `stationary_20mps_at_36m`, `stationary_25mps_at_52m` just outside the re-measured avoidability boundary, each with 2–4 frames of decision slack; `stationary_20mps_at_40m` the pair for the 36 m case *(moved TWICE: from 25/45/60/75 m, which was 16–32 m clear of any boundary, and then OUT again from 15/26/29/42 m, which was INSIDE the real boundary and therefore unsatisfiable — see B3)* |
+| Missed braking under sensor noise, range bias, a frame overrun, or with no camera calibration | untested until now | `noisy_stationary_36m_030m_noise`, `range_bias_far_10pct_stationary_36m`, `frame_overrun_during_stationary_approach`, `uncalibrated_camera_stationary_40m` |
+| Braking beyond comfort with nothing to correct, below the emergency threshold | round 2, undetected until now | Every case with `max_commanded_decel_mps2 = 3.0`: the whole constant-range family, `lead_brakes_gently_2mps2`, `lead_accelerates_away`, `cutin_moderate_at_25m`, `track_id_churn_during_steady_follow_40m`, `range_jump_during_steady_follow`, the two `noisy_range_*` cases, `variable_dt_constant_range_40m`, `real_tracker_constant_range_40m`, `hostile_sensor_constant_range_40m`, `range_bias_near_10pct_constant_range_47m`; plus `BAND_UNWARRANTED` in the sweep |
+| Over-braking: full authority where the kinematics ask for a third of it | rounds 1–2 | `stationary_20mps_at_75m` (requirement 2.74 m/s², ceiling 4.6 m/s²), `stationary_20mps_at_50m` (4.17, ceiling 6.8), `stationary_20mps_at_40m`, `dropout_mid_approach`, `lead_brakes_gently_2mps2` |
+| Self-sustaining loop: `steering_rate -> plan_accel -> lane_departure` | rounds 1–3 | Every scenario with `recover_within_frames`: the four inside-region `constant_range_*` cases, `lead_brakes_then_leaves_lane`, `cutin_close_at_12m`, `cutin_moderate_at_25m`, `empty_road_dropout`, `bend_mrm_and_recover`, `track_id_churn_during_steady_follow_40m`, `range_jump_during_steady_follow`, and the noise, bias and variable-dt cases |
 | Held or zeroed steering during a minimum-risk manoeuvre | round 3 | `bend_nominal`, `bend_mrm_and_recover` |
 | ADAS-DEC-21: a latched command after the loop ends | build | `terminate_during_emergency` (lead braking from frame 0 at 20 m, the middle of the contact region), `source_loss_mid_run` |
+
+### `reid_during_steady_follow` was vacuous, and what replaced it
+
+The case named "the estimator seeds a new track's rate from the ego speed" ran
+on a **steady follow**, where the true closing rate is zero. A fresh track with
+no history also reports zero. Every answer an estimator can give on a re-id
+frame is therefore the same number the truth gives, and the case could not fail
+for the reason it named. Measured on `25e3ba5` it reported exactly the same five
+diagnoses as `constant_range_40m` — `phantom_intervention`,
+`forbidden_emergency_brake`, `forbidden_emergency_state`, `over_authority_state`,
+`over_braked` — i.e. it added no discrimination to the library at all.
+
+Two changes:
+
+1. **Renamed** to `track_id_churn_during_steady_follow_40m`, which is what it
+   tests: identity churn on the phantom boundary. Every per-track estimate
+   downstream is destroyed three times and each new track re-applies whatever
+   prior the system seeds a fresh track with. The gap is recorded in the
+   scenario's own `physics` string, not only here.
+2. **Replaced** for the original purpose by `reid_during_closing_approach`: the
+   ego at 20 m/s, the lead at 12 m/s, a real 8 m/s closure from 60 m, with
+   re-identifications at frames 60, 90 and 118 (the warrant frame itself). The
+   three candidate answers are now three different numbers with three different
+   consequences — seed from ego speed → −20 m/s, demanding 5.88 m/s² at a true
+   36 m, 58 frames before an emergency is warranted; no history → 0 m/s, brake
+   deferred past safety; re-fit from range → −8 m/s, correct. **Both failure
+   directions are reachable in one scenario.**
+
+**Remaining gap, stated rather than closed.** The plant's own sensor reports
+`velocity_mps = 0.0` for a track with no history; it cannot be configured to
+report a rate seeded from the ego speed, so the harness can produce "no rate"
+but not "a confidently wrong rate". The arbiter's *own* range filter does seed
+from `−ego_speed`, so the defect is still exercised through that path — but the
+plant cannot yet inject it directly. `tests/scenarios/plant.py` belongs to
+another workstream and the request is recorded in this workstream's handoff.
 
 Ordinary cases, which exist so that the guards above cannot be satisfied by
 simply never intervening: `stationary_20mps_at_40m`, `constant_range_52m`,
@@ -535,7 +747,23 @@ Do **not**:
   deleted, whether or not it still appears in the report;
 * delete a scenario that guards a historical failure. Add to the table in
   section 6 instead — that table is the record of what this codebase has already
-  got wrong once.
+  got wrong once;
+* place a scenario **inside** the avoidability boundary of section 3a/B3. An
+  unsatisfiable expectation is as destructive as a relaxed one, because the only
+  way to pass it is the misbehaviour this specification punishes elsewhere.
+  `test_harness_every_scenario_is_physically_satisfiable` and
+  `test_harness_every_scenario_has_decision_slack` enforce this; do not skip
+  them;
+* let a row of the section 3b census go to zero.
+  `test_harness_fidelity_features_are_exercised` enforces that too. If a plant
+  capability genuinely has no use, delete the capability rather than the
+  coverage.
+
+Four scenarios are **pinned by name** in `tests/scenarios/backtest.py` for
+`25e3ba5` and four for `1ce4886`, each with the specific diagnosis it must
+produce, plus the cases just outside each region that must NOT produce it.
+Renaming, deleting or moving any of them turns `tests/test_backtest.py` red by
+name. That is deliberate; it is what a family-prefix check could not do.
 
 ### Re-measuring a boundary
 
@@ -558,3 +786,22 @@ git worktree remove /tmp/bt                 # clean up
 Then update the tables in section 3a, the `physics` strings that quote them, and
 the `PROFILES` range axes in `tests/scenarios/sweep.py` so the grid still holds a
 sample either side of the new boundary.
+
+For the stationary avoidability boundary (B3) do **not** measure it by driving
+the plant at `brake = 1.0`; that number is not reachable by any compliant
+system. Use the harness's own feasibility model, which charges the emergency
+jerk limit and the two-frame measurement floor:
+
+```bash
+PYTHONPATH=src:. python3 - <<'EOF'
+from tests.scenarios import plant as pl
+from tests.scenarios.scenario import Scenario, Expectation, feasibility
+s = Scenario(name="probe", summary="", physics="", frames=340, ego_speed_mps=20.0,
+             lead=pl.LeadSpec(36.0, 0.0, pl.lead_stationary()),
+             expect=Expectation(no_collision=True, min_clearance_m=2.0))
+print(feasibility(s).summary)
+EOF
+```
+
+Then update `library.AVOIDABILITY_M`, which is what the stationary family is
+placed against.

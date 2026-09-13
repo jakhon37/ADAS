@@ -51,6 +51,45 @@ the classic way to build a harness that demands clairvoyance:
   it answers ("could this have been avoided?") is a physical one about what
   actually happened, not about what was knowable.  It is only ever used to
   bound how LATE an intervention was, never to require an earlier one.
+
+Avoidability is judged against the vehicle the system actually drives
+--------------------------------------------------------------------
+This was the module's worst defect and it made four scenarios unpassable.
+:func:`full_braking_min_gap` drove the plant directly with ``brake = 1.0`` from
+the frame in question, so "avoidable" meant avoidable by a vehicle with no sense
+latency, no rate-observability delay and an infinitely fast brake demand.  The
+system under test has all three.  Scenarios were then placed about a metre
+inside that fictional boundary, and passing them required reacting before the
+information existed -- which the only available shortcut, braking on the
+assumption that every unmeasured object is stationary, does supply, and which
+this same harness punishes as phantom braking everywhere else.  An expectation
+whose only solution is a defect is worse than no expectation.
+
+Three costs are now charged, all of them measured from the harness's own models
+rather than assumed:
+
+1. **Sense latency.**  ``SENSE_LATENCY_S`` is 55 ms, one frame on the 50 ms
+   grid, so the world the system reasons about is a frame old.
+2. **Rate observability.**  A camera measures range; a closing rate is a
+   difference of ranges over time.  Decision frames 0 and 1 both read capture 0,
+   so the second distinct range -- and therefore any rate at all -- arrives at
+   decision frame 2.  100 ms, 2.0 m at 20 m/s.  See
+   :func:`earliest_actionable_frame`.
+3. **Jerk.**  The counterfactual builds its brake demand at
+   :data:`EMERGENCY_JERK_MPS3` instead of stepping it, because a step is
+   160 m/s^3 and ``excess_jerk`` forbids it.
+
+The measured consequence, and the number the redesign should carry: full
+authority stops a stationary-obstacle approach in 9.37 / 18.77 / 31.30 / 46.95 m
+at 10 / 15 / 20 / 25 m/s once all three are paid, against 6.67 / 14.70 / 25.85 /
+40.13 m for the zero-latency step-braking vehicle the previous version assumed.
+
+Contact ends the run
+--------------------
+:class:`tests.scenarios.plant.Plant` stops at contact and records the impact
+speed, and :func:`judge` reads it.  Before that, a collided scenario ran to the
+end of its frame budget and the report printed a "minimum true gap" of -38.07 m,
+which is the distance by which the ego had driven through the lead.
 """
 
 from __future__ import annotations
@@ -60,16 +99,26 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
 
 from tests.scenarios.plant import (
+    CONTACT_GAP_M,
     DEFAULT_PLANT,
+    PERFECT_PERCEPTION,
+    ContactEvent,
     LeadSpec,
+    PerceptionSpec,
     Plant,
     PlantConfig,
     RoadSpec,
     WorldState,
+    capture_frames,
 )
 
-CONTACT_GAP_M = 0.0
-"""Bumper-to-bumper gap at which contact occurs, metres."""
+CONTACT_GAP_M = CONTACT_GAP_M
+"""Bumper-to-bumper gap at which contact occurs, metres.
+
+Re-exported from :mod:`tests.scenarios.plant`, which owns it: the plant has to
+know it in order to STOP at contact, and two definitions of "collided" that
+could drift apart is how a run continued to frame 300 with a gap of -38 m.
+"""
 
 REQUIRED_CLEARANCE_M = 2.0
 """Clearance a correct intervention should preserve, metres."""
@@ -315,33 +364,212 @@ def required_decel_mps2(
 # --------------------------------------------------------------------------- #
 
 
+MIN_DECISION_LATENCY_NOTE = """\
+No system can react to information it does not have.  Between the world and a
+brake command sit, in order: the shutter, the pipeline, the decision, the bus,
+and the hydraulics.  This module charges every one of them.
+"""
+
+
 def full_braking_min_gap(
     state: WorldState,
     lead: Optional[LeadSpec],
     road: Optional[RoadSpec] = None,
     config: PlantConfig = DEFAULT_PLANT,
     horizon_s: float = AVOIDANCE_HORIZON_S,
+    delay_s: float = 0.0,
+    others: Sequence[LeadSpec] = (),
+    jerk_limited: bool = True,
 ) -> float:
-    """Minimum gap if the ego applies full brake from ``state`` onward.
+    """Minimum gap if the ego commits full brake ``delay_s`` after ``state``.
 
-    Runs the SAME plant the system was driven by, including the brake actuator
-    lag, and lets the lead continue its true script.  This is the physical
-    answer to "could it still have stopped in time?", so it must not use an
-    idealised instant-deceleration model.
+    Runs the SAME plant the system was driven by -- the brake actuator lag, the
+    actuation dead time, the true lead script -- and now stops at contact, so a
+    run that hits cannot report a "minimum gap" measured from inside the other
+    vehicle.
+
+    ``delay_s`` is the decision latency being charged.  During it the ego holds
+    the pedals it was already applying at ``state``; it is not a phase in which
+    the ego coasts to a convenient speed, it is the interval in which the system
+    has not yet decided.  With ``delay_s = 0`` the question is "if the command
+    goes out on THIS frame, is contact still avoidable?", which is what bounds
+    how late an intervention was.  With ``delay_s`` set to the pipeline's own
+    latency the question becomes "could any real system have avoided this?",
+    which is what decides whether a scenario is satisfiable at all.  Judging
+    avoidability with ``delay_s = 0`` against a system that has 55 ms of sense
+    latency is how four scenarios came to be placed about 1 m inside a boundary
+    that no correct system could reach.
+
+    Args:
+        state: The true state to resume from.
+        lead: The lead script.
+        road: The road.
+        config: The plant configuration the run used.
+        horizon_s: How far ahead to simulate.
+        delay_s: Decision latency charged before full authority is committed.
+        others: Additional objects to resume, for a multi-object world.
+        jerk_limited: Build the brake demand at :data:`EMERGENCY_JERK_MPS3`
+            rather than stepping it to full in one frame.  True by default,
+            because a step is 160 m/s^3 and this specification's own
+            ``excess_jerk`` finding forbids it: an oracle that judged
+            avoidability against a manoeuvre the harness punishes would place
+            scenarios on a boundary no compliant system can reach.  Set False
+            only to reproduce the old, physically optimistic figures.
+
+    Returns:
+        The smallest true gap to the lead over the horizon, or ``inf`` when
+        there is no lead.
     """
     if lead is None or not state.lead_present:
         return float("inf")
-    sim = Plant.from_state(state, lead=lead, road=road, config=config)
+    sim = Plant.from_state(state, lead=lead, road=road, config=config, others=others)
     worst = state.gap_m
+    hold = (state.throttle, state.brake, state.steering)
+    until = state.t_s + max(0.0, float(delay_s))
     steps = int(round(horizon_s / config.dt_s))
+    pedal = float(hold[1])
     for _ in range(steps):
-        s = sim.step(0.0, 1.0, 0.0)
+        dt = config.dt_for_frame(sim.state.frame)
+        deciding = sim.state.t_s + 1e-9 < until
+        if deciding:
+            s = sim.step(hold[0], hold[1], hold[2])
+        else:
+            if jerk_limited:
+                # THE DEMAND IS RATE LIMITED, because this specification forbids
+                # the alternative.  A one-frame step from nothing to full
+                # authority is 160 m/s^3 and fails ``excess_jerk`` at eight times
+                # the ceiling; an oracle that measured avoidability against a
+                # step would be requiring a manoeuvre the same harness punishes,
+                # and a scenario placed on THAT boundary can only be passed by
+                # failing a different assertion.  The ramp is
+                # :data:`EMERGENCY_JERK_MPS3`, the fastest build this
+                # specification permits anywhere, so nothing achievable is being
+                # given away: reaching 8.0 m/s^2 takes 0.4 s, the time a
+                # competent human panic brake takes.
+                pedal = min(
+                    1.0,
+                    pedal + EMERGENCY_JERK_MPS3 * dt / config.max_brake_decel_mps2,
+                )
+            else:
+                pedal = 1.0
+            s = sim.step(0.0, pedal, 0.0)
+        if s.lead_present:
+            worst = min(worst, s.gap_m)
+        if sim.contacted:
+            break
         if not s.lead_present:
             break
-        worst = min(worst, s.gap_m)
         if s.ego_v_mps <= 1e-6 and s.lead_v_mps >= s.ego_v_mps:
             break
     return worst
+
+
+def braking_budget_s(
+    state: WorldState,
+    lead: Optional[LeadSpec],
+    road: Optional[RoadSpec] = None,
+    config: PlantConfig = DEFAULT_PLANT,
+    clearance_m: float = CONTACT_GAP_M,
+    horizon_s: float = AVOIDANCE_HORIZON_S,
+    others: Sequence[LeadSpec] = (),
+    jerk_limited: bool = True,
+) -> float:
+    """Longest decision latency that still preserves ``clearance_m``, seconds.
+
+    The scenario's whole margin, expressed as time instead of as metres.  It is
+    ``-inf`` when even a zero-latency decision cannot hold the clearance (the
+    requirement is physically impossible) and ``inf`` when nothing is required.
+
+    Bisected on :func:`full_braking_min_gap`, which is monotone in the delay --
+    waiting longer before braking can never leave more room -- so 40 iterations
+    resolve it to well under a microsecond and no timestep can hide the answer.
+    """
+    if lead is None or not state.lead_present:
+        return float("inf")
+    if full_braking_min_gap(
+        state, lead, road, config, horizon_s, 0.0, others, jerk_limited
+    ) < clearance_m:
+        return float("-inf")
+    lo, hi = 0.0, float(horizon_s)
+    if full_braking_min_gap(
+        state, lead, road, config, horizon_s, hi, others, jerk_limited
+    ) >= clearance_m:
+        return float("inf")
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        if full_braking_min_gap(
+            state, lead, road, config, horizon_s, mid, others, jerk_limited
+        ) >= clearance_m:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def earliest_actionable_frame(
+    history: Sequence[WorldState],
+    perception: PerceptionSpec = PERFECT_PERCEPTION,
+    config: PlantConfig = DEFAULT_PLANT,
+) -> Optional[int]:
+    """First decision frame on which the hazard could HONESTLY be acted on.
+
+    "Honestly" is the whole content of this function, and it is the difference
+    between a satisfiable scenario and one whose only solution is the
+    misbehaviour this harness punishes elsewhere.  A frame is actionable when
+    all of the following are true of the measurements the system is actually
+    handed, as :class:`tests.scenarios.plant.Sensor` produces them:
+
+    1. The frame is not a detection miss and perception is not failed on it.
+    2. The captured state -- the one the measurements describe, which is
+       ``sense_latency_s`` old -- contains the lead, inside the detection range
+       and inside the lateral field of view.
+    3. The system has seen the lead in at least ``rate_min_samples`` DISTINCT
+       captures, so that a closing rate exists.  A camera measures range; every
+       closing rate is a difference of ranges over time, and a track with one
+       sample has none.  A system that acts before this point is acting on a
+       PRIOR, not on a measurement -- and the prior available to it (assume the
+       object is stationary in the world) is precisely what produced the
+       constant-range phantom braking this harness exists to catch.  A scenario
+       that can only be passed by braking on that prior is not testing
+       competence, it is rewarding the defect.
+
+    On the nominal 50 ms grid with the measured 55 ms latency, (3) resolves to
+    decision frame 2 for a hazard present from frame 0: frames 0 and 1 both read
+    capture 0, and only frame 2 brings a second distinct range.  100 ms is
+    therefore the floor on any correct system's reaction, and 2.0 m of closure
+    at 20 m/s.
+
+    Returns:
+        The frame index, or None when the hazard never becomes actionable.
+    """
+    if not history:
+        return None
+    caps = capture_frames(history, perception, config)
+    by_frame = {s.frame: s for s in history}
+    seen_captures: set = set()
+    for i, st in enumerate(history):
+        f = st.frame
+        if f in perception.miss_frames or f in perception.failed_frames:
+            continue
+        if (
+            perception.source_lost_from_frame is not None
+            and f >= perception.source_lost_from_frame
+        ):
+            continue
+        cap = by_frame.get(caps[i])
+        if cap is None or not cap.lead_present:
+            continue
+        gap = cap.gap_m
+        if not math.isfinite(gap) or gap > perception.max_range_m or gap <= 0.0:
+            continue
+        lead_obj = next((o for o in cap.objects if o.is_lead), None)
+        if lead_obj is not None:
+            if abs(lead_obj.lateral_m - cap.lateral_offset_m) > perception.max_lateral_fov_m:
+                continue
+        seen_captures.add(cap.frame)
+        if len(seen_captures) >= max(2, int(perception.rate_min_samples)):
+            return f
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -382,7 +610,31 @@ class OracleVerdict:
     """
 
     avoidable: Optional[bool] = None
-    """Whether contact was avoidable at the first frame the lead was visible."""
+    """Whether contact was avoidable BY A REAL SYSTEM.
+
+    Judged from :attr:`earliest_actionable_frame` -- the first frame on which
+    the measurements the system is handed could support the decision -- and
+    through the same plant the system drives, so it charges the sense latency,
+    the rate-observability delay, the actuation dead time and the brake rise.
+    It used to be judged from the first frame the lead existed in the WORLD,
+    against a zero-latency vehicle, which credited the system with information
+    it does not have and made four boundary scenarios unpassable.
+    """
+
+    contact: Optional[ContactEvent] = None
+    """The contact this run ended at, or None.
+
+    Carries the impact speed as well as the frame, because a 0.2 m/s nudge and a
+    12 m/s impact are both "collided" and they are not the same event.
+    """
+
+    earliest_actionable_frame: Optional[int] = None
+    """First frame the hazard could honestly be acted on.
+
+    See :func:`earliest_actionable_frame`.  The gap between this and frame 0 is
+    the latency no correct system can avoid, and it is subtracted from the
+    scenario's own margin to give the affordable decision budget.
+    """
 
     hazard_clear_frame: Optional[int] = None
     """First frame from which the requirement stays negligible for the rest of
@@ -456,6 +708,30 @@ class OracleVerdict:
         return any(d >= COMFORT_DECEL_MPS2 for d in self.required_decel[lo : hi + 1])
 
 
+    def emergency_warranted_near(
+        self, frame: int, window: int = JUSTIFICATION_WINDOW_FRAMES
+    ) -> bool:
+        """Whether a genuine emergency was live ANYWHERE within +/- ``window``.
+
+        The trailing-only version of this question
+        (:meth:`emergency_warranted_at`) punishes a system for being early.  The
+        oracle's requirement is CAUSAL -- it is what the kinematics demand given
+        what is measurable this frame -- so a system with a better range
+        estimate, or one that simply reads the situation half a second sooner,
+        reaches emergency-grade demand BEFORE the oracle's own requirement
+        crosses the comfort line.  Judging its brake ramp against the comfort
+        jerk ceiling in those frames penalises exactly the behaviour the rest of
+        this specification demands.  The window is therefore symmetric: half a
+        second of anticipation is competence, not discomfort.
+        """
+        if not self.required_decel:
+            return False
+        n = len(self.required_decel)
+        hi = min(max(frame, 0), n - 1)
+        lo = max(0, hi - window)
+        up = min(n - 1, hi + window)
+        return any(d >= COMFORT_DECEL_MPS2 for d in self.required_decel[lo : up + 1])
+
     def warranted_at(self, frame: int) -> bool:
         """Whether braking was warranted at all on ``frame``."""
         if not self.required_decel:
@@ -481,9 +757,7 @@ def jerk_limit_mps3(emergency: bool) -> float:
     """The ceiling on the rate of change of demanded deceleration, m/s^3.
 
     Args:
-        emergency: True when a genuine emergency was live in the trailing
-            window, or when the system is still completing a stop that was
-            warranted when it began.
+        emergency: True when the manoeuvre is a collision-avoidance one.
 
     Returns:
         :data:`EMERGENCY_JERK_MPS3` or :data:`COMFORT_JERK_MPS3`.
@@ -491,21 +765,101 @@ def jerk_limit_mps3(emergency: bool) -> float:
     return EMERGENCY_JERK_MPS3 if emergency else COMFORT_JERK_MPS3
 
 
+def jerk_is_assessable(prev_decel_mps2: float, decel_mps2: float) -> bool:
+    """Whether this frame's change in demand is a comfort hazard at all.
+
+    ONLY A RISING DEMAND IS.  Three reasons, and the third is decisive:
+
+    * **Occupant.**  The hazard a jerk limit exists to bound is an unbraced
+      occupant, a standing passenger or a loose object thrown FORWARD.  That is
+      produced by an increase in deceleration.  A release returns the occupant
+      towards zero g and is arrested by the seat back, which is the direction a
+      seat is built to resist.
+    * **Actuator.**  The brake's own 0.15 s first-order decay
+      (:attr:`PlantConfig.brake_rise_time_s`) turns a step release into a 0.15 s
+      ramp on the road whatever the demand does, so the achieved jerk of a
+      release is bounded by the plumbing in a way the achieved jerk of an
+      application is not: pressure can be commanded faster than it can be bled.
+    * **Consistency, which settles it.**  This specification demands elsewhere
+      that an unwarranted deceleration be REMOVED PROMPTLY -- see
+      ``unwarranted_brake``, ``disproportionate_brake``,
+      :attr:`Expectation.recover_within_frames` and
+      :attr:`Expectation.min_speed_floor_mps`.  A ceiling on the rate of release
+      is a requirement to keep braking, and the two axes are then mutually
+      unsatisfiable: the only policy that satisfies both is never to brake at
+      all.  A harness whose assertions contradict each other does not measure
+      the system, it measures which assertion runs first.  Releasing a brake is
+      not a comfort hazard.
+
+    An oscillating demand is still caught, because every cycle of it contains a
+    rising half.
+    """
+    return decel_mps2 > prev_decel_mps2
+
+
+def jerk_ceiling_mps3(
+    prev_decel_mps2: float, decel_mps2: float, emergency_nearby: bool
+) -> float:
+    """The jerk ceiling that applies to a demand moving between these two values.
+
+    The band is chosen from the DEMAND ITSELF wherever it can be, and only falls
+    back on the oracle's opinion of the situation otherwise:
+
+    * A demand that reaches :data:`EMERGENCY_DECEL_MPS2` at either end of the
+      step is a collision-avoidance action, whether or not it turns out to have
+      been warranted, and :data:`EMERGENCY_JERK_MPS3` applies.  Whether that
+      brake should have existed at all is a different question, asked by the
+      phantom and proportionality findings; asking it twice, once through the
+      jerk ceiling, is what made a system that braked slightly BEFORE the
+      oracle's causal requirement became visible fail on comfort for doing the
+      right thing early.
+    * Otherwise, if a genuine emergency was live within half a second either
+      side (:meth:`OracleVerdict.emergency_warranted_near`), the emergency band
+      still applies: a sub-emergency demand built quickly in the run-up to a
+      real hazard is a system reading the road, not a system throwing heads.
+    * Otherwise the demand is headway keeping and
+      :data:`COMFORT_JERK_MPS3` applies, because outside an emergency a faster
+      ramp buys nothing -- there is by definition no collision to outrun -- and
+      costs the occupant.
+
+    Args:
+        prev_decel_mps2: The demanded deceleration on the previous frame.
+        decel_mps2: The demanded deceleration on this frame.
+        emergency_nearby: The oracle's answer for the symmetric window.
+
+    Returns:
+        The ceiling in m/s^3.
+    """
+    peak = max(float(prev_decel_mps2), float(decel_mps2))
+    if peak >= EMERGENCY_DECEL_MPS2 - 1e-9 or emergency_nearby:
+        return EMERGENCY_JERK_MPS3
+    return COMFORT_JERK_MPS3
+
+
 def judge(
     history: Sequence[WorldState],
     lead: Optional[LeadSpec],
     road: Optional[RoadSpec] = None,
     config: PlantConfig = DEFAULT_PLANT,
+    perception: PerceptionSpec = PERFECT_PERCEPTION,
 ) -> OracleVerdict:
     """Analyse a true state history and return the kinematic verdict.
 
     Args:
         history: The true states, frame 0 first.  This is the trajectory that
             ACTUALLY happened, so the verdict is about the run that occurred,
-            not about a hypothetical one.
+            not about a hypothetical one.  It ends at contact when there was
+            one, because the plant stops there.
         lead: The lead script, needed for the counterfactual braking runs.
         road: The road, for the same reason.
         config: The plant configuration the run used.
+        perception: The sensor characteristics the run was driven through.
+            Avoidability is judged against the vehicle AND the sensor the system
+            actually had, so this is not optional information -- with the
+            default (exact, one frame of latency) the answer is still latency
+            aware, but a scenario that blinds the system for twenty frames must
+            say so here or the oracle will hold it to a standard it was never
+            given the information to meet.
 
     Returns:
         An :class:`OracleVerdict`.
@@ -513,6 +867,10 @@ def judge(
     v = OracleVerdict(frames=len(history))
 
     for s in history:
+        if s.contact is not None and v.contact is None:
+            v.contact = s.contact
+            v.collided = True
+            v.collision_frame = s.contact.frame
         gap = s.gap_m
         if math.isfinite(gap):
             v.min_gap_m = min(v.min_gap_m, gap)
@@ -553,6 +911,11 @@ def judge(
         v.hazard_clear_frame = clear
 
     if v.first_hazard_frame is not None and lead is not None:
+        # The LAST FRAME AT WHICH A COMMAND STILL WORKS.  No sense latency here,
+        # deliberately: this number is compared against the frame on which the
+        # system ISSUED its brake, and the staleness of the picture that
+        # provoked that command is charged once, in
+        # ``earliest_actionable_frame``, not twice.
         last_ok: Optional[int] = None
         for s in history:
             if not s.lead_present:
@@ -562,8 +925,19 @@ def judge(
             elif last_ok is not None:
                 break
         v.last_avoidance_frame = last_ok
-        first_visible = next((s for s in history if s.lead_present), None)
-        if first_visible is not None:
-            v.avoidable = full_braking_min_gap(first_visible, lead, road, config) > CONTACT_GAP_M
+
+        # WAS IT AVOIDABLE BY A REAL SYSTEM?  Judged from the first frame on
+        # which the measurements could support the decision, through the same
+        # plant, so the sense latency and the rate-observability delay are paid
+        # for.  Anything else asks the system to react before the information
+        # exists and then reports its failure to do so as a defect.
+        actionable = earliest_actionable_frame(history, perception, config)
+        v.earliest_actionable_frame = actionable
+        by_frame = {s.frame: s for s in history}
+        start = by_frame.get(actionable) if actionable is not None else None
+        if start is None:
+            start = next((s for s in history if s.lead_present), None)
+        if start is not None:
+            v.avoidable = full_braking_min_gap(start, lead, road, config) > CONTACT_GAP_M
 
     return v

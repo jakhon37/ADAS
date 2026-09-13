@@ -1,20 +1,40 @@
 {
   "diagnosis_counts": {
     "arbiter_failed_to_veto": 1,
-    "clearance": 11,
-    "collided": 7,
+    "clearance": 7,
+    "collided": 5,
     "disengaged": 1,
-    "disproportionate_brake": 9,
-    "excess_jerk": 32,
+    "disproportionate_brake": 18,
+    "excess_jerk": 46,
     "exit_released_brake": 1,
-    "late_intervention": 2,
-    "over_authority_state": 2,
-    "over_braked": 8,
-    "phantom_intervention": 12,
-    "self_reported_violation": 33,
+    "failed_to_recover": 1,
+    "final_speed": 2,
+    "forbidden_emergency_brake": 7,
+    "forbidden_emergency_state": 1,
+    "late_intervention": 1,
+    "over_authority_state": 5,
+    "over_braked": 13,
+    "phantom_intervention": 14,
+    "self_reported_violation": 46,
     "slow_recovery": 2,
-    "speed_loss": 2,
-    "unwarranted_brake": 13
+    "speed_loss": 5,
+    "unwarranted_brake": 23
+  },
+  "generated": {
+    "corpus": {
+      "diagnosis_codes_md5": "4b7f886d58467caa0abd7dc909844973",
+      "scenario_count": 52,
+      "scenario_names_md5": "a9e8a1f7ab4f5c426cdb7d8caaae4a40"
+    },
+    "generated_utc": "2026-09-13T20:28:43Z",
+    "git_head": "a72df895407990289e4a021a7ea04b53396f04c1",
+    "staleness_check": "This baseline describes the arbiter with md5 d517e2aa judged by a corpus of 52 scenarios (names md5 a9e8a1f7). If any of those three differ from what you measure now, the file is STALE and the new/worsened/fixed split below is meaningless: re-record it. Regenerating with report.py --write-baseline does NOT rewrite this header -- report.build_baseline() should call tests.scenarios.baseline_header() so it cannot silently go missing.",
+    "system_under_test": {
+      "clean_at_head": true,
+      "md5": "d517e2aa2662bf251b9cc0bd108d206b",
+      "md5_short": "d517e2aa",
+      "path": "src/adas/control/arbiter.py"
+    }
   },
   "how_to_regenerate": "python -m tests.scenarios.report --write-baseline",
   "known_failures": {
@@ -32,18 +52,19 @@
     ],
     "arbiter_vetoes_stuck_brake_on_empty_road": [
       "arbiter_failed_to_veto",
+      "forbidden_emergency_brake",
       "phantom_intervention",
       "self_reported_violation",
       "speed_loss"
     ],
     "bend_mrm_and_recover": [
       "excess_jerk",
-      "phantom_intervention",
       "self_reported_violation",
       "slow_recovery"
     ],
     "constant_range_12m": [
       "excess_jerk",
+      "forbidden_emergency_brake",
       "over_braked",
       "phantom_intervention",
       "self_reported_violation",
@@ -51,6 +72,7 @@
     ],
     "constant_range_20m": [
       "excess_jerk",
+      "forbidden_emergency_brake",
       "over_braked",
       "phantom_intervention",
       "self_reported_violation",
@@ -85,12 +107,30 @@
     ],
     "empty_road_dropout": [
       "excess_jerk",
-      "phantom_intervention",
       "self_reported_violation",
       "slow_recovery"
     ],
-    "lane_error_with_closing_lead": [
+    "frame_overrun_during_stationary_approach": [
+      "disproportionate_brake",
+      "excess_jerk",
+      "self_reported_violation"
+    ],
+    "hostile_sensor_constant_range_40m": [
+      "excess_jerk",
+      "failed_to_recover",
+      "final_speed",
+      "self_reported_violation",
+      "unwarranted_brake"
+    ],
+    "in_lane_and_out_of_lane_hazards": [
       "clearance",
+      "collided",
+      "excess_jerk",
+      "phantom_intervention",
+      "self_reported_violation"
+    ],
+    "lane_error_with_closing_lead": [
+      "disproportionate_brake",
       "excess_jerk",
       "self_reported_violation"
     ],
@@ -124,6 +164,7 @@
       "clearance",
       "collided",
       "excess_jerk",
+      "late_intervention",
       "self_reported_violation",
       "unwarranted_brake"
     ],
@@ -142,7 +183,6 @@
     ],
     "lead_brakes_gently_2mps2": [
       "disproportionate_brake",
-      "excess_jerk",
       "over_braked",
       "self_reported_violation",
       "unwarranted_brake"
@@ -153,13 +193,27 @@
       "self_reported_violation",
       "unwarranted_brake"
     ],
-    "primary_alone_stops_for_stationary": [
+    "noisy_range_20m_030m_noise": [
+      "excess_jerk",
+      "forbidden_emergency_brake",
+      "over_braked",
+      "phantom_intervention",
+      "self_reported_violation",
+      "unwarranted_brake"
+    ],
+    "noisy_range_40m_030m_noise": [
+      "excess_jerk",
+      "self_reported_violation",
+      "unwarranted_brake"
+    ],
+    "noisy_stationary_36m_030m_noise": [
       "disproportionate_brake",
       "excess_jerk",
       "self_reported_violation"
     ],
-    "range_jump_during_steady_follow": [
+    "out_of_lane_vehicle_at_12m": [
       "excess_jerk",
+      "forbidden_emergency_brake",
       "over_authority_state",
       "over_braked",
       "phantom_intervention",
@@ -167,9 +221,58 @@
       "speed_loss",
       "unwarranted_brake"
     ],
-    "reid_during_steady_follow": [
+    "out_of_lane_vehicle_dragged_in_by_lane_error": [
+      "excess_jerk",
+      "forbidden_emergency_brake",
+      "over_authority_state",
+      "over_braked",
+      "phantom_intervention",
+      "self_reported_violation",
+      "speed_loss",
+      "unwarranted_brake"
+    ],
+    "out_of_lane_vehicle_overtaken": [
+      "excess_jerk",
+      "final_speed",
+      "over_authority_state",
+      "over_braked",
+      "self_reported_violation",
+      "speed_loss",
+      "unwarranted_brake"
+    ],
+    "primary_alone_stops_for_stationary": [
+      "disproportionate_brake",
+      "excess_jerk",
+      "self_reported_violation"
+    ],
+    "range_bias_far_10pct_stationary_36m": [
+      "disproportionate_brake",
+      "excess_jerk",
+      "self_reported_violation"
+    ],
+    "range_bias_near_10pct_constant_range_47m": [
       "excess_jerk",
       "self_reported_violation",
+      "unwarranted_brake"
+    ],
+    "range_jump_during_steady_follow": [
+      "excess_jerk",
+      "forbidden_emergency_brake",
+      "forbidden_emergency_state",
+      "over_authority_state",
+      "over_braked",
+      "phantom_intervention",
+      "self_reported_violation",
+      "speed_loss",
+      "unwarranted_brake"
+    ],
+    "real_tracker_constant_range_40m": [
+      "excess_jerk",
+      "self_reported_violation",
+      "unwarranted_brake"
+    ],
+    "reid_during_closing_approach": [
+      "excess_jerk",
       "unwarranted_brake"
     ],
     "source_loss_mid_run": [
@@ -178,21 +281,13 @@
       "over_authority_state",
       "self_reported_violation"
     ],
-    "stationary_15mps_at_15m": [
-      "clearance",
-      "collided",
+    "stationary_15mps_at_24m": [
+      "disproportionate_brake",
       "excess_jerk",
       "self_reported_violation"
     ],
-    "stationary_20mps_at_26m": [
-      "clearance",
-      "collided",
-      "excess_jerk",
-      "late_intervention",
-      "self_reported_violation"
-    ],
-    "stationary_20mps_at_29m": [
-      "clearance",
+    "stationary_20mps_at_36m": [
+      "disproportionate_brake",
       "excess_jerk",
       "self_reported_violation"
     ],
@@ -201,17 +296,21 @@
       "excess_jerk",
       "self_reported_violation"
     ],
+    "stationary_20mps_at_50m": [
+      "disproportionate_brake",
+      "excess_jerk",
+      "over_braked",
+      "self_reported_violation"
+    ],
     "stationary_20mps_at_75m": [
       "disproportionate_brake",
       "excess_jerk",
       "over_braked",
       "self_reported_violation"
     ],
-    "stationary_25mps_at_42m": [
-      "clearance",
-      "collided",
+    "stationary_25mps_at_52m": [
+      "disproportionate_brake",
       "excess_jerk",
-      "late_intervention",
       "self_reported_violation"
     ],
     "terminate_during_emergency": [
@@ -219,6 +318,20 @@
       "exit_released_brake",
       "phantom_intervention",
       "self_reported_violation"
+    ],
+    "track_id_churn_during_steady_follow_40m": [
+      "excess_jerk",
+      "self_reported_violation",
+      "unwarranted_brake"
+    ],
+    "uncalibrated_camera_stationary_40m": [
+      "disproportionate_brake",
+      "excess_jerk",
+      "self_reported_violation"
+    ],
+    "variable_dt_constant_range_40m": [
+      "excess_jerk",
+      "unwarranted_brake"
     ]
   },
   "purpose": "Scenarios that FAIL against the arbiter as committed today. This file is the redesign's target: the work is done when 'known_failures' is empty. It is NOT a suppression list -- every scenario named here still fails, still prints its diagnosis and still makes the suite red. Its only job is to let pytest say which failures are NEW.",
@@ -227,9 +340,9 @@
     "Removing a name is the only allowed way to make this file smaller, and it must be because the scenario now PASSES.",
     "Never edit a scenario's expectation to get it out of this file. The expectation is the specification."
   ],
-  "spec_version": "1.1",
+  "spec_version": "1.2",
   "totals": {
-    "known_failures": 33,
-    "scenarios": 37
+    "known_failures": 48,
+    "scenarios": 52
   }
 }

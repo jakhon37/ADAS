@@ -42,6 +42,39 @@ which let a real, measured defect through:
   AEB grade was invisible.  Proportionality is now policed over the whole range
   of the brake: see :data:`oracle.HEADWAY_DECEL_ALLOWANCE_MPS2`.
 
+Five correctness bugs in this judgement layer, found by audit and fixed here
+---------------------------------------------------------------------------
+Every one of them made the harness say something untrue, and three of them said
+it about the SYSTEM when the fault was in the harness:
+
+1. **The oracle and the plant disagreed about the vehicle.**  Avoidability was
+   judged against a zero-latency, step-braking car while the system under test
+   has 55 ms of sense latency, a two-frame wait for a closing rate to exist at
+   all, and a jerk ceiling on its own demand.  Four scenarios were placed inside
+   that fictional boundary and could only be passed by braking before the
+   measurement existed.  :func:`feasibility` now prints the AFFORDABLE DECISION
+   LATENCY for every scenario, and a negative one is reported as a defect in the
+   scenario (``infeasible_clearance``, ``unactionable_scenario``,
+   ``collided_unavoidable``) rather than in the system.
+2. **The plant did not stop at contact**, so a collided run carried on and the
+   report quoted a minimum gap measured from inside the other vehicle.
+3. **``phantom_intervention`` fired on frames with no braking**, because
+   "emergency authority" was ``decel >= 3.5 OR state is MRM``.  A state label
+   with no actuation is not an intervention; it is now
+   ``unwarranted_authority_state``, a separate finding with a separate severity.
+4. **``excess_jerk`` punished early intervention and brake release.**  It now
+   assesses only a RISING demand and takes its band from the demand rather than
+   from whether the oracle's causal requirement had already become visible.
+5. **``forbid_emergency_intervention`` had no read site.**  It was set on eight
+   scenarios and asserted nothing.  :func:`unread_expectation_fields` now makes
+   that class of defect a test failure.
+
+And one device that would have caught all of them at once:
+:class:`ReferenceController`, a constant time gap plus a braking law derived
+from required deceleration, driven through the same sensor and the same plant.
+Every scenario must be passable by it; ``report.py --reference`` says whether
+they are.
+
 Finally, the stack is DEGRADABLE.  The arbiter's entire design rationale is that
 it is an independent backstop, and that claim is untestable while every run
 executes planner, controller and arbiter together and only ever actuates the
@@ -54,7 +87,7 @@ two separate, separately falsifiable claims.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as dataclass_fields
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from adas.core.models import (
@@ -74,7 +107,12 @@ from tests.scenarios.plant import (
     DEFAULT_PLANT,
     FRAME_HEIGHT_PX,
     FRAME_WIDTH_PX,
+    CAMERA_FOCAL_PX,
+    CAR_WIDTH_M,
+    EGO_HALF_WIDTH_M,
+    MAX_ROAD_WHEEL_RAD,
     PERFECT_PERCEPTION,
+    WHEELBASE_M,
     LeadSpec,
     Observation,
     PerceptionSpec,
@@ -538,6 +576,689 @@ class StackUnderTest:
 
 
 # --------------------------------------------------------------------------- #
+# The reference controller: proof that the specification is satisfiable
+# --------------------------------------------------------------------------- #
+
+
+class ReferenceController:
+    """A simple, honest longitudinal policy that every scenario must be passable by.
+
+    THIS IS NOT THE REDESIGN and it does not belong in ``src/``.  It is a
+    harness fixture with exactly one job: to make the harness's own
+    satisfiability checkable.  A specification is only worth something if some
+    correct system can meet it, and the fastest way to find out that a scenario
+    demands the impossible is to run a competent, uncomplicated controller
+    against it and watch it fail.  Version 2 of this library placed four
+    scenarios about a metre inside a boundary that no system with the pipeline's
+    own latency could reach; this class would have found that in one run.
+
+    It also gives the redesign a KNOWN-ACHIEVABLE TARGET.  Every number the
+    redesign has to beat is printed by ``report.py --reference``.
+
+    What it is
+    ----------
+    Two laws and a rate limiter, and nothing else:
+
+    * **Constant time gap.**  The policy spacing is
+      ``STANDOFF_M + TIME_GAP_S * v`` -- 12 m plus two seconds, which is 52 m at
+      20 m/s and is the vehicle's own following policy.  Inside it the ego
+      settles at a speed deficit proportional to the shortfall and capped at
+      :data:`HEADWAY_DV_MAX`, because a gap only opens while the ego is slower
+      than the lead and 3 m/s of deficit opens 40 m in a comfortable thirteen
+      seconds.  The authority this law may use is capped at
+      :data:`oracle.HEADWAY_DECEL_ALLOWANCE_MPS2`: headway keeping is not
+      collision avoidance and must never be mistaken for it.
+    * **A braking law derived from required deceleration.**  Textbook, computed
+      from the MEASURED range, the ego's own closing rate estimate and an
+      estimate of the lead's acceleration: if the lead is decelerating it will
+      still travel ``v_lead^2 / 2|a_lead|``, so the ego has that plus the gap
+      less the standstill clearance in which to stop; if it is not, the ego has
+      only to wash out the relative speed inside the gap.  No margin factors, no
+      state machine, no thresholds tuned against a recording.
+    * **A jerk limiter** at exactly the ceilings this specification derives:
+      :data:`oracle.COMFORT_JERK_MPS3` while the demand stays inside the comfort
+      band and :data:`oracle.EMERGENCY_JERK_MPS3` once it is heading past
+      emergency grade.
+
+    What it refuses to do, and why it matters
+    -----------------------------------------
+    * **It never brakes on a rate it has not measured.**  A camera measures
+      range; a closing rate is a difference of ranges over time.  Until two
+      distinct captures exist there is no rate, and the only prior available --
+      "assume the object is stationary in the world" -- is exactly what produced
+      the constant-range phantom braking.  Without a rate the controller falls
+      back on the time-gap law, which is bounded at 1.5 m/s^2.
+    * **It rejects a range jump.**  A reported range that moves further in one
+      frame than any pair of road vehicles could move re-anchors the estimate
+      and discards the rate rather than being differentiated into a 200 m/s
+      closure.  :data:`RANGE_JUMP_M` is 3.0 m, which at 20 Hz is 60 m/s of
+      implied closure and ten standard deviations of the harness's own range
+      noise.
+    * **It holds through a detection miss.**  A detector that reports nothing
+      has not reported that the road is clear, so the avoidance demand is held
+      for :data:`MISS_HOLD_FRAMES` before it decays.
+    * **It never commands both pedals.**
+
+    It pays the same latency the system under test pays -- it is driven from the
+    same :class:`tests.scenarios.plant.Observation`, one frame stale, through the
+    same plant and the same actuator lag -- so a scenario it cannot pass is a
+    scenario nothing can pass.
+    """
+
+    TIME_GAP_S = 2.0
+    """Following time gap, seconds.  The vehicle's own policy, and the figure the
+    scenario library quotes as ``12 m + 2.0 s x v``."""
+
+    STANDOFF_M = 12.0
+    """Standing part of the policy gap, metres."""
+
+    TARGET_CLEARANCE_M = truth.REQUIRED_CLEARANCE_M + 0.25
+    """Room a completed stop aims to leave, metres.
+
+    The oracle's 2.0 m plus a quarter of a metre of aim-off, which is the range
+    the controller cannot see: it is acting on a measurement one frame old, and
+    a law that aims at exactly the required clearance therefore stops a fraction
+    inside it every time.  0.25 m is one frame of the closure that is still
+    present in the last metre of a completed stop."""
+
+    HEADWAY_DV_MAX = 3.0
+    """Largest speed deficit the time-gap law will hold, m/s.
+
+    A gap opens at the deficit, so 3 m/s opens 40 m -- the worst shortfall any
+    scenario here presents -- in about thirteen seconds, and costs 3 m/s of
+    speed.  Larger deficits open the gap faster and are what a passenger reads
+    as the car giving up on the journey."""
+
+    HEADWAY_GAIN = 0.30
+    """Speed deficit per metre of gap shortfall, 1/s."""
+
+    SPEED_GAIN = 0.8
+    """Deceleration demanded per m/s of speed error, 1/s."""
+
+    THROTTLE_GAIN = 0.35
+    """Throttle fraction per m/s of speed deficit."""
+
+    RAMP_ALLOWANCE_S = 0.4
+    """Cap on the closure conceded to the brake's own build-up, seconds.
+
+    While the demand ramps at :data:`oracle.EMERGENCY_JERK_MPS3` the average
+    deceleration is about half the target, so the required-deceleration law has
+    to give away roughly half the ramp time's worth of closure or it chases its
+    own lag and settles high.  The allowance is computed FROM THE RAMP ACTUALLY
+    NEEDED -- ``(target - current) / 20 m/s^3`` -- rather than being a fixed
+    fraction of a second, because a brake that is already applied needs no
+    allowance at all, and charging one anyway inflates the demand by a sixth
+    exactly where the case is tightest.  0.4 s is the full-range ramp and
+    therefore the ceiling."""
+
+    DEMAND_MARGIN_FRAC = 0.05
+    DEMAND_MARGIN_MPS2 = 0.05
+    """Prudence added to the computed requirement.
+
+    Five per cent and 0.05 m/s^2, which is the quantisation of a brake command
+    that has been through a rate limiter.  Deliberately small: the requirement
+    is recomputed every frame from a fresh measurement, so a standing margin
+    buys nothing that the next frame does not buy anyway, and the oracle's
+    proportionality test measures the response against the requirement rather
+    than against the outcome."""
+
+    ACCEL_CONFIDENCE_SIGMAS = 5.0
+    """Confidence demanded of the LEAD ACCELERATION term, in standard errors.
+
+    Higher than :data:`CONFIDENCE_SIGMAS` and not for statistical reasons -- the
+    false-alarm rate a given sigma count buys is the same for both -- but
+    because the CONSEQUENCE is not.  A 3-sigma false closure enters the braking
+    law squared and small: at a 20 m gap it produces 0.15 m/s^2, which nobody
+    feels.  A 3-sigma false lead deceleration switches the law to its
+    lead-is-stopping branch, where the demand scales with the EGO's speed
+    squared and not with the error, and produces 4.7 m/s^2 -- a full emergency
+    manufactured out of range noise, which is this codebase's founding defect.
+    The bound is therefore set so that the worst demand pure noise can produce
+    through this term stays below the headway allowance; at the harness's own
+    +/-0.30 m of range noise the split-half acceleration estimate has a standard
+    error of about 15 m/s^2, so five of them is 75 m/s^2 and no draw survives it."""
+
+    BLIND_HOLD_FRAMES = 8
+    """Frames of perception loss tolerated before a minimum-risk stop begins.
+
+    0.4 s.  A single dropped frame is a dropped frame; half a second of nothing
+    is a vehicle driving blind, and 0.4 s at 20 m/s is 8 m travelled without a
+    picture."""
+
+    MRM_DECEL_MPS2 = 3.0
+    """Deceleration of the minimum-risk stop, m/s^2.
+
+    The comfort limit: the vehicle has to stop, nothing has been detected in
+    front of it, and the traffic behind has no reason to expect more."""
+
+    MISS_HOLD_FRAMES = 24
+    """Frames an avoidance demand survives a detection miss.
+
+    1.2 s.  A detector that produced nothing has not produced evidence of an
+    empty road, and the harness's own dropout scenarios inject 0.8 s of it."""
+
+    RANGE_JUMP_M = 3.0
+    """Range discontinuity treated as a re-anchor rather than as motion."""
+
+    RATE_MIN_SAMPLES = 4
+    """Fewest range samples the avoidance law will act on.
+
+    Three intervals.  Two samples give a slope with no residual, so there is no
+    way to tell a rate from a noise draw; four give two degrees of freedom and
+    the first honest estimate of how much of the slope is measurement error.
+    Below this the controller falls back on the time-gap law, which is bounded
+    at 1.5 m/s^2 and cannot hurt anyone."""
+
+    RATE_WINDOW = 9
+    """Least-squares window for the controller's own range differentiation.
+
+    0.45 s.  The standard error of a slope fitted over ``n`` samples spaced
+    ``dt`` is ``sigma / sqrt(dt^2 n (n^2-1) / 12)``, so widening the window from
+    5 to 9 samples cuts the noise on the rate by a factor of 2.4 while costing
+    about 0.2 s of lag against a lead whose deceleration is changing -- which
+    every scenario here can afford, and none of them can afford a 6 m/s^2 brake
+    for a range estimate that wandered."""
+
+    CONFIDENCE_SIGMAS = 4.0
+    """Confidence demanded before the braking law engages, in standard errors.
+
+    THE GATE IS ON THE BOUND; THE MAGNITUDE IS THE ESTIMATE.  The controller
+    will not begin braking for collision avoidance until the closure it has
+    measured is four standard errors clear of zero -- the errors being computed
+    from the residuals of its own fit, so a noise-free sensor is not penalised
+    (the residuals are zero and the bound is the estimate) and a noisy one
+    cannot manufacture a hazard.  Once the gate is open the law uses the
+    UNBIASED estimate, because the required deceleration goes as the square of
+    the closure and braking for a deliberately pessimistic closure would be its
+    own kind of over-response.
+
+    Four rather than three because the question is not "is this frame a false
+    alarm?" but "does this controller ever brake for nothing across the whole
+    corpus?".  Fifty scenarios of three hundred frames is fifteen thousand
+    opportunities, and a one-sided three-sigma gate (1.3e-3) would be expected
+    to open about twenty times; four sigma (3.2e-5) is expected to open once in
+    two corpora.  The cost of the extra sigma is nothing when the sensor is
+    clean and about one frame of latency when it is not, because a genuine
+    20 m/s closure is more than seven standard errors even on the shortest
+    window this controller will fit."""
+
+    LAT_WN = 2.0
+    LAT_ZETA = 0.9
+    """Natural frequency and damping of the lane-keeping loop, rad/s.
+
+    Lateral acceleration is ``v^2 (delta / L + kappa)``, so a proportional-
+    derivative law placed at 2.0 rad/s leaves a steady-state offset of
+    ``v^2 kappa / wn^2`` against a constant bend: 0.43 m on the 230 m radius
+    this library uses and 0.25 m on the 400 m one, both inside the 1.75 m the
+    scenarios allow.  The lateral half exists only so that the longitudinal
+    scenarios can be run on a bend at all; it is not a proposal."""
+
+    def __init__(self, cruise_speed_mps: float, spec: StackSpec = DEFAULT_STACK) -> None:
+        self.spec = spec
+        self.cruise_speed_mps = float(cruise_speed_mps)
+        self._decel = 0.0
+        self._blind = 0
+        self._range_hist: Dict[int, List[Tuple[float, float]]] = {}
+        self._vego_hist: List[Tuple[float, float]] = []
+        self._sigma_range: Optional[float] = None
+        self._sigma_var: Optional[float] = None
+        self._miss_frames = 0
+        self._held_avoid = 0.0
+        self._last_offset: Optional[float] = None
+        self._last_offset_t: Optional[float] = None
+        self._offset_rate = 0.0
+        self._steer = 0.0
+        self._last_speed_mps = float(cruise_speed_mps)
+        self._last_brake = 0.0
+
+    # ------------------------------------------------------------ estimation
+
+    SIGMA_EWMA_ALPHA = 0.1
+    """Forgetting factor of the running measurement-noise estimate.
+
+    See :meth:`_note_noise` for how the estimate is formed.
+
+    The noise on a range measurement is a property of the SENSOR, not of the
+    last four samples, so it is estimated once and remembered.  This is not a
+    refinement: with a four-sample fit the residuals carry two degrees of
+    freedom, and a chi-squared with two degrees of freedom has plenty of mass
+    near zero, so the local estimate collapses to almost nothing several times
+    in a three-hundred-frame run.  Every standard error computed from it
+    collapses with it, the lower-confidence bound stops bounding anything, and
+    the controller brakes at 4 m/s^2 for a lead holding a steady speed -- which
+    is the original defect, reconstructed inside the fix for it.  A running
+    estimate over the whole run has tens of degrees of freedom and does not do
+    that.  Alpha of 0.1 settles in about thirty frames, 1.5 s."""
+
+    @staticmethod
+    def _ls_fit(
+        samples: Sequence[Tuple[float, float]]
+    ) -> Optional[Tuple[float, float, Optional[float]]]:
+        """``(slope, Sxx, residual sigma)`` of ``y`` against ``t``.
+
+        ``Sxx`` is the spread of the abscissae, so a caller can turn any noise
+        estimate into a standard error with ``sigma / sqrt(Sxx)``.  The residual
+        sigma is this fit's own opinion of the measurement noise and is None
+        when there are too few degrees of freedom to have one.
+        """
+        n = len(samples)
+        if n < 2:
+            return None
+        mt = sum(s[0] for s in samples) / n
+        my = sum(s[1] for s in samples) / n
+        sxx = sum((s[0] - mt) ** 2 for s in samples)
+        if sxx <= 1e-12:
+            return None
+        slope = sum((s[0] - mt) * (s[1] - my) for s in samples) / sxx
+        if n <= 2:
+            return slope, sxx, None
+        intercept = my - slope * mt
+        resid = sum((s[1] - (intercept + slope * s[0])) ** 2 for s in samples)
+        return slope, sxx, math.sqrt(max(0.0, resid / (n - 2)))
+
+    def _note_noise(self, hist: Sequence[Tuple[float, float]]) -> None:
+        """Update the running measurement-noise estimate from ``hist``.
+
+        SECOND DIFFERENCES, not fit residuals.  The residuals of a straight line
+        fitted to a range that is genuinely curving -- which is exactly what a
+        braking lead produces -- are dominated by the curvature, not by the
+        noise, so a noise estimate taken from them rises with the very signal it
+        is supposed to help detect: fit the noise from those residuals and the
+        controller concludes that a lead braking at 6 m/s^2 is a noisy lead
+        holding station, refuses it the lead-deceleration credit, and drives
+        into it.  The second difference ``r[i] - 2 r[i-1] + r[i-2]`` annihilates
+        any straight line exactly and leaves a constant acceleration with only
+        ``a dt^2`` -- 0.015 m at 6 m/s^2 on a 50 ms grid, four per cent of the
+        noise this harness injects -- so it measures the sensor and not the
+        manoeuvre.  Its variance is six times the measurement variance for
+        independent samples, which is the ``/ 6``.
+
+        The estimate is an EWMA over the whole run because the noise is a
+        property of the sensor and one triple of samples is one degree of
+        freedom.
+        """
+        if len(hist) < 3:
+            return
+        (t0, r0), (t1, r1), (t2, r2) = hist[-3], hist[-2], hist[-1]
+        if abs((t2 - t1) - (t1 - t0)) > 1e-6:
+            # Unequally spaced captures: the second difference is not a clean
+            # noise probe across a frame overrun, so this triple is skipped.
+            return
+        var = (r2 - 2.0 * r1 + r0) ** 2 / 6.0
+        if self._sigma_var is None:
+            self._sigma_var = var
+        else:
+            self._sigma_var += self.SIGMA_EWMA_ALPHA * (var - self._sigma_var)
+        self._sigma_range = math.sqrt(max(0.0, self._sigma_var))
+
+    def _slope_se(self, sxx: float, sigma_local: Optional[float]) -> float:
+        """Standard error of a slope fitted over samples with spread ``sxx``.
+
+        ``sigma_local`` is this fit's own residual estimate and is used only
+        when it is LARGER than the running one, so a window that has just seen
+        something the running estimate has not is not ignored.
+        """
+        sigma = max(sigma_local or 0.0, self._sigma_range or 0.0)
+        return sigma / math.sqrt(sxx) if sxx > 1e-12 else 0.0
+
+    @classmethod
+    def _ls_slope(cls, samples: Sequence[Tuple[float, float]]) -> Optional[float]:
+        """Least-squares slope of ``y`` against ``t``, or None."""
+        got = cls._ls_fit(samples)
+        return None if got is None else got[0]
+
+    def _update_range(
+        self, tid: int, t_s: float, rng_m: float
+    ) -> Optional[Tuple[float, float]]:
+        """Add a range sample and return ``(closing estimate, confident closure)``.
+
+        Two numbers because they answer two questions.  The ESTIMATE is the
+        unbiased slope and is what the time-gap law needs, since that law is
+        regulating a following speed and a biased estimate of the lead's speed
+        makes it chase its own tail: subtract the uncertainty there and the ego
+        keeps deciding it is 3 m/s too fast, however slowly it is going.  The
+        CONFIDENT CLOSURE is the estimate less three standard errors and is what
+        the braking law uses, because braking is irreversible and a closure that
+        is indistinguishable from noise is not a reason to decelerate.
+
+        Positive is closing.  A sample that jumps further than
+        :data:`RANGE_JUMP_M` from where the current estimate predicted is a
+        re-anchor, not motion: the history is dropped and the rate goes back to
+        unknown until two fresh captures exist.  Differentiating such a jump is
+        how a 10 m range correction becomes a 200 m/s closure and a phantom
+        emergency.
+        """
+        hist = self._range_hist.setdefault(tid, [])
+        if hist and t_s <= hist[-1][0] + 1e-12:
+            # The same capture twice: a decision loop faster than the camera.
+            if len(hist) < self.RATE_MIN_SAMPLES:
+                return None
+            fit = self._ls_fit(hist)
+            if fit is None:
+                return None
+            se = self._slope_se(fit[1], None)
+            return -fit[0], -fit[0] - self.CONFIDENCE_SIGMAS * se
+        if hist:
+            prev_t, prev_r = hist[-1]
+            slope = self._ls_slope(hist)
+            predicted = prev_r + (slope if slope is not None else 0.0) * (t_s - prev_t)
+            if abs(rng_m - predicted) > self.RANGE_JUMP_M:
+                hist = []
+                self._range_hist[tid] = hist
+        hist.append((t_s, rng_m))
+        if len(hist) > self.RATE_WINDOW:
+            del hist[0]
+        if len(hist) < self.RATE_MIN_SAMPLES:
+            return None
+        fit = self._ls_fit(hist)
+        if fit is None:
+            return None
+        slope, sxx, sigma_local = fit
+        self._note_noise(hist)
+        se = self._slope_se(sxx, None)
+        return -slope, -slope - self.CONFIDENCE_SIGMAS * se
+
+    def _lead_accel(self, tid: int, a_ego_mps2: float) -> float:
+        """Confident lead acceleration, m/s^2, from the RAW range history.
+
+        SPLIT HALVES, not a second differentiation of a smoothed series.  The
+        obvious implementation -- differentiate the estimated lead speed, which
+        is itself a differentiated range -- produces errors that are strongly
+        CORRELATED between frames, because consecutive estimates share most of
+        their samples.  A residual-based standard error then reports almost
+        zero uncertainty for a trend that is entirely noise, and the controller
+        confidently concludes that a lead holding a steady 20 m/s is braking at
+        4 m/s^2.  That is not a tuning problem, it is the wrong estimator.
+
+        Instead the window is split into two halves with NO SAMPLES IN COMMON, a
+        slope is fitted to each, and the relative acceleration is the difference
+        of the slopes over the gap between their centres.  The two slope errors
+        are then independent, so ``sqrt(se_old^2 + se_new^2) / dt`` is an honest
+        standard error, and the same lower-confidence-bound rule applies: credit
+        only the deceleration that survives three of them.
+
+        ``range'' = a_lead - a_ego``, so the ego's own acceleration -- known
+        from the vehicle bus, not from the camera -- is added back.
+        """
+        hist = self._range_hist.get(tid) or []
+        n = len(hist)
+        half = self.RATE_MIN_SAMPLES
+        if n < 2 * half:
+            return 0.0
+        old_s, new_s = hist[:half], hist[n - half :]
+        f_old, f_new = self._ls_fit(old_s), self._ls_fit(new_s)
+        if f_old is None or f_new is None:
+            return 0.0
+        t_old = sum(s[0] for s in old_s) / len(old_s)
+        t_new = sum(s[0] for s in new_s) / len(new_s)
+        span = t_new - t_old
+        if span <= 1e-9:
+            return 0.0
+        a_rel = (f_new[0] - f_old[0]) / span
+        se_old = self._slope_se(f_old[1], None)
+        se_new = self._slope_se(f_new[1], None)
+        se = math.sqrt(se_new * se_new + se_old * se_old) / span
+        a_lead = a_rel + a_ego_mps2
+        return max(-8.0, min(0.0, a_lead + self.ACCEL_CONFIDENCE_SIGMAS * se))
+
+    def _update_ego_accel(self, t_s: float, v_ego: float) -> float:
+        """The ego's own acceleration, differentiated from the vehicle bus.
+
+        Not from the camera: the speed signal is the system's own
+        proprioception and is orders of magnitude cleaner than a range.
+        """
+        hist = self._vego_hist
+        if not hist or t_s > hist[-1][0] + 1e-12:
+            hist.append((t_s, v_ego))
+            if len(hist) > self.RATE_WINDOW:
+                del hist[0]
+        fit = self._ls_fit(hist)
+        return 0.0 if fit is None else fit[0]
+
+    # -------------------------------------------------------------- the laws
+
+    def _required_decel(
+        self, rng_m: float, closing_mps: float, v_ego: float, a_lead: float
+    ) -> float:
+        """Constant deceleration that keeps :data:`TARGET_CLEARANCE_M`, m/s^2.
+
+        Textbook, from measured quantities only.  Two cases, because they are
+        physically different problems: against a lead that is stopping the ego
+        must come to rest inside the gap plus whatever the lead still travels;
+        against one that is not, the ego only has to wash out the relative speed.
+        """
+        # The clearance target is capped at the room that still exists, exactly
+        # as the oracle caps it.  Once the ego is already inside the standstill
+        # clearance no deceleration can restore it, and demanding it anyway
+        # turns the law into a step to full authority in the last metre of an
+        # otherwise correct stop -- braking hard for a gap that is no longer
+        # closing, which is disproportionate however it is dressed up.
+        clearance = min(self.TARGET_CLEARANCE_M, max(0.0, rng_m - 0.3))
+        room = max(0.05, rng_m - clearance)
+        # First pass with no allowance, to find out how far the demand has to
+        # travel; then charge half of that ramp's worth of closure.
+        naive = (
+            (max(0.0, closing_mps) ** 2) / (2.0 * room)
+            if closing_mps > 0.05
+            else 0.0
+        )
+        if a_lead < -0.5:
+            naive = max(naive, (v_ego * v_ego) / (2.0 * room))
+        t_ramp = min(
+            self.RAMP_ALLOWANCE_S,
+            max(0.0, naive - self._decel) / truth.EMERGENCY_JERK_MPS3,
+        )
+        usable = max(0.05, room - max(0.0, closing_mps) * 0.5 * t_ramp)
+        if a_lead < -0.5:
+            v_lead = max(0.0, v_ego - closing_mps)
+            avail = max(0.05, usable + v_lead * v_lead / (2.0 * (-a_lead)))
+            return min(
+                DEFAULT_PLANT.max_brake_decel_mps2, (v_ego * v_ego) / (2.0 * avail)
+            )
+        if closing_mps <= 0.05:
+            return 0.0
+        return min(
+            DEFAULT_PLANT.max_brake_decel_mps2,
+            (closing_mps * closing_mps) / (2.0 * usable),
+        )
+
+    def _lateral(self, obs: Observation, dt_s: float) -> float:
+        """Normalised steering.  Holds the last command while blind."""
+        offset = obs.lateral_offset_m
+        if offset is None:
+            return self._steer
+        if self._last_offset is not None and dt_s > 0.0:
+            raw = (offset - self._last_offset) / dt_s
+            self._offset_rate += 0.4 * (raw - self._offset_rate)
+        self._last_offset = offset
+        v = max(3.0, obs.ego.speed_mps)
+        accel_cmd = -(
+            2.0 * self.LAT_ZETA * self.LAT_WN * self._offset_rate
+            + self.LAT_WN * self.LAT_WN * offset
+        )
+        delta = WHEELBASE_M * accel_cmd / (v * v)
+        self._steer = max(-1.0, min(1.0, delta / MAX_ROAD_WHEEL_RAD))
+        return self._steer
+
+    # ------------------------------------------------------------------- API
+
+    def step(
+        self, obs: Observation, dt_s: float
+    ) -> Tuple[ControlCommand, ControlCommand, ControlCommand, object]:
+        """One frame.  Same signature as :meth:`StackUnderTest.step`."""
+        self._last_speed_mps = obs.ego.speed_mps
+        v_ego = obs.ego.speed_mps
+        dt = dt_s if dt_s and dt_s > 0 else DEFAULT_PLANT.dt_s
+        steering = self._lateral(obs, dt)
+        a_ego = self._update_ego_accel(obs.t_s, v_ego)
+
+        if not obs.perception.ok:
+            self._blind += 1
+            if self._blind > self.BLIND_HOLD_FRAMES:
+                target = self.MRM_DECEL_MPS2
+                state = SafetyState.MIN_RISK_MANEUVER
+                reason = "minimum_risk_stop"
+            else:
+                target = self._decel
+                state = SafetyState.LIMITED
+                reason = "perception_dropout_hold"
+            v_target = 0.0
+        else:
+            self._blind = 0
+            lead = self._nearest_in_path(obs)
+            if lead is None:
+                self._miss_frames += 1
+                if self._miss_frames <= self.MISS_HOLD_FRAMES:
+                    a_avoid = self._held_avoid
+                    reason = "detection_miss_hold" if self._held_avoid > 0.0 else "cruise"
+                else:
+                    a_avoid = 0.0
+                    self._held_avoid = 0.0
+                    reason = "cruise"
+                v_target = self.cruise_speed_mps
+                a_headway = 0.0
+            else:
+                self._miss_frames = 0
+                rng = max(0.01, float(lead.distance_m))
+                got = self._update_range(lead.track_id, obs.measurement_t_s, rng)
+                if got is None:
+                    a_avoid = 0.0
+                    v_lead_est = v_ego
+                    reason = "headway_no_rate"
+                else:
+                    rate, confident = got
+                    v_lead_est = max(0.0, v_ego - rate)
+                    a_lead = self._lead_accel(lead.track_id, a_ego)
+                    # Gate on the confident bound, size on the estimate.
+                    a_avoid = (
+                        self._required_decel(rng, max(0.0, rate), v_ego, a_lead)
+                        if confident > 0.05
+                        else self._required_decel(rng, 0.0, v_ego, a_lead)
+                    )
+                    if a_avoid > 0.05:
+                        a_avoid = min(
+                            DEFAULT_PLANT.max_brake_decel_mps2,
+                            a_avoid * (1.0 + self.DEMAND_MARGIN_FRAC)
+                            + self.DEMAND_MARGIN_MPS2,
+                        )
+                    else:
+                        a_avoid = 0.0
+                    reason = "avoid" if a_avoid > 0.0 else "follow"
+                self._held_avoid = a_avoid
+                desired = self.STANDOFF_M + self.TIME_GAP_S * v_ego
+                dv = max(0.0, min(self.HEADWAY_DV_MAX, self.HEADWAY_GAIN * (desired - rng)))
+                v_target = max(0.0, min(self.cruise_speed_mps, v_lead_est - dv))
+                a_headway = max(
+                    0.0,
+                    min(
+                        truth.HEADWAY_DECEL_ALLOWANCE_MPS2,
+                        self.SPEED_GAIN * (v_ego - v_target),
+                    ),
+                )
+            target = max(a_avoid, a_headway)
+            state = (
+                SafetyState.LIMITED
+                if target >= truth.COMFORT_DECEL_MPS2
+                else SafetyState.NOMINAL
+            )
+
+        # Jerk limit.  The rising band comes from where the demand is HEADING:
+        # a demand bound for emergency grade is a collision-avoidance action and
+        # gets the emergency ceiling for the whole ramp, which is what the
+        # judgement layer's own local-peak rule grants it.
+        if target > self._decel:
+            rate_limit = (
+                truth.EMERGENCY_JERK_MPS3
+                if target >= truth.EMERGENCY_DECEL_MPS2
+                else truth.COMFORT_JERK_MPS3
+            )
+            self._decel = min(target, self._decel + rate_limit * dt)
+        else:
+            self._decel = max(target, self._decel - 12.0 * dt)
+
+        brake = max(0.0, min(1.0, self._decel / DEFAULT_PLANT.max_brake_decel_mps2))
+        throttle = 0.0
+        if brake <= 1e-6 and obs.perception.ok and v_target > v_ego + 0.05:
+            throttle = max(0.0, min(1.0, self.THROTTLE_GAIN * (v_target - v_ego)))
+            brake = 0.0
+        self._last_brake = brake
+
+        command = ControlCommand(throttle, brake, steering)
+        result = ArbitrationResult(
+            command=command, state=state, violations=[], reason=reason
+        )
+        result.plan_reason = reason
+        result.plan_target = v_target
+        return command, command, command, result
+
+    def _nearest_in_path(self, obs: Observation):
+        """The closest reported track whose footprint overlaps the ego's own.
+
+        It does NOT read ``TrackedObject.in_ego_lane``.  That flag is the lane
+        estimator's opinion, and a lane fit that has slipped a metre towards the
+        next lane reports a car that is nowhere near the ego as being in front
+        of it -- which is a lane error CREATING a hazard, the mirror image of a
+        lane error hiding one.  The geometry that decides whether a collision is
+        possible is the object's lateral offset from the EGO, which the detector
+        measures from the box's position in the image and which no lane model
+        can move.  Half the ego plus half the object is 1.8 m; a car one lane
+        over is at 3.5 m and is not in the way however confident the lane fit is.
+        """
+        best = None
+        for t in obs.tracks:
+            if t.distance_m is None or t.distance_m <= 0.0:
+                continue
+            lateral = getattr(t, "lateral_offset_m", None)
+            if lateral is not None:
+                half_w = 0.5 * CAR_WIDTH_M
+                box = getattr(t, "box", None)
+                if box is not None and t.distance_m > 0.0:
+                    half_w = max(
+                        0.3,
+                        0.5 * (box.x2 - box.x1) * float(t.distance_m) / CAMERA_FOCAL_PX,
+                    )
+                if abs(float(lateral)) > EGO_HALF_WIDTH_M + half_w:
+                    continue
+            if best is None or t.distance_m < best.distance_m:
+                best = t
+        return best
+
+    def fail_safe(self, t_s: float, ego_speed_mps: float, dt_s: float) -> ControlCommand:
+        """The command written when the loop ends: throttle off, brake held.
+
+        ADAS-DEC-21.  Leaving the loop is not a command, so a defined one is
+        emitted: never any throttle, and never less brake than the loop's last
+        frame was applying, with a floor at the comfort deceleration whenever the
+        vehicle is still moving.
+        """
+        floor = (
+            truth.COMFORT_DECEL_MPS2 / DEFAULT_PLANT.max_brake_decel_mps2
+            if ego_speed_mps > STANDSTILL_MPS
+            else 0.0
+        )
+        return ControlCommand(0.0, max(self._last_brake, floor), 0.0)
+
+    def shutdown(self, t_s: float, dt_s: float, hold_steps: int = 4) -> List[ControlCommand]:
+        """The commands written after the frame loop ends."""
+        return [
+            self.fail_safe(t_s + (i + 1) * dt_s, self._last_speed_mps, dt_s)
+            for i in range(hold_steps)
+        ]
+
+
+def reference_stack(scenario: "Scenario") -> ReferenceController:
+    """A :class:`ReferenceController` configured for ``scenario``."""
+    return ReferenceController(
+        cruise_speed_mps=(
+            scenario.cruise_speed_mps
+            if scenario.cruise_speed_mps is not None
+            else scenario.ego_speed_mps
+        ),
+        spec=scenario.stack,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Expectations
 # --------------------------------------------------------------------------- #
 
@@ -658,7 +1379,16 @@ class Scenario:
         ego_speed_mps: Initial ego speed.
         cruise_speed_mps: The planner's cruise target.  Defaults to the initial
             ego speed, which is the ordinary "set cruise and drive" case.
-        lead: The lead vehicle script, or None for an empty road.
+        lead: The lead vehicle script, or None for an empty road.  The oracle
+            judges avoidability against this object.
+        others: Any number of ADDITIONAL objects, simulated and reported exactly
+            like the lead.  The plant has accepted them and published
+            ``WorldState.objects``, ``in_path_objects`` and ``min_in_path_gap_m``
+            for several revisions and nothing could reach them, because this
+            class had no field for them: a capability the specification cannot
+            express is not coverage.  Use them for a next-lane vehicle beside a
+            real lead, a queue, or an object the ego must NOT confuse with the
+            one that matters.
         perception: Sensor characteristics.
         road: Road geometry.
         expect: The requirements.
@@ -676,6 +1406,7 @@ class Scenario:
     guards: str = ""
     cruise_speed_mps: Optional[float] = None
     lead: Optional[LeadSpec] = None
+    others: Tuple[LeadSpec, ...] = ()
     perception: PerceptionSpec = PERFECT_PERCEPTION
     road: RoadSpec = field(default_factory=straight_road)
     initial_lateral_offset_m: float = 0.0
@@ -733,6 +1464,24 @@ class ScenarioResult:
             "oracle_last_avoidance_frame": self.verdict.last_avoidance_frame,
             "oracle_hazard_clear_frame": self.verdict.hazard_clear_frame,
             "oracle_avoidable": self.verdict.avoidable,
+            "oracle_earliest_actionable_frame": self.verdict.earliest_actionable_frame,
+            "contact": (
+                {
+                    "frame": self.verdict.contact.frame,
+                    "t_s": _round(self.verdict.contact.t_s),
+                    "gap_m": _round(self.verdict.contact.gap_m),
+                    "closing_mps": _round(self.verdict.contact.closing_mps),
+                    "ego_v_mps": _round(self.verdict.contact.ego_v_mps),
+                    "object_v_mps": _round(self.verdict.contact.object_v_mps),
+                    "label": self.verdict.contact.label,
+                }
+                if self.verdict.contact is not None
+                else None
+            ),
+            "affordable_decision_latency_s": _round(
+                feasibility(self.scenario).affordable_decision_latency_s
+            ),
+            "scenario_feasible": feasibility(self.scenario).feasible,
             "max_commanded_decel_mps2": _round(max(decels) if decels else 0.0),
             "max_primary_decel_mps2": _round(
                 max((r.raw_decel_mps2 for r in self.records), default=0.0)
@@ -793,8 +1542,9 @@ def run(scenario: Scenario, sut: Optional[StackUnderTest] = None) -> ScenarioRes
         road=scenario.road,
         config=cfg,
         initial_lateral_offset_m=scenario.initial_lateral_offset_m,
+        others=tuple(scenario.others),
     )
-    sensor = Sensor(scenario.perception)
+    sensor = Sensor(scenario.perception, cfg)
     system = sut or StackUnderTest(
         cruise_speed_mps=(
             scenario.cruise_speed_mps
@@ -828,12 +1578,23 @@ def run(scenario: Scenario, sut: Optional[StackUnderTest] = None) -> ScenarioRes
             )
         )
         state = plant.step(command.throttle, command.brake, command.steering)
+        if plant.contacted:
+            # THE RUN IS OVER.  The contact frame is kept in the history so the
+            # oracle can read the impact speed off it, and nothing after it is
+            # simulated: two bodies that have collided are not still driving,
+            # and every finding derived from the frames that follow is
+            # arithmetic about a world that does not exist.  Before this,
+            # lead_brakes_6mps2_ego20_at_20m hit the lead at frame 71, ran on to
+            # frame 300, and the report printed a "minimum true gap" of
+            # -38.07 m -- the distance by which the ego had driven THROUGH it.
+            history.append(state)
+            break
 
     exit_commands: List[ControlCommand] = []
     if scenario.terminate_during_run:
         exit_commands = system.shutdown(state.t_s, dt)
 
-    verdict = truth.judge(history, scenario.lead, scenario.road, cfg)
+    verdict = truth.judge(history, scenario.lead, scenario.road, cfg, scenario.perception)
     findings = evaluate(scenario, records, verdict, exit_commands)
     return ScenarioResult(
         scenario=scenario,
@@ -843,6 +1604,210 @@ def run(scenario: Scenario, sut: Optional[StackUnderTest] = None) -> ScenarioRes
         exit_commands=exit_commands,
         findings=findings,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Satisfiability: is this scenario passable by ANY correct system?
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class Feasibility:
+    """Whether a scenario's requirement can be met, and by how much time.
+
+    Computed WITHOUT running the system under test: a neutral ego holds its
+    cruise, the sensor model says when the hazard could first be acted on, and
+    the plant says how long full authority can be deferred and still hold the
+    clearance the scenario demands.  Nothing here depends on what the arbiter
+    does, which is what makes it usable as an acceptance criterion for the
+    harness itself.
+
+    Attributes:
+        name: The scenario's name.
+        required_clearance_m: The clearance the expectation demands (contact,
+            when it only forbids collision).
+        ideal_clearance_m: Best clearance a ZERO-latency system could hold.
+            The arithmetic bound; no system can beat it.
+        best_clearance_m: Best clearance a system that pays the unavoidable
+            latency can hold.  This is the number that matters.
+        earliest_actionable_frame: First frame on which the measurements could
+            support the decision; see
+            :func:`oracle.earliest_actionable_frame`.
+        minimum_latency_s: That frame in seconds -- the reaction time no
+            correct system can get below.
+        total_budget_s: Longest decision latency, measured from frame 0, that
+            still holds ``required_clearance_m``.
+        affordable_decision_latency_s: ``total_budget_s - minimum_latency_s``.
+            THE number: how much time the system has to think, on top of the
+            time the pipeline has already spent.  Negative means the scenario
+            demands a reaction before the information exists, and the only way
+            to pass it is to brake on a prior -- which is the phantom braking
+            this harness punishes elsewhere.  A scenario like that is
+            mis-specified and must be moved or deleted.
+        feasible: ``affordable_decision_latency_s >= 0``.
+    """
+
+    name: str
+    required_clearance_m: float
+    ideal_clearance_m: float
+    best_clearance_m: float
+    earliest_actionable_frame: Optional[int]
+    minimum_latency_s: float
+    total_budget_s: float
+    affordable_decision_latency_s: float
+    feasible: bool
+
+    @property
+    def summary(self) -> str:
+        """One line for the report and for a finding's detail text."""
+        if self.earliest_actionable_frame is None:
+            return "no hazard: nothing to be in time for"
+        return (
+            "requires %.2f m; a zero-latency system holds %.2f m and a real one "
+            "%.2f m. The hazard is first actionable at frame %d (%.3f s: %.3f s "
+            "of sense latency and rate observability), full authority may be "
+            "deferred until %.3f s, so the affordable decision latency is "
+            "%+.3f s"
+            % (
+                self.required_clearance_m,
+                self.ideal_clearance_m,
+                self.best_clearance_m,
+                self.earliest_actionable_frame,
+                self.minimum_latency_s,
+                self.minimum_latency_s,
+                self.total_budget_s,
+                self.affordable_decision_latency_s,
+            )
+        )
+
+
+_FEASIBILITY_CACHE: Dict[Tuple[object, ...], Feasibility] = {}
+
+
+def _neutral_history(scenario: "Scenario") -> List[WorldState]:
+    """The scenario with the ego holding its cruise and commanding nothing.
+
+    The reference trajectory against which "when could this first be known?" is
+    asked, so that the answer is a property of the SCENARIO and not of whatever
+    the system under test happened to do.
+    """
+    plant = Plant(
+        ego_speed_mps=scenario.ego_speed_mps,
+        lead=scenario.lead,
+        road=scenario.road,
+        config=scenario.config,
+        initial_lateral_offset_m=scenario.initial_lateral_offset_m,
+        others=tuple(scenario.others),
+    )
+    out = [plant.state]
+    for _ in range(scenario.frames - 1):
+        out.append(plant.step(0.0, 0.0, 0.0))
+        if plant.contacted:
+            break
+    return out
+
+
+def feasibility(scenario: "Scenario") -> Feasibility:
+    """Whether ``scenario``'s clearance requirement is physically satisfiable.
+
+    Cached per scenario, because the bisection runs about forty full-authority
+    simulations and the answer cannot change between calls.
+    """
+    exp = scenario.expect
+    target = (
+        float(exp.min_clearance_m)
+        if exp.min_clearance_m is not None
+        else (truth.CONTACT_GAP_M + 1e-6 if exp.no_collision else float("-inf"))
+    )
+    key = (scenario.name, scenario.frames, scenario.ego_speed_mps, target)
+    got = _FEASIBILITY_CACHE.get(key)
+    if got is not None:
+        return got
+
+    cfg = scenario.config
+    if scenario.lead is None or not math.isfinite(target):
+        out = Feasibility(
+            name=scenario.name,
+            required_clearance_m=target,
+            ideal_clearance_m=float("inf"),
+            best_clearance_m=float("inf"),
+            earliest_actionable_frame=None,
+            minimum_latency_s=0.0,
+            total_budget_s=float("inf"),
+            affordable_decision_latency_s=float("inf"),
+            feasible=True,
+        )
+        _FEASIBILITY_CACHE[key] = out
+        return out
+
+    history = _neutral_history(scenario)
+    by_frame = {s.frame: s for s in history}
+    actionable = truth.earliest_actionable_frame(history, scenario.perception, cfg)
+    hazard = next((s for s in history if s.lead_present), None)
+    start = by_frame.get(actionable) if actionable is not None else None
+    if hazard is None or start is None:
+        out = Feasibility(
+            name=scenario.name,
+            required_clearance_m=target,
+            ideal_clearance_m=float("inf"),
+            best_clearance_m=float("inf"),
+            earliest_actionable_frame=actionable,
+            minimum_latency_s=0.0,
+            total_budget_s=float("inf"),
+            affordable_decision_latency_s=float("inf"),
+            feasible=True,
+        )
+        _FEASIBILITY_CACHE[key] = out
+        return out
+
+    # The clock starts when the hazard EXISTS and the decision may be taken from
+    # the first frame it can be MEASURED.  Both are properties of the scenario,
+    # not of any system, because the neutral ego holds its cruise throughout.
+    min_latency = max(0.0, (start.frame - hazard.frame) * cfg.dt_s)
+    others = tuple(scenario.others)
+    ideal = truth.full_braking_min_gap(
+        hazard, scenario.lead, scenario.road, cfg, others=others
+    )
+    best = truth.full_braking_min_gap(
+        start, scenario.lead, scenario.road, cfg, others=others
+    )
+    afford = truth.braking_budget_s(
+        start, scenario.lead, scenario.road, cfg, clearance_m=target, others=others
+    )
+    budget = afford + min_latency if math.isfinite(afford) else afford
+    out = Feasibility(
+        name=scenario.name,
+        required_clearance_m=target,
+        ideal_clearance_m=ideal,
+        best_clearance_m=best,
+        earliest_actionable_frame=actionable,
+        minimum_latency_s=min_latency,
+        total_budget_s=budget,
+        affordable_decision_latency_s=afford,
+        feasible=afford >= -1e-9,
+    )
+    _FEASIBILITY_CACHE[key] = out
+    return out
+
+
+SCENARIO_DEFECT_CODES = frozenset(
+    {
+        "no_frames",
+        "collided_unavoidable",
+        "infeasible_clearance",
+        "unactionable_scenario",
+    }
+)
+"""Findings that indict the SCENARIO rather than the system under test.
+
+A harness that reports "you failed to stop" for a stop that no vehicle could
+make is manufacturing bug reports out of its own arithmetic, and it is worse
+than useless: the only way to make such a scenario green is the misbehaviour
+this specification punishes everywhere else -- braking on a prior instead of a
+measurement.  These four codes say so out loud.  They still FAIL the scenario,
+because a mis-specified acceptance case is a defect that has to be fixed; they
+just name the right culprit.
+"""
 
 
 # --------------------------------------------------------------------------- #
@@ -868,38 +1833,107 @@ def evaluate(
         return [Finding("no_frames", "the scenario produced no frames")]
 
     # ---------------------------------------------------------- collision ---
+    ev = verdict.contact
+    impact = (
+        "impact at %.2f m/s (ego %.2f m/s into object %d, %r, at %.2f m/s)"
+        % (ev.closing_mps, ev.ego_v_mps, ev.object_index, ev.label, ev.object_v_mps)
+        if ev is not None
+        else "impact speed not recorded"
+    )
     if exp.no_collision and verdict.collided:
+        feas = feasibility(scenario)
         if verdict.avoidable is False:
             findings.append(
                 Finding(
                     "collided_unavoidable",
-                    "contact at frame %d; the oracle says it was already unavoidable at the "
-                    "first frame the lead was visible, so this scenario is mis-specified"
-                    % verdict.collision_frame,
+                    "contact at frame %d; %s. The oracle says it was ALREADY UNAVOIDABLE on "
+                    "the first frame a real system could have acted (frame %s), so this "
+                    "scenario is mis-specified: %s. Passing it would require braking before "
+                    "the measurement exists, which is the phantom this harness punishes "
+                    "elsewhere -- move the case out or delete it."
+                    % (
+                        verdict.collision_frame,
+                        impact,
+                        verdict.earliest_actionable_frame,
+                        feas.summary,
+                    ),
                 )
             )
         else:
             findings.append(
                 Finding(
                     "collided",
-                    "contact at frame %d (t=%.2f s); full-authority braking was still "
-                    "sufficient up to frame %s"
+                    "contact at frame %d (t=%.2f s); %s. Full-authority braking was still "
+                    "sufficient up to frame %s, and a correct system had %+.3f s of decision "
+                    "latency to spare (%s)."
                     % (
                         verdict.collision_frame,
                         records[min(verdict.collision_frame, len(records) - 1)].t_s,
+                        impact,
                         verdict.last_avoidance_frame,
+                        feas.affordable_decision_latency_s,
+                        feas.summary,
                     ),
                 )
             )
 
-    if exp.min_clearance_m is not None and verdict.min_gap_m < exp.min_clearance_m:
-        findings.append(
-            Finding(
-                "clearance",
-                "minimum true gap %.2f m, required at least %.2f m"
-                % (verdict.min_gap_m, exp.min_clearance_m),
-            )
+    if exp.min_clearance_m is not None:
+        feas = feasibility(scenario)
+        # Two independent questions, and the old code could only ask one.  "Is
+        # this requirement reachable at all?" indicts the SCENARIO; "did the
+        # system get as close to the limit as a correct one would?" indicts the
+        # SYSTEM.  When a requirement is impossible the second question is still
+        # worth asking, but it has to be asked against the reachable clearance
+        # rather than against the impossible one, or every run of a
+        # mis-specified case reports a system failure it did not commit.
+        # In the infeasible branch the comparison is against a THEORETICAL
+        # optimum -- a bang-bang brake committed on the first actionable frame
+        # -- which no closed-loop law can match exactly.  One frame of travel is
+        # conceded, because a shortfall smaller than the harness's own time
+        # quantisation cannot be attributed to the system.
+        reachable = (
+            exp.min_clearance_m
+            if feas.feasible
+            else feas.best_clearance_m - scenario.ego_speed_mps * scenario.config.dt_s
         )
+        if not feas.feasible:
+            findings.append(
+                Finding(
+                    "infeasible_clearance",
+                    "this scenario demands %.2f m of clearance that NO SYSTEM CAN HOLD: %s. "
+                    "The requirement is inside the reaction time of the pipeline the system "
+                    "under test is given, so the only way to satisfy it is to command full "
+                    "authority before the closing rate has been measured -- exactly the "
+                    "unwarranted braking this specification treats as a failure everywhere "
+                    "else. The run itself reached %.2f m. This is a defect in the SCENARIO: "
+                    "move the obstacle out to at least the range at which %.2f m is "
+                    "reachable, or lower the requirement to the %.2f m that is."
+                    % (
+                        exp.min_clearance_m,
+                        feas.summary,
+                        verdict.min_gap_m,
+                        exp.min_clearance_m,
+                        max(0.0, feas.best_clearance_m),
+                    ),
+                )
+            )
+        if verdict.min_gap_m < reachable - 1e-6:
+            findings.append(
+                Finding(
+                    "clearance",
+                    "minimum true gap %.2f m, against the %.2f m %s. %s."
+                    % (
+                        verdict.min_gap_m,
+                        reachable,
+                        "this scenario requires"
+                        if feas.feasible
+                        else "a correct system would still have held here (the %.2f m the "
+                        "scenario asks for is not reachable by anything)"
+                        % exp.min_clearance_m,
+                        feas.summary,
+                    ),
+                )
+            )
 
     # ------------------------------------------------------- intervention ---
     first_emergency_cmd = next(
@@ -915,10 +1949,16 @@ def evaluate(
             if peak_cmd < truth.NEGLIGIBLE_DECEL_MPS2:
                 findings.append(
                     Finding(
-                        "no_response",
+                            "no_response",
                         "a lead was present and closing but the system never commanded even "
-                        "%.1f m/s^2 (peak %.2f m/s^2)"
-                        % (truth.NEGLIGIBLE_DECEL_MPS2, peak_cmd),
+                        "%.1f m/s^2 (peak %.2f m/s^2). The primary path's last plan asked for "
+                        "%.2f m/s (%s)."
+                        % (
+                            truth.NEGLIGIBLE_DECEL_MPS2,
+                            peak_cmd,
+                            records[-1].plan_target_mps,
+                            records[-1].plan_reason or "no reason given",
+                        ),
                     )
                 )
         elif first_emergency_cmd is None:
@@ -943,26 +1983,66 @@ def evaluate(
                         verdict.first_emergency_frame,
                         truth.EMERGENCY_DECEL_MPS2,
                         max(r.commanded_decel_mps2 for r in records),
-                    ),
-                )
-            )
-        elif (
-            verdict.last_avoidance_frame is not None
-            and first_emergency_cmd > verdict.last_avoidance_frame
-        ):
-            findings.append(
-                Finding(
-                    "late_intervention",
-                    "first emergency-grade command at frame %d, %d frames (%.2f s) after the "
-                    "last frame from which full braking still avoided contact (frame %d)"
+                    )
+                    + ". At the first frame the oracle required it, the plan was targeting "
+                    "%.2f m/s (%s)."
                     % (
-                        first_emergency_cmd,
-                        first_emergency_cmd - verdict.last_avoidance_frame,
-                        (first_emergency_cmd - verdict.last_avoidance_frame) * scenario.config.dt_s,
-                        verdict.last_avoidance_frame,
+                        records[
+                            min(verdict.first_emergency_frame or 0, len(records) - 1)
+                        ].plan_target_mps,
+                        records[
+                            min(verdict.first_emergency_frame or 0, len(records) - 1)
+                        ].plan_reason
+                        or "no reason given",
                     ),
                 )
             )
+        elif verdict.last_avoidance_frame is not None:
+            # A command cannot precede the measurement that provokes it.  The
+            # deadline a system can be held to is the LATER of "the last frame
+            # from which braking still works" and "the first frame on which the
+            # hazard could be acted on"; holding it to the earlier of the two is
+            # asking it to be clairvoyant, and it is how a scenario placed 1 m
+            # inside the zero-latency boundary produced a lateness report
+            # against a system that reacted on the very first frame it could.
+            actionable = verdict.earliest_actionable_frame
+            deadline = verdict.last_avoidance_frame
+            if actionable is not None and actionable > deadline:
+                findings.append(
+                    Finding(
+                        "unactionable_scenario",
+                        "full-authority braking stops working after frame %d, but the hazard "
+                        "cannot be acted on before frame %d: there is no frame on which any "
+                        "system could have intervened in time. %s. This is a defect in the "
+                        "SCENARIO, not in the system -- the case has to move to a range where "
+                        "the deadline is later than the first actionable frame, or be deleted."
+                        % (
+                            deadline,
+                            actionable,
+                            feasibility(scenario).summary,
+                        ),
+                    )
+                )
+            elif first_emergency_cmd > deadline:
+                findings.append(
+                    Finding(
+                        "late_intervention",
+                        "first emergency-grade command at frame %d, %d frames (%.2f s) after "
+                        "the last frame from which full braking still avoided contact (frame "
+                        "%d). The hazard was actionable from frame %s, so %s frame(s) of "
+                        "that delay was the system's own."
+                        % (
+                            first_emergency_cmd,
+                            first_emergency_cmd - deadline,
+                            (first_emergency_cmd - deadline) * scenario.config.dt_s,
+                            deadline,
+                            actionable,
+                            (first_emergency_cmd - actionable)
+                            if actionable is not None
+                            else "all",
+                        ),
+                    )
+                )
 
     # ------------------------------------------------------------ phantom ---
     # A vehicle already at a standstill holding its brake is not intervening, and
@@ -971,20 +2051,35 @@ def evaluate(
     # stopped" scores as continuous unjustified braking; without the second, every
     # successful intervention is scored as a phantom on the way out of it, because
     # a brake that works makes its own justification disappear.
-    exempt = _completing_a_warranted_stop(records, verdict)
+    exempt, blind_manoeuvre = _manoeuvre_exemptions(records, verdict)
     phantoms: List[FrameRecord] = []
     unwarranted: List[FrameRecord] = []
+    unwarranted_states: List[FrameRecord] = []
     excessive: List[FrameRecord] = []
     for i, r in enumerate(records):
         if r.true.ego_v_mps <= STANDSTILL_MPS or not r.perception_ok:
             continue
+        if blind_manoeuvre[i]:
+            # A stop the system started because it had gone blind, or the tail
+            # of one still being released now that it can see again.  The oracle
+            # has no requirement to measure it against; the recovery and final
+            # speed assertions are what police it.
+            continue
         quiet = verdict.is_quiet(r.frame) and not exempt[i]
-        emergency_authority = (
-            r.commanded_decel_mps2 >= truth.EMERGENCY_DECEL_MPS2
-            or r.safety_state is SafetyState.MIN_RISK_MANEUVER
-        )
+        # A STATE LABEL WITH NO ACTUATION IS NOT AN INTERVENTION.  These two used
+        # to be one test -- "commanded_decel >= 3.5 OR state is MRM" -- which
+        # diagnosed a reference stack with a phantom brake for entering a state
+        # while commanding nothing.  They are different defects with different
+        # consequences: one decelerates the vehicle and can cause a rear-end
+        # collision behind, the other mis-classifies the world and will hand the
+        # vehicle back or brake on the next frame.  Both are findings; they are
+        # not the same finding.
+        emergency_brake = r.commanded_decel_mps2 >= truth.EMERGENCY_DECEL_MPS2
+        emergency_state = r.safety_state is SafetyState.MIN_RISK_MANEUVER
         if quiet:
-            if emergency_authority:
+            if emergency_state and not emergency_brake:
+                unwarranted_states.append(r)
+            if emergency_brake:
                 phantoms.append(r)
             elif r.commanded_decel_mps2 > truth.HEADWAY_DECEL_ALLOWANCE_MPS2 + 1e-6:
                 # The SUB-EMERGENCY band.  Nothing in the true world required any
@@ -999,12 +2094,17 @@ def evaluate(
 
     if phantoms:
         first = phantoms[0]
+        peak = max(phantoms, key=lambda r: r.commanded_decel_mps2)
         findings.append(
             Finding(
                 "phantom_intervention",
-                "emergency authority on %d frame(s) with no hazard; first at frame %d "
-                "(state=%s, brake=%.2f = %.1f m/s^2, true gap %.1f m, true closing %+.2f m/s, "
-                "true requirement %.2f m/s^2)"
+                "EMERGENCY-GRADE BRAKING ACTUATED on %d frame(s) with no hazard; first at "
+                "frame %d (state=%s, brake=%.2f = %.1f m/s^2, true gap %.1f m, true closing "
+                "%+.2f m/s, true requirement %.2f m/s^2), peak %.2f m/s^2 at frame %d. This "
+                "is the actuated half of the phantom: the vehicle really did decelerate, and "
+                "a follower keeping a 2 s gap and taking 1 s to react can absorb 5 m/s^2 and "
+                "cannot absorb 8, so it does not avoid a collision, it manufactures one "
+                "behind."
                 % (
                     len(phantoms),
                     first.frame,
@@ -1014,6 +2114,42 @@ def evaluate(
                     first.true.gap_m,
                     first.true.closing_mps,
                     verdict.required_decel[first.frame],
+                    peak.commanded_decel_mps2,
+                    peak.frame,
+                ),
+            )
+        )
+
+    if unwarranted_states:
+        first = unwarranted_states[0]
+        peak = max(unwarranted_states, key=lambda r: r.commanded_decel_mps2)
+        findings.append(
+            Finding(
+                "unwarranted_authority_state",
+                "declared %s on %d frame(s) with no hazard and NO EMERGENCY BRAKING to go "
+                "with it; first at frame %d (brake=%.2f = %.1f m/s^2, true gap %.1f m, true "
+                "closing %+.2f m/s, true requirement %.2f m/s^2), hardest command over those "
+                "frames %.2f m/s^2 -- below the %.1f m/s^2 that would make it an "
+                "intervention. This is a mis-classification of the world, not a phantom "
+                "brake: nothing was actuated, so no occupant felt it and no follower was "
+                "endangered by it. It is still a finding, because the state is the system's "
+                "declaration that it has given up on the driving task, and a system that "
+                "declares that for nothing will either hand the vehicle back for nothing or "
+                "start braking for nothing on the next frame. Reported separately from "
+                "phantom_intervention so the two cannot be confused: they have different "
+                "consequences and different fixes. Violations: %s"
+                % (
+                    first.safety_state.value,
+                    len(unwarranted_states),
+                    first.frame,
+                    first.command.brake,
+                    first.commanded_decel_mps2,
+                    first.true.gap_m,
+                    first.true.closing_mps,
+                    verdict.required_decel[first.frame],
+                    peak.commanded_decel_mps2,
+                    truth.EMERGENCY_DECEL_MPS2,
+                    ", ".join(first.violations[:4]) or "none",
                 ),
             )
         )
@@ -1074,6 +2210,24 @@ def evaluate(
         )
 
     # --------------------------------------------------------------- jerk ---
+    # Two rules, both re-derived, because the old one penalised the two things a
+    # correct system does: braking slightly BEFORE the oracle's causal
+    # requirement becomes visible, and letting the brake off briskly afterwards.
+    #
+    #   1. ONLY A RISING DEMAND IS ASSESSED.  Releasing a brake is not a comfort
+    #      hazard, and a ceiling on the release rate contradicts every other
+    #      assertion here that demands an unwarranted deceleration be removed
+    #      promptly.  See :func:`oracle.jerk_is_assessable`.
+    #   2. THE BAND COMES FROM THE DEMAND, not from whether the oracle's
+    #      requirement had already crossed the comfort line in the trailing
+    #      window.  A demand that reaches emergency grade is a collision-
+    #      avoidance action and gets the emergency ceiling whether or not it was
+    #      warranted -- whether it should have existed at all is asked once, by
+    #      the phantom and proportionality findings, and asking it twice through
+    #      the jerk ceiling is what punished early intervention.  Below
+    #      emergency grade the oracle's SYMMETRIC window still opens the
+    #      emergency band, so half a second of anticipation is competence.
+    #      See :func:`oracle.jerk_ceiling_mps3`.
     jerks = commanded_jerk_series(records, scenario.config)
     worst_jerk: Optional[Tuple[int, float, float]] = None
     jerk_frames = 0
@@ -1086,11 +2240,19 @@ def evaluate(
             # Stopped.  A brake demand that changes while the vehicle is already
             # at rest moves nobody's head.
             continue
+        prev_d = records[i - 1].commanded_decel_mps2
+        cur_d = records[i].commanded_decel_mps2
+        if not truth.jerk_is_assessable(prev_d, cur_d):
+            continue
         limit = (
             exp.max_jerk_mps3
             if exp.max_jerk_mps3 is not None
-            else truth.jerk_limit_mps3(
-                verdict.emergency_warranted_at(records[i].frame) or exempt[i]
+            else truth.jerk_ceiling_mps3(
+                prev_d,
+                cur_d,
+                verdict.emergency_warranted_near(records[i].frame)
+                or exempt[i]
+                or blind_manoeuvre[i],
             )
         )
         if jerk > limit + 1e-6:
@@ -1102,14 +2264,17 @@ def evaluate(
         findings.append(
             Finding(
                 "excess_jerk",
-                "the demanded deceleration changed at %.1f m/s^3 at frame %d, above the "
-                "%.1f m/s^3 this situation allows, on %d frame(s). %.1f m/s^3 over a %.0f ms "
-                "frame is a step of %.2f m/s^2 in the demand. The ceiling outside an "
-                "emergency is %.1f m/s^3 (the top of the band a seated occupant does not "
-                "register) and inside one it is %.1f m/s^3 (full %.1f m/s^2 authority "
-                "reached in the 0.4 s a human panic brake takes); braking faster than that "
-                "buys no stopping distance, because the brake actuator's own rise time "
-                "filters it out, and costs a head-toss the occupant cannot brace for."
+                "the demanded deceleration was INCREASED at %.1f m/s^3 at frame %d, above "
+                "the %.1f m/s^3 this situation allows, on %d frame(s). %.1f m/s^3 over a "
+                "%.0f ms frame is a step of %.2f m/s^2 in the demand. The ceiling outside a "
+                "collision-avoidance manoeuvre is %.1f m/s^3 (the top of the band a seated "
+                "occupant does not register) and inside one it is %.1f m/s^3 (full %.1f "
+                "m/s^2 authority reached in the 0.4 s a human panic brake takes); braking "
+                "faster than that buys no stopping distance, because the brake actuator's "
+                "own rise time filters it out, and costs a head-toss the occupant cannot "
+                "brace for. Only increases are counted: letting the brake off is not a "
+                "comfort hazard, and this specification demands elsewhere that an "
+                "unwarranted deceleration be removed promptly."
                 % (
                     jerk_v,
                     frame_i,
@@ -1124,6 +2289,73 @@ def evaluate(
                 )
             )
         )
+
+    # -------------------------------------- forbidden emergency authority ---
+    # ``Expectation.forbid_emergency_intervention`` was declared, set on eight
+    # scenarios, and READ BY NOTHING.  Those eight asserted nothing at all on
+    # this axis for as long as the field existed, which is the worst kind of
+    # defect a test harness can have: a green light with no lamp behind it.
+    # Wired here, and split along the same line as the phantom findings, because
+    # commanding an unwarranted deceleration and declaring an unwarranted state
+    # are different failures.  Unlike the phantom findings this one does not ask
+    # the oracle whether the frame was quiet: the scenario has ALREADY asserted,
+    # in its physics, that no emergency exists anywhere in the run, so any
+    # emergency-grade authority at all is a finding.  It is restricted to
+    # healthy-perception frames because a perception dropout is its own reason
+    # for a minimum-risk manoeuvre, and the scenarios that inject one say so.
+    if exp.forbid_emergency_intervention:
+        healthy = [r for r in records if r.perception_ok]
+        braked = [
+            r for r in healthy if r.commanded_decel_mps2 >= truth.EMERGENCY_DECEL_MPS2
+        ]
+        declared = [r for r in healthy if r.safety_state is SafetyState.MIN_RISK_MANEUVER]
+        if braked:
+            peak = max(braked, key=lambda r: r.commanded_decel_mps2)
+            findings.append(
+                Finding(
+                    "forbidden_emergency_brake",
+                    "this scenario contains no emergency at any frame, and the system "
+                    "commanded emergency-grade deceleration on %d of the %d healthy frame(s); "
+                    "first at frame %d (%.2f m/s^2), peak %.2f m/s^2 at frame %d (true gap "
+                    "%.1f m, true closing %+.2f m/s, true requirement %.2f m/s^2). The ego "
+                    "was dragged from %.2f to %.2f m/s."
+                    % (
+                        len(braked),
+                        len(healthy),
+                        braked[0].frame,
+                        braked[0].commanded_decel_mps2,
+                        peak.commanded_decel_mps2,
+                        peak.frame,
+                        braked[0].true.gap_m,
+                        braked[0].true.closing_mps,
+                        verdict.required_decel[braked[0].frame]
+                        if braked[0].frame < len(verdict.required_decel)
+                        else 0.0,
+                        records[0].true.ego_v_mps,
+                        min(r.true.ego_v_mps for r in records),
+                    ),
+                )
+            )
+        if declared:
+            findings.append(
+                Finding(
+                    "forbidden_emergency_state",
+                    "this scenario contains no emergency at any frame, and the system entered "
+                    "%s on %d of the %d healthy frame(s); first at frame %d, where it "
+                    "commanded %.2f m/s^2 (violations: %s). A minimum-risk manoeuvre is the "
+                    "system's declaration that it can no longer drive; declaring it on a road "
+                    "where nothing is happening is a mis-classification whether or not any "
+                    "brake went with it."
+                    % (
+                        declared[0].safety_state.value,
+                        len(declared),
+                        len(healthy),
+                        declared[0].frame,
+                        declared[0].commanded_decel_mps2,
+                        ", ".join(declared[0].violations[:4]) or "none",
+                    ),
+                )
+            )
 
     # ------------------------------------------------------ pedal conflict ---
     conflicts = [r for r in records if r.pedal_conflict]
@@ -1531,6 +2763,33 @@ present each half with a demand the other half must overrule.
 """
 
 
+def expectation_field_reads() -> Dict[str, int]:
+    """Every :class:`Expectation` field, and how many times ``evaluate`` reads it.
+
+    A field with a count of zero is an assertion that is DECLARED, SET ON REAL
+    SCENARIOS, AND NEVER CHECKED -- a green light with no lamp behind it, and the
+    worst defect a test harness can have, because the scenarios carrying it
+    report success on an axis nothing measured.
+    ``forbid_emergency_intervention`` was in that state on eight scenarios.
+
+    The check is by source inspection of :func:`evaluate` rather than by a
+    hand-maintained registry, on purpose: a registry is another thing to forget
+    to update, and the failure mode being guarded against is precisely
+    forgetting.
+    """
+    import inspect
+
+    body = inspect.getsource(evaluate)
+    return {
+        f.name: body.count("exp." + f.name) for f in dataclass_fields(Expectation)
+    }
+
+
+def unread_expectation_fields() -> List[str]:
+    """Expectation fields ``evaluate`` never reads.  Must be empty."""
+    return sorted(name for name, hits in expectation_field_reads().items() if hits == 0)
+
+
 def commanded_jerk_series(
     records: Sequence[FrameRecord], config: PlantConfig = DEFAULT_PLANT
 ) -> List[Optional[float]]:
@@ -1633,6 +2892,53 @@ def collect_assertable_self_reports(
     return out
 
 
+def _manoeuvre_exemptions(
+    records: Sequence[FrameRecord], verdict: truth.OracleVerdict
+) -> Tuple[List[bool], List[bool]]:
+    """Per frame: ``(inside a warranted stop, inside a blind manoeuvre)``.
+
+    Two different exemptions, kept apart because they mean different things and
+    conflating them turns one into a bug.
+
+    ``warranted``
+        The frame belongs to an unbroken braking run that WAS kinematically
+        warranted when it began.  A correct intervention destroys the evidence
+        for itself -- once the brake has worked the gap stops shrinking and the
+        requirement falls to zero -- so the last frames of every successful stop
+        look exactly like a phantom.  These frames are still judged for
+        PROPORTIONALITY, against the worst requirement in the trailing window,
+        because the requirement they are answering is a real one.
+
+    ``blind``
+        The frame belongs to a braking run that began, or continued, while
+        PERCEPTION WAS DOWN.  A controlled stop under sensor loss is a manoeuvre
+        this specification demands (``source_loss_mid_run`` requires the vehicle
+        to be stopped by the end of it), and it is warranted by the system's
+        blindness rather than by anything in the oracle's kinematics -- which
+        see an empty road.  There is no kinematic requirement to be proportional
+        TO, so these frames are exempt from the proportionality tests outright.
+        Judging them against the 1.5 m/s^2 a headway law may use would make
+        every minimum-risk stop a finding, and the release tail of one a finding
+        for four more frames after perception came back.
+    """
+    warranted = [False] * len(records)
+    blind = [False] * len(records)
+    run_warranted = False
+    run_blind = False
+    for i, r in enumerate(records):
+        if r.command.brake > 0.05 or not r.perception_ok:
+            if verdict.warranted_at(r.frame):
+                run_warranted = True
+            if not r.perception_ok:
+                run_blind = True
+        else:
+            run_warranted = False
+            run_blind = False
+        warranted[i] = run_warranted
+        blind[i] = run_blind
+    return warranted, blind
+
+
 def _completing_a_warranted_stop(
     records: Sequence[FrameRecord], verdict: truth.OracleVerdict
 ) -> List[bool]:
@@ -1647,6 +2953,13 @@ def _completing_a_warranted_stop(
 
     A run ends when the command releases the brake below 0.05 (0.4 m/s^2, which
     is inside the noise of a jerk-limited release).
+
+    A braking run that began while PERCEPTION WAS DOWN counts as warranted too.
+    A controlled stop under sensor loss is a manoeuvre the specification demands
+    (``source_loss_mid_run`` requires the vehicle to be stopped by the end of
+    it), and it is warranted by the system's blindness rather than by anything
+    in the oracle's kinematics -- which see an empty road and would score every
+    frame of it as a phantom.
     """
     out = [False] * len(records)
     run_start: Optional[int] = None
@@ -1656,7 +2969,7 @@ def _completing_a_warranted_stop(
             if run_start is None:
                 run_start = i
                 run_warranted = False
-            if verdict.warranted_at(r.frame):
+            if verdict.warranted_at(r.frame) or not r.perception_ok:
                 run_warranted = True
         else:
             run_start = None

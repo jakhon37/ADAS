@@ -339,7 +339,10 @@ class SweepGrid:
 #: outside) a failure region reports its width as zero or as the width of the
 #: grid, and both are wrong.
 #:
-#: Measured boundaries the range axes straddle (see ``docs/SAFETY_SWEEP.md``):
+#: Measured boundaries the range axes straddle (see ``docs/SAFETY_SWEEP.md``).
+#: All of them were RE-MEASURED after the ``velocity_mps`` contract fix (see
+#: :func:`closing_mps`); every one is unchanged, because none of the three
+#: committed arbiters reads that field.
 #:
 #: * constant-range phantom on 25e3ba5 -- fires up to 43 m at 20 m/s, 26 m at
 #:   15 m/s, 66 m at 25 m/s, and not at all beyond; hence 26/32/40/44/52/70.
@@ -348,16 +351,38 @@ class SweepGrid:
 #: * stationary lead -- the plant's own full-authority stop is 14.70 m at
 #:   15 m/s, 25.85 m at 20 m/s and 40.13 m at 25 m/s, so contact closer than
 #:   that is arithmetic; hence 12/16/26/40/44.
+#: * the FAR edge, added in this revision because the tool itself reported two
+#:   regions running off the top of the axis ("EARLY for range 16-70 at ego
+#:   20 m/s ... the real boundary is beyond 70 m").  Both were measured, and
+#:   both are real boundaries rather than artefacts:
 #:
-#: ``fast`` is the CI resolution: 96 cells, about ten seconds, and it contains a
-#: straddling pair for every boundary above.  ``standard`` is the default and
-#: adds the low and high ends of the envelope and the intermediate closing
-#: rates.  ``dense`` halves the ego and range steps for boundary-finding by hand.
+#:   - EARLY against a lead 8 m/s slower, no lead braking, 8 s window: the
+#:     arbiter stops firing inside the window at **82 m at 20 m/s and 89 m at
+#:     25 m/s** (identical on both broken commits); hence 80 inside and 90
+#:     outside on the ``fast`` axis.  At the 12 s window of ``standard`` the
+#:     same edge moves out to 120 m at 20 m/s and between 120 and 140 m at
+#:     25-30 m/s, so ``standard`` carries 120 inside and 150 outside.
+#:   - LATE at ego 25 m/s against a lead braking at 6 m/s^2, 8 s window: the
+#:     last late cell is **76 m at rate +0 and 70 m at rate -8**; hence 70
+#:     inside and 80 outside.
+#:   - BAND_UNWARRANTED at ego 10 m/s against a lead braking at 6 m/s^2, 12 s
+#:     window: held from 16 m out to **between 120 and 140 m**; hence 120
+#:     inside and 150 outside on ``standard``.
+#:
+#: Nothing on any axis now runs off the top of the grid on either broken
+#: commit, so every failure region the tool reports is bounded on both sides
+#: and its width is a measurement rather than the width of the grid.
+#:
+#: ``fast`` is the CI resolution: 120 cells, about fifteen seconds, and it
+#: contains a straddling pair for every boundary above.  ``standard`` is the
+#: default and adds the low and high ends of the envelope and the intermediate
+#: closing rates.  ``dense`` halves the ego and range steps for boundary-finding
+#: by hand.
 PROFILES: Dict[str, "SweepGrid"] = {
     "fast": SweepGrid(
         name="fast",
         ego_speeds_mps=(15.0, 20.0, 25.0),
-        ranges_m=(12.0, 16.0, 26.0, 32.0, 40.0, 44.0, 52.0, 70.0),
+        ranges_m=(12.0, 16.0, 26.0, 32.0, 40.0, 44.0, 52.0, 70.0, 80.0, 90.0),
         relative_rates_mps=(0.0, -8.0),
         lead_decels_mps2=(0.0, 6.0),
         horizon_s=8.0,
@@ -367,7 +392,7 @@ PROFILES: Dict[str, "SweepGrid"] = {
         ego_speeds_mps=(5.0, 10.0, 15.0, 20.0, 25.0, 30.0),
         ranges_m=(
             5.0, 8.0, 12.0, 16.0, 20.0, 26.0, 30.0, 32.0, 40.0, 43.0, 44.0,
-            52.0, 60.0, 70.0, 80.0,
+            52.0, 60.0, 70.0, 80.0, 90.0, 120.0, 150.0,
         ),
         relative_rates_mps=(3.0, 0.0, -1.0, -2.0, -4.0, -8.0, -15.0),
         lead_decels_mps2=(0.0, 6.0),
@@ -378,7 +403,7 @@ PROFILES: Dict[str, "SweepGrid"] = {
         ranges_m=(
             4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 14.0, 15.0, 16.0, 18.0, 20.0, 22.0,
             25.0, 26.0, 27.0, 28.0, 29.0, 30.0, 32.0, 35.0, 40.0, 42.0, 43.0,
-            44.0, 45.0, 52.0, 60.0, 66.0, 70.0, 80.0,
+            44.0, 45.0, 52.0, 60.0, 66.0, 70.0, 80.0, 90.0, 100.0, 120.0, 150.0,
         ),
         relative_rates_mps=(3.0, 0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -11.0, -15.0),
         lead_decels_mps2=(0.0, 3.0, 6.0),
@@ -704,21 +729,78 @@ class _Adas(object):
         self.TrackedObject = TrackedObject
 
 
+def closing_mps(ego_v: float, lead_v: float) -> float:
+    """The quantity ``TrackedObject.velocity_mps`` is defined to carry.
+
+    The production contract is stated at ``adas.tracking.tracker`` (see
+    ``MultiObjectTracker._to_tracked_object`` and ``time_to_collision_s``):
+    ``velocity_mps`` is a **range rate with the positive-when-closing
+    convention** -- the negated derivative of the measured range -- and NOT the
+    lead's absolute speed over the ground.  A camera measures range; it has no
+    way to know a lead's ground speed at all, and every consumer downstream
+    divides this number into a gap to get a time.
+
+    Until this function existed the sweep put ``lead_v`` (the lead's absolute
+    speed) straight into that field, so on the cell that matters most -- a
+    matched-speed follow, true closing rate exactly zero -- the arbiter was
+    handed "closing at 20 m/s" and a TTC of one second.  That is not a
+    measurement of the scene the oracle graded; it is a different scene, and
+    the numbers the gate printed for it were partly a measurement of the
+    harness.  The plant's own sensor model has always reported the same
+    quantity (``Sensor._tracks_injected`` differentiates measured range); this
+    makes the sweep agree with it.
+
+    Args:
+        ego_v: Ego ground speed, m/s.
+        lead_v: Lead ground speed, m/s.
+
+    Returns:
+        ``ego_v - lead_v``: positive while the gap shrinks, negative while it
+        opens.
+    """
+    return float(ego_v) - float(lead_v)
+
+
+def _ttc_s(gap_m: float, closing: float) -> float:
+    """Contact time for a gap and a positive-when-closing rate, seconds.
+
+    The same degenerate cases the production tracker declares in
+    ``time_to_collision_s``: an opening or negligible closure is ``inf`` ("not
+    closing"), never a huge finite number that reads as a real time to a
+    downstream threshold, and a gap already at zero is ``0.0``.  A pure contact
+    time, with no standstill gap subtracted -- consumers that want one subtract
+    it themselves.
+    """
+    if closing <= 1e-3:
+        return float("inf")
+    if gap_m <= 0.0:
+        return 0.0
+    return gap_m / closing
+
+
 def _context(api: _Adas, spec: SweepSpec, frame: int, ego_v: float, gap: float, lead_v: float):
     """One :class:`SafetyContext` for a single in-path lead.
 
     The bounding box comes from :func:`tests.scenarios.plant.render_box`, the
     same projection the scenario suite uses, so the arbiter's image-space
     in-path gate sees geometry consistent with the range it is given.
+
+    ``velocity_mps`` and ``ttc_s`` are filled from :func:`closing_mps` and
+    :func:`_ttc_s`, so the three numbers on the track (range, range rate, time
+    to contact) are mutually consistent and all three mean what the production
+    stack defines them to mean.  ``lead_v`` is the lead's ground speed and is
+    converted here; it is deliberately not passed through raw.
     """
+    closing = closing_mps(ego_v, lead_v)
     track = api.TrackedObject(
         track_id=1,
         box=render_box(gap),
-        velocity_mps=lead_v,
+        velocity_mps=closing,
         distance_m=max(0.3, gap),
         age_frames=frame + 1,
         hits=frame + 1,
         time_since_update=0,
+        ttc_s=_ttc_s(gap, closing),
         in_ego_lane=True,
     )
     return api.SafetyContext(

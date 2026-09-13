@@ -40,9 +40,33 @@ not over one hard-coded name:
 
 A family survives the scenario renames and re-parameterisations that moving a
 case onto its failure boundary requires; a hard-coded name turns this file into
-something people delete.  What a family cannot survive is the family being
-emptied or moved off the boundary, which is exactly the failure this test is
-here to catch, so an empty family is a failure and not a skip.
+something people delete.
+
+But a family ON ITS OWN IS NOT ENOUGH, and this file used to contain only
+families.  Verified by mutation: moving the whole ``constant_range`` family off
+the phantom boundary to 55/60/65/68 m left ``pytest tests/test_backtest.py`` at
+"8 passed", because the family check is satisfied by ANY member reporting ANY of
+the required codes, and at 55 m the phantom commit still tripped the softer
+``unwarranted_brake``.  A regression test that survives the exact regression it
+exists to prevent is decoration.
+
+So every commit now also carries PINS:
+
+``required_by_scenario``
+    named scenario -> the diagnosis it must report.  Pins the case AND the
+    diagnosis, so renaming, deleting or moving one fails by name.
+``forbidden_by_scenario``
+    named scenario -> diagnoses it must NOT report.  This is the other edge of
+    the boundary, and it was missing entirely.  "The phantom stops at 43 m" is a
+    statement about ``constant_range_52m`` PASSING just as much as about
+    ``constant_range_40m`` failing, and a family that fails everywhere has
+    measured the grid rather than the defect.
+``min_caught``
+    how many family members must catch it, not merely one.
+
+The three mutations this arrangement was verified against, each run as a real
+edit followed by ``pytest tests/test_backtest.py``, are recorded in
+``tests/test_backtest.py``.
 
 Run it directly::
 
@@ -122,6 +146,31 @@ class BrokenCommit:
         required_any: The family must report at least one of these codes.
         min_family_size: Fewest scenarios the family must contain.  An empty or
             gutted family is a FAILURE: it means the coverage was deleted.
+        min_caught: Fewest family members that must report one of
+            ``required_any``.  The family check alone accepted ONE member
+            catching something, which is why moving the whole family off its
+            boundary survived it: a single case still tripped a softer
+            diagnosis and the count of one was met.
+        required_by_scenario: ``(scenario name, codes)`` pairs. Each NAMED
+            scenario must report at least one of those codes. This is the
+            assertion a prefix cannot make -- it pins the case AND the
+            diagnosis, so a scenario that is renamed, deleted or moved off the
+            boundary fails here by name rather than being silently covered for
+            by a sibling.
+        forbidden_by_scenario: ``(scenario name, codes)`` pairs. Each named
+            scenario must report NONE of those codes. This is the other half of
+            a boundary and the half that was missing: a family that catches the
+            defect everywhere is not measuring a boundary, it is measuring the
+            grid. ``constant_range_52m`` passing on the phantom commit is as
+            much a part of "the phantom stops at 43 m" as
+            ``constant_range_40m`` failing.
+
+    Measured on this plant, and the reason the pins are the pins they are:
+
+    * ``25e3ba5`` -- ``constant_range`` at 12/20/30/40 m all report
+      ``phantom_intervention``; at 52 m and 70 m both PASS outright.
+    * ``1ce4886`` -- ``lead_brakes_6mps2_ego20_at`` 16/20/26 m all report
+      ``collided``; 32 m reports ``clearance`` and does NOT collide.
     """
 
     sha: str
@@ -131,6 +180,9 @@ class BrokenCommit:
     family_prefix: str
     required_any: FrozenSet[str]
     min_family_size: int = 2
+    min_caught: int = 1
+    required_by_scenario: Tuple[Tuple[str, FrozenSet[str]], ...] = ()
+    forbidden_by_scenario: Tuple[Tuple[str, FrozenSet[str]], ...] = ()
 
 
 KNOWN_BROKEN: Tuple[BrokenCommit, ...] = (
@@ -148,6 +200,19 @@ KNOWN_BROKEN: Tuple[BrokenCommit, ...] = (
         ),
         family_prefix="constant_range",
         required_any=PHANTOM_CODES,
+        min_caught=4,
+        required_by_scenario=(
+            ("constant_range_12m", frozenset({"phantom_intervention"})),
+            ("constant_range_20m", frozenset({"phantom_intervention"})),
+            ("constant_range_30m", frozenset({"phantom_intervention"})),
+            ("constant_range_40m", frozenset({"phantom_intervention"})),
+            ("noisy_range_40m_030m_noise", frozenset({"phantom_intervention"})),
+            ("out_of_lane_vehicle_at_12m", frozenset({"phantom_intervention"})),
+        ),
+        forbidden_by_scenario=(
+            ("constant_range_52m", PHANTOM_CODES),
+            ("constant_range_70m", PHANTOM_CODES),
+        ),
     ),
     BrokenCommit(
         sha="1ce4886",
@@ -161,6 +226,24 @@ KNOWN_BROKEN: Tuple[BrokenCommit, ...] = (
         ),
         family_prefix="lead_brakes_6mps2",
         required_any=COLLISION_CODES,
+        min_caught=5,
+        required_by_scenario=(
+            ("lead_brakes_6mps2_ego20_at_16m", frozenset({"collided"})),
+            ("lead_brakes_6mps2_ego20_at_20m", frozenset({"collided"})),
+            ("lead_brakes_6mps2_ego20_at_26m", frozenset({"collided"})),
+            ("lead_brakes_6mps2_ego25_at_30m", frozenset({"collided"})),
+            # The sensitivity control, and the only pin whose diagnosis depends
+            # on a THRESHOLD rather than on contact.  1ce4886 does not collide
+            # at 32 m -- it clears by 2.22 m in the sweep and still finishes
+            # inside the 2.0 m this specification requires -- so it must report
+            # ``clearance`` and must not report ``collided``.  Weakening
+            # REQUIRED_CLEARANCE_M is therefore a mutation this backtest can
+            # see, which is the property it lacked before.
+            ("lead_brakes_6mps2_ego20_at_32m", frozenset({"clearance"})),
+        ),
+        forbidden_by_scenario=(
+            ("lead_brakes_6mps2_ego20_at_32m", frozenset({"collided"})),
+        ),
     ),
 )
 """The commits this harness must still catch.  Do not shorten this tuple."""
@@ -462,6 +545,12 @@ class BacktestOutcome:
     """Family member -> the required codes it reported."""
     missed: List[str] = field(default_factory=list)
     """Family members that reported none of the required codes."""
+    pinned_ok: List[str] = field(default_factory=list)
+    """Named scenarios that reported the exact diagnosis pinned for them."""
+    pinned_failures: List[str] = field(default_factory=list)
+    """Named scenarios that did NOT: gone, renamed, or no longer diagnosing."""
+    straddle_failures: List[str] = field(default_factory=list)
+    """Named scenarios OUTSIDE the failure region that reported it anyway."""
     problem: str = ""
 
     @property
@@ -490,6 +579,24 @@ class BacktestOutcome:
                 "    missed  %-34s %s"
                 % (name, ", ".join(self.run.findings.get(name, [])) or "PASSED")
             )
+        if self.commit.required_by_scenario:
+            lines.append(
+                "  pinned scenarios (each must report its own diagnosis, by name):"
+            )
+            for name in self.pinned_ok:
+                lines.append("    PINNED  %s" % name)
+            for detail in self.pinned_failures:
+                lines.append("    BROKEN  %s" % detail)
+        if self.commit.forbidden_by_scenario:
+            lines.append(
+                "  straddle scenarios (outside the region; must NOT report it):"
+            )
+            for name, codes in self.commit.forbidden_by_scenario:
+                bad = [d for d in self.straddle_failures if d.startswith(name)]
+                lines.append(
+                    "    %s  %s"
+                    % ("BROKEN " if bad else "CLEAN  ", bad[0] if bad else name)
+                )
         if self.problem:
             lines += ["", "  PROBLEM: %s" % self.problem, "", "  what this commit is known for:"]
             lines.append("    " + self.commit.measured)
@@ -535,18 +642,84 @@ def backtest_commit(
             outcome.caught[name] = hit
         else:
             outcome.missed.append(name)
-    if not outcome.caught:
-        outcome.problem = (
-            "not one of the %d scenario(s) in the %r family reported any of %s against an "
-            "arbiter measured to be broken in exactly that way. The harness has stopped "
-            "being a specification: either the scenarios have drifted off the failure "
-            "boundary, or the detector for these diagnoses no longer fires."
+
+    # --- the pins ---------------------------------------------------------- #
+    # Checked before the family count, because they are the specific statement
+    # and the family count is the fallback.  A failure here names the scenario
+    # and the diagnosis, which is the whole reason the pins exist: "the family
+    # caught something" survived moving the entire family off its boundary.
+    for name, codes in commit.required_by_scenario:
+        if name not in run.findings:
+            outcome.pinned_failures.append(
+                "%s is NOT IN THE LIBRARY at all (renamed or deleted); it was pinned "
+                "here because it is the case that reports %s on %s"
+                % (name, "/".join(sorted(codes)), commit.sha)
+            )
+            continue
+        hit = sorted(set(run.findings[name]) & codes)
+        if hit:
+            outcome.pinned_ok.append(name)
+        else:
+            outcome.pinned_failures.append(
+                "%s reported %s but NOT any of %s"
+                % (
+                    name,
+                    ", ".join(sorted(run.findings[name])) or "nothing (it PASSED)",
+                    "/".join(sorted(codes)),
+                )
+            )
+    for name, codes in commit.forbidden_by_scenario:
+        if name not in run.findings:
+            outcome.straddle_failures.append(
+                "%s is NOT IN THE LIBRARY at all; it is the case OUTSIDE the failure "
+                "region, and without it the region has no measured upper edge" % name
+            )
+            continue
+        hit = sorted(set(run.findings[name]) & codes)
+        if hit:
+            outcome.straddle_failures.append(
+                "%s reported %s, but it sits OUTSIDE the measured failure region and "
+                "must not" % (name, ", ".join(hit))
+            )
+
+    problems: List[str] = []
+    if outcome.pinned_failures:
+        problems.append(
+            "%d pinned scenario(s) no longer produce the diagnosis they were pinned "
+            "for on %s (%s). A prefix-matched family cannot say this: it is satisfied "
+            "by ANY member catching ANYTHING, which is how moving the whole "
+            "constant_range family from 12/20/30/40 m to 55/60/65/68 m once left this "
+            "backtest green. Do not adjust the pins; the change that made this red "
+            "either moved a scenario off its boundary or broke a detector.\n      %s"
             % (
+                len(outcome.pinned_failures),
+                commit.sha,
+                commit.label,
+                "\n      ".join(outcome.pinned_failures),
+            )
+        )
+    if outcome.straddle_failures:
+        problems.append(
+            "%d scenario(s) OUTSIDE the measured failure region reported it anyway. A "
+            "boundary needs both edges: a family that fails everywhere has measured "
+            "the grid, not the defect.\n      %s"
+            % (len(outcome.straddle_failures), "\n      ".join(outcome.straddle_failures))
+        )
+    if len(outcome.caught) < commit.min_caught:
+        problems.append(
+            "only %d of the %d scenario(s) in the %r family reported any of %s, and %d "
+            "are required. The harness has stopped being a specification: either the "
+            "scenarios have drifted off the failure boundary, or the detector for these "
+            "diagnoses no longer fires."
+            % (
+                len(outcome.caught),
                 len(outcome.family),
                 commit.family_prefix,
                 ", ".join(sorted(commit.required_any)),
+                commit.min_caught,
             )
         )
+    outcome.problem = "\n  PROBLEM: ".join(problems)
     return outcome
 
 

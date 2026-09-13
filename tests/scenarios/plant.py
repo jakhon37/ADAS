@@ -76,6 +76,19 @@ the defect cannot be a specification against it.
    range filtering, Hungarian association, M-of-N confirmation and the tracker's
    own ego-lane decision are all exercised.  Still CPU-only: the tracker imports
    numpy and nothing else.
+
+Contact ends the run
+--------------------
+:meth:`Plant.step` detects footprint overlap, records a :class:`ContactEvent`
+carrying the impact speed, and FREEZES: every later call returns the same state
+and nothing is integrated.  Two bodies that have collided are not still driving,
+and a simulator that pretends otherwise produces findings about a world that
+does not exist -- ``lead_brakes_6mps2_ego20_at_20m`` used to hit the lead at
+frame 71, run on to frame 300, and report a "minimum true gap" of -38.07 m.
+
+Contact is footprint overlap (``present and in_ego_path and gap <= 0``), not a
+negative lead gap, so a lead that changes lane and is overtaken is not scored as
+a collision.
 """
 
 from __future__ import annotations
@@ -197,6 +210,17 @@ default lateral footprint used by the in-path test."""
 
 EGO_HALF_WIDTH_M = 0.9
 """Half the ego's own width, metres.  Half of :data:`CAR_WIDTH_M`."""
+
+CONTACT_GAP_M = 0.0
+"""Bumper-to-bumper gap at which contact occurs, metres.
+
+The gap this plant reports is already clear distance between bumpers, so zero
+is contact and there is no vehicle-length term to subtract.  It lives here
+rather than in the oracle because it is a statement about the WORLD -- two
+bodies cannot occupy the same metre of road -- and because the plant is the
+thing that has to stop simulating when it happens.  :mod:`tests.scenarios.oracle`
+re-exports it under the same name.
+"""
 
 LANE_WIDTH_M = 3.5
 """Lane width, metres.  The narrow end of a motorway lane (3.5-3.75 m), chosen
@@ -644,6 +668,43 @@ def constant_bend(radius_m: float, sign: float = 1.0) -> RoadSpec:
 
 
 @dataclass(frozen=True)
+class ContactEvent:
+    """The moment two footprints overlapped.  Ground truth, recorded once.
+
+    A simulator that keeps integrating after contact is not modelling anything:
+    the bodies have collided, the gap is meaningless, and every number derived
+    from the frames that follow is arithmetic about a world that does not exist.
+    Before this existed, ``lead_brakes_6mps2_ego20_at_20m`` hit the lead at
+    frame 71 and ran on to frame 300, and the report printed "minimum true gap
+    -38.07 m" -- the distance by which the ego had driven THROUGH the lead.
+
+    Attributes:
+        frame: The frame on which the overlap first existed.
+        t_s: Simulation time of that frame.
+        gap_m: The (non-positive) clear distance at that frame.  It is not
+            exactly zero because contact is detected at the end of the step
+            that crossed it; the overshoot is bounded by one step of closure.
+        closing_mps: ``ego_v - object_v`` at contact -- the impact speed, and
+            the number that says how bad it was.  A 0.2 m/s nudge and a 12 m/s
+            impact are both "contact" and they are not the same event.
+        ego_v_mps, object_v_mps: The two speeds at contact.
+        object_index: Index of the object struck, 0 for the lead.
+        label: That object's label.
+        is_lead: Whether the object struck was the scenario's designated lead.
+    """
+
+    frame: int
+    t_s: float
+    gap_m: float
+    closing_mps: float
+    ego_v_mps: float
+    object_v_mps: float
+    object_index: int
+    label: str
+    is_lead: bool
+
+
+@dataclass(frozen=True)
 class ObjectState:
     """The true state of one object at one frame.
 
@@ -757,6 +818,12 @@ class WorldState:
     accel_demand_mps2: float = 0.0
     """The acceleration the applied pedals demanded, before actuator lag."""
 
+    contact: Optional[ContactEvent] = None
+    """Set on the ONE frame at which contact was first detected, else None.
+
+    The plant stops advancing after this frame; see :meth:`Plant.step`.
+    """
+
     @property
     def gap_m(self) -> float:
         """True bumper-to-bumper clear distance to the LEAD, or +inf when there
@@ -798,6 +865,39 @@ def _in_lane(lateral_m: float, half_width_m: float) -> bool:
 def _in_path(lateral_m: float, half_width_m: float, ego_lateral_m: float) -> bool:
     """Footprint overlap between an object and the ego's own swept corridor."""
     return abs(lateral_m - ego_lateral_m) <= EGO_HALF_WIDTH_M + half_width_m
+
+
+def first_contact(state: WorldState) -> Optional[ContactEvent]:
+    """The contact in ``state``, or None.
+
+    Contact is FOOTPRINT OVERLAP, not a negative lead gap: an object the ego has
+    driven past in another lane has a negative gap and has not been hit, and a
+    scenario in which the lead changes lane and the ego overtakes it must not be
+    scored as a collision.  The test is therefore ``present and in_ego_path and
+    gap <= 0``, evaluated over every object, and the nearest qualifying one wins
+    because that is the one the bumper reached first.
+    """
+    hit: Optional[ObjectState] = None
+    for obj in state.objects:
+        if not obj.present or not obj.in_ego_path:
+            continue
+        if obj.gap_m > CONTACT_GAP_M:
+            continue
+        if hit is None or obj.gap_m > hit.gap_m:
+            hit = obj
+    if hit is None:
+        return None
+    return ContactEvent(
+        frame=state.frame,
+        t_s=state.t_s,
+        gap_m=hit.gap_m,
+        closing_mps=state.ego_v_mps - hit.v_mps,
+        ego_v_mps=state.ego_v_mps,
+        object_v_mps=hit.v_mps,
+        object_index=hit.index,
+        label=hit.label,
+        is_lead=hit.is_lead,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -856,6 +956,12 @@ class Plant:
         self._obj_a = [0.0] * len(self._specs)
 
         self._alpha_cache: Dict[Tuple[float, float], float] = {}
+        self.contact: Optional[ContactEvent] = None
+        """The contact this run ended at, or None while the run is still real.
+
+        Set once, by :meth:`step`, and never cleared: a collision is not a
+        transient.
+        """
         self._cmd_queue: List[Tuple[float, float, float]] = []
         self.pedal_conflict_frames: List[int] = []
         """Frames on which the ISSUED command asked for throttle and brake at
@@ -880,6 +986,16 @@ class Plant:
             throttle_cut=False,
             accel_demand=0.0,
         )
+        # A scenario may be born in contact (an obstacle placed at zero range).
+        # That is a mis-specified scenario, not a run, and it must be visible as
+        # contact at frame 0 rather than as a run that starts by reversing out.
+        self.contact = first_contact(self._state)
+        self._state.contact = self.contact
+
+    @property
+    def contacted(self) -> bool:
+        """True once contact has occurred and the run has stopped advancing."""
+        return self.contact is not None
 
     # -------------------------------------------------------------- helpers
 
@@ -1041,6 +1157,11 @@ class Plant:
             throttle_cut=state.throttle_cut_by_brake,
             accel_demand=state.accel_demand_mps2,
         )
+        # A counterfactual resumed from a contact frame would be frozen before
+        # it began; the caller is asking "what if it had braked HERE", and here
+        # is by construction a frame the run actually reached.
+        plant.contact = first_contact(plant._state)
+        plant._state.contact = plant.contact
         return plant
 
     @property
@@ -1070,8 +1191,16 @@ class Plant:
                 overrunning frame without the caller doing anything.
 
         Returns:
-            The new :class:`WorldState`.
+            The new :class:`WorldState`.  Once :attr:`contact` is set the world
+            is FROZEN: the same state comes back from every subsequent call and
+            nothing is integrated.  Two bodies that have collided do not carry
+            on driving, and a harness that lets them produces findings about a
+            world that does not exist -- a "minimum true gap" of -38 m is the
+            distance by which the ego drove through the lead, not a measurement.
+            Callers that want to stop looping should test :attr:`contacted`.
         """
+        if self.contact is not None:
+            return self._state
         cfg = self.config
         s = self._state
         dt = float(dt_s) if dt_s is not None else self.dt_for_frame(s.frame)
@@ -1153,7 +1282,7 @@ class Plant:
         heading = s.heading_err_rad + (yaw_rate - v_mid * kappa) * dt
         lateral = s.lateral_offset_m - v_mid * math.sin(heading) * dt
 
-        self._state = self._compose(
+        new_state = self._compose(
             frame=s.frame + 1,
             t_s=t_next,
             dt_s=dt,
@@ -1170,7 +1299,10 @@ class Plant:
             throttle_cut=throttle_cut,
             accel_demand=demand,
         )
-        return self._state
+        self.contact = first_contact(new_state)
+        new_state.contact = self.contact
+        self._state = new_state
+        return new_state
 
 
 # --------------------------------------------------------------------------- #
@@ -1512,6 +1644,69 @@ class _RangeHistory:
         return -(num / den)
 
 
+def captured_state(
+    buffer: Sequence[WorldState], now: WorldState, sense_latency_s: float
+) -> WorldState:
+    """The buffered true state the measurements taken at ``now`` describe.
+
+    The capture instant is ``now.t_s - sense_latency_s``, quantised to the
+    nearest frame actually in the buffer -- which is what a camera does: it
+    cannot expose between frames.  Quantising by nearest rather than by floor
+    keeps a 55 ms latency at exactly one frame on a 50 ms grid instead of
+    rounding it up to two, and lets it stretch to two frames on its own once the
+    frame period grows past 110 ms.
+
+    Before the buffer is deep enough (the first frames of a run) the oldest
+    available state is used.  A real pipeline's first command likewise acts on
+    its first image, however old that is by the time it arrives.  The
+    consequence is worth stating because the oracle depends on it: on a 50 ms
+    grid decision frames 0 AND 1 both read capture 0, and only from frame 2 does
+    the pipeline settle into a steady one-frame lag.  A quantity that needs two
+    DISTINCT captures -- a range rate, for instance -- therefore cannot exist
+    before decision frame 2, and no correct system can act on one earlier.
+    """
+    lat = float(sense_latency_s)
+    if lat <= 0.0 or len(buffer) < 2:
+        return buffer[-1]
+    target = now.t_s - lat
+    best = buffer[0]
+    best_err = abs(best.t_s - target)
+    for s in buffer:
+        err = abs(s.t_s - target)
+        if err <= best_err:
+            best, best_err = s, err
+    return best
+
+
+def capture_buffer_depth(sense_latency_s: float, config: PlantConfig = DEFAULT_PLANT) -> int:
+    """Frames of capture history a sensor with this latency has to keep."""
+    nominal = config.dt_s if config.dt_s > 0 else DT_S
+    return max(4, int(math.ceil(float(sense_latency_s) / nominal)) + 4)
+
+
+def capture_frames(
+    history: Sequence[WorldState],
+    spec: "PerceptionSpec",
+    config: PlantConfig = DEFAULT_PLANT,
+) -> List[int]:
+    """For each decision frame in ``history``, the frame its measurements show.
+
+    The same quantisation :class:`Sensor` applies, factored out so the oracle
+    can ask "when could this first have been KNOWN?" without instantiating a
+    sensor and paying for detection, tracking and lane fitting.  Returns a list
+    the same length as ``history``.
+    """
+    depth = capture_buffer_depth(spec.sense_latency_s, config)
+    buf: List[WorldState] = []
+    out: List[int] = []
+    for st in history:
+        buf.append(st)
+        while len(buf) > depth:
+            del buf[0]
+        out.append(captured_state(buf, st, spec.sense_latency_s).frame)
+    return out
+
+
 class Sensor:
     """Turns true :class:`WorldState` into an :class:`Observation`.
 
@@ -1550,8 +1745,7 @@ class Sensor:
         self._tracker = None  # built lazily; see _real_tracker
         self._last_capture_frame: Optional[int] = None
         self._last_tracks: List[TrackedObject] = []
-        nominal = config.dt_s if config.dt_s > 0 else DT_S
-        self._buffer_depth = max(4, int(math.ceil(spec.sense_latency_s / nominal)) + 4)
+        self._buffer_depth = capture_buffer_depth(spec.sense_latency_s, config)
         """Frames of capture history kept.  The delay needs
         ``ceil(latency/dt)`` of them; the rest is headroom for a schedule with
         frames shorter than nominal."""
@@ -1561,28 +1755,10 @@ class Sensor:
     def _delayed(self, now: WorldState) -> WorldState:
         """The buffered true state the current measurements describe.
 
-        The capture instant is ``now.t_s - sense_latency_s``, quantised to the
-        nearest frame actually in the buffer -- which is what a camera does: it
-        cannot expose between frames.  Quantising by nearest rather than by
-        floor keeps a 55 ms latency at exactly one frame on a 50 ms grid instead
-        of rounding it up to two, and lets it stretch to two frames on its own
-        once the frame period grows past 110 ms.
-
-        Before the buffer is deep enough (the first frames of a run) the oldest
-        available state is used.  A real pipeline's first command likewise acts
-        on its first image, however old that is by the time it arrives.
+        See :func:`captured_state` for the rule; this is the stateful wrapper
+        that applies it to the sensor's own capture buffer.
         """
-        lat = float(self.spec.sense_latency_s)
-        if lat <= 0.0 or len(self._buffer) < 2:
-            return self._buffer[-1]
-        target = now.t_s - lat
-        best = self._buffer[0]
-        best_err = abs(best.t_s - target)
-        for s in self._buffer:
-            err = abs(s.t_s - target)
-            if err <= best_err:
-                best, best_err = s, err
-        return best
+        return captured_state(self._buffer, now, self.spec.sense_latency_s)
 
     def _track_id_for(self, index: int) -> int:
         got = self._track_ids.get(index)
