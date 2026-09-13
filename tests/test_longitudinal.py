@@ -551,3 +551,235 @@ def test_reset_re_arms_the_ego_speed_log_gate(caplog):
             planner.plan(None, None, True, DT)
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(warnings) == 2
+
+
+# --------------------------------------------------------------------------- #
+# Range-rate cross-check
+#
+# Regression for the second half of the AEB blocker: with a stationary lead 25 m
+# ahead at 15 m/s the tracker's velocity channel reported 0, so every AEB
+# predicate read "not closing", the planner said follow_gap on all 40 frames and
+# the controller commanded brake 0.000 on all 40. The planner now measures the
+# range derivative itself and only overrides a rate that its own measurement
+# contradicts -- see the module docstring for why that is not the same thing as
+# fabricating a closing rate out of the ego speed.
+# --------------------------------------------------------------------------- #
+
+
+def _closing_run(planner, gap0, closing_true, reported_rate, ego_speed, frames, dt=DT,
+                 track_id=1, coasting=0):
+    """Drive `planner` with a range that really collapses at `closing_true`."""
+    out = []
+    gap = gap0
+    for _ in range(frames):
+        lead = LeadVehicle(
+            distance_m=gap,
+            range_rate_mps=reported_rate,
+            track_id=track_id,
+            frames_since_measurement=coasting,
+        )
+        out.append(planner.plan(lead, ego_speed, dt_s=dt))
+        gap = max(0.0, gap - closing_true * dt)
+    return out
+
+
+def test_contradicted_rate_channel_still_produces_an_aeb():
+    """The exact reviewer scenario: stationary lead, velocity channel stuck at 0.
+
+    Before the cross-check the planner said ``follow_gap`` on all 40 frames and
+    the controller commanded brake 0.000 on all 40 -- the arbiter was the only
+    thing braking. It now declares AEB.
+
+    The LATENCY is pinned deliberately and is not free: the fit needs a full
+    window of evidence, so with a channel that lies from the first frame the AEB
+    lands one window (0.95 s) in, at 11.5 m of the original 25 m. An ego at
+    15 m/s needs 14 m to stop at 8 m/s^2, so this MITIGATES the stuck-channel
+    case, it does not make it survivable -- measured impact speed falls from
+    13.7 m/s to 6.6 m/s in the closed loop. Shortening the window is what would
+    buy the rest, and the measured grid in ``LongitudinalLimits`` says every
+    shorter setting fabricates corrections out of range noise instead. If this
+    latency has to come down, the evidence has to get better, not looser.
+    """
+    planner = LongitudinalPlanner()
+    window = planner.limits.range_rate_cross_check_window
+    decisions = _closing_run(planner, 25.0, 15.0, 0.0, 15.0, 40)
+    assert any(d.range_rate_corrected for d in decisions)
+    assert any(d.aeb_active for d in decisions), [d.reason for d in decisions]
+    fired = next(i for i, d in enumerate(decisions) if d.aeb_active)
+    assert fired <= window, "AEB took %d frames, more than one window" % fired
+    assert decisions[fired].target_speed_mps == 0.0
+    assert decisions[fired].range_rate_mps == pytest.approx(-15.0, abs=0.2)
+
+
+def test_cross_check_is_silent_when_the_rate_channel_is_honest():
+    planner = LongitudinalPlanner()
+    decisions = _closing_run(planner, 60.0, 5.0, -5.0, 15.0, 80)
+    assert not any(d.range_rate_corrected for d in decisions)
+
+
+def test_cross_check_is_silent_on_a_steady_gap():
+    planner = LongitudinalPlanner()
+    decisions = _closing_run(planner, 45.0, 0.0, 0.0, 15.0, 100)
+    assert not any(d.range_rate_corrected for d in decisions)
+    assert not any(d.aeb_active for d in decisions)
+
+
+def test_cross_check_never_implies_worse_than_a_stationary_obstacle():
+    """The correction is clamped at -v_ego, so it cannot invent an oncoming lead."""
+    planner = LongitudinalPlanner()
+    # Range collapsing at 30 m/s while the ego only does 4 m/s: physically this
+    # is an approaching object, but the correction path must not act on more than
+    # the stationary-obstacle rate.
+    decisions = _closing_run(planner, 200.0, 30.0, 0.0, 4.0, 40)
+    corrected = [d for d in decisions if d.range_rate_corrected]
+    assert corrected, "expected the disagreement to be detected"
+    assert all(d.range_rate_mps >= -4.0 - 1e-9 for d in corrected), [
+        d.range_rate_mps for d in corrected
+    ]
+
+
+def test_cross_check_ignores_an_isolated_range_jump():
+    """One bad range sample must not move a median-of-N estimate."""
+    planner = LongitudinalPlanner()
+    seen = []
+    for i in range(60):
+        gap = 40.0 if i != 30 else 4.5  # single-frame collapse and back again
+        seen.append(
+            planner.plan(
+                LeadVehicle(distance_m=gap, range_rate_mps=0.0, track_id=1), 15.0, dt_s=DT
+            )
+        )
+    assert not any(d.range_rate_corrected for d in seen[31:]), (
+        "an isolated range jump moved the cross-check"
+    )
+
+
+def test_cross_check_needs_a_full_window():
+    planner = LongitudinalPlanner()
+    window = planner.limits.range_rate_cross_check_window
+    decisions = _closing_run(planner, 60.0, 15.0, 0.0, 15.0, window - 1)
+    assert not any(d.range_rate_corrected for d in decisions)
+    # ...and fires on the very next frame, once the window is complete.
+    assert _closing_run(planner, 60.0 - 0.75 * (window - 1), 15.0, 0.0, 15.0, 1)[
+        0
+    ].range_rate_corrected
+
+
+def test_cross_check_restarts_on_a_track_change():
+    planner = LongitudinalPlanner()
+    gap = 60.0
+    corrected = []
+    for i in range(40):
+        lead = LeadVehicle(distance_m=gap, range_rate_mps=0.0, track_id=i)  # new id each frame
+        corrected.append(planner.plan(lead, 15.0, dt_s=DT).range_rate_corrected)
+        gap -= 0.75
+    assert not any(corrected)
+
+
+def test_cross_check_restarts_on_a_coasting_track():
+    planner = LongitudinalPlanner()
+    decisions = _closing_run(planner, 60.0, 15.0, 0.0, 15.0, 40, coasting=1)
+    assert not any(d.range_rate_corrected for d in decisions)
+
+
+def test_cross_check_restarts_after_a_perception_dropout():
+    planner = LongitudinalPlanner()
+    gap = 60.0
+    for _ in range(30):
+        planner.plan(LeadVehicle(distance_m=gap, range_rate_mps=0.0, track_id=1), 15.0, dt_s=DT)
+        gap -= 0.75
+    planner.plan(None, 15.0, perception_valid=False, dt_s=DT)
+    d = planner.plan(
+        LeadVehicle(distance_m=gap, range_rate_mps=0.0, track_id=1), 15.0, dt_s=DT
+    )
+    assert not d.range_rate_corrected
+
+
+def test_cross_check_logs_once_not_once_per_frame(caplog):
+    planner = LongitudinalPlanner()
+    with caplog.at_level(logging.WARNING, logger="adas.planning.longitudinal"):
+        _closing_run(planner, 400.0, 15.0, 0.0, 15.0, 300)
+    lines = [r for r in caplog.records if "collapsing" in r.getMessage()]
+    assert len(lines) == 1, "%d warnings for one latched condition" % len(lines)
+
+
+def test_reset_clears_the_cross_check():
+    planner = LongitudinalPlanner()
+    _closing_run(planner, 400.0, 15.0, 0.0, 15.0, 40)
+    planner.reset()
+    d = planner.plan(LeadVehicle(distance_m=300.0, range_rate_mps=0.0, track_id=1), 15.0, dt_s=DT)
+    assert not d.range_rate_corrected
+
+
+def test_range_rate_override_preserves_monotonicity():
+    """raw_target_speed_mps must be monotone in the OVERRIDE argument too."""
+    planner = LongitudinalPlanner()
+    for ego in EGO_SPEEDS:
+        for distance in (0.0, 3.0, 8.0, 15.0, 30.0, 60.0, 120.0):
+            previous = None
+            rate = -30.0
+            while rate <= 30.0:
+                lead = LeadVehicle(distance_m=distance, range_rate_mps=0.0)
+                target = planner.raw_target_speed_mps(lead, ego, range_rate_mps=rate)[0]
+                if previous is not None:
+                    assert target >= previous - 1e-9, (ego, distance, rate)
+                previous = target
+                rate += 0.25
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"range_rate_cross_check_window": 4},
+        {"range_rate_disagreement_mps": 0.0},
+        {"range_rate_disagreement_mps": float("nan")},
+        {"range_rate_significance_sigma": 0.0},
+        {"range_rate_significance_sigma": float("inf")},
+    ],
+)
+def test_cross_check_tuning_is_validated(kwargs):
+    with pytest.raises(ValidationError):
+        LongitudinalLimits(**kwargs)
+
+
+def test_cross_check_is_silent_under_range_noise_with_an_honest_channel(caplog):
+    """The gate that matters: a NOISY range must not manufacture a closing rate.
+
+    The first version of this cross-check took the median of the per-frame range
+    differences. Differencing multiplies range noise by 1/dt (20x at 20 Hz) and a
+    median only divides it by 3, so with an honest rate channel and 0.25 m of
+    gaussian range noise it corrected 180 frames in 3000, and at 5 m of noise it
+    manufactured AEB frames from a lead that was not closing at all. The fit's own
+    standard error is what closes that hole, so this test sweeps the noise.
+    """
+    for sigma in (0.25, 0.5, 1.0, 2.0, 5.0, 8.0):
+        rng = random.Random(SEED + int(sigma * 100))
+        planner = LongitudinalPlanner()
+        corrected = 0
+        aeb = 0
+        for _ in range(600):
+            noisy = max(0.1, 40.0 + rng.gauss(0.0, sigma))
+            decision = planner.plan(
+                LeadVehicle(distance_m=noisy, range_rate_mps=0.0, track_id=1), 15.0, dt_s=DT
+            )
+            corrected += int(decision.range_rate_corrected)
+            aeb += int(decision.aeb_active)
+        assert corrected == 0, "sigma=%.2f m: %d fabricated corrections" % (sigma, corrected)
+        assert aeb == 0, "sigma=%.2f m: %d phantom AEB frames" % (sigma, aeb)
+
+
+def test_cross_check_still_fires_through_range_noise_when_the_channel_lies():
+    """Significance must not be bought by making the check deaf."""
+    rng = random.Random(SEED + 7)
+    planner = LongitudinalPlanner()
+    gap = 60.0
+    corrected = 0
+    for _ in range(60):
+        gap = max(0.5, gap - 15.0 * DT)
+        noisy = max(0.1, gap + rng.gauss(0.0, 0.5))
+        corrected += int(
+            planner.plan(
+                LeadVehicle(distance_m=noisy, range_rate_mps=0.0, track_id=1), 15.0, dt_s=DT
+            ).range_rate_corrected
+        )
+    assert corrected > 30, "only %d corrected frames on a 15 m/s lie" % corrected

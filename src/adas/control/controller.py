@@ -17,9 +17,10 @@ Why this controller is stateful
 -------------------------------
 The previous implementation was a stateless proportional map, which made a rate
 limit impossible by construction: a 0.02 -> 1.00 brake step inside one 50 ms frame
-was legal.  This version keeps four pieces of state -- the speed-error integral,
-the previous commanded acceleration, the previous throttle and the previous brake --
-and uses them to enforce, in order:
+was legal.  This version keeps five pieces of state -- the speed-error integral,
+the previous commanded acceleration, the previous throttle, the previous brake
+and the previous target speed --
+and the previous target speed, and uses them to enforce, in order:
 
 1. a symmetric speed-error deadband with hysteresis, so throttle and brake cannot
    alternate frame to frame around zero error;
@@ -27,20 +28,36 @@ and uses them to enforce, in order:
    acceleration command is saturated, or while inside the deadband -- except that
    an update which moves the integrator back TOWARD zero is always accepted, so a
    frozen integrator can never latch);
-3. an EMERGENCY FEED-FORWARD: when the caller flags an emergency the controller
+3. a TARGET-RATE FEED-FORWARD: the planner's target speed is itself rate-limited
+   (at ``max_decel_mps2`` on comfort frames, ``mrm_decel_mps2`` on a controlled
+   stop), so a plan that says "decelerate at 3 m/s^2" arrives as a target that
+   falls 0.15 m/s per 50 ms frame.  A pure error feedback law cannot follow a
+   ramp without a standing lag: with ``kp_speed = 0.15 1/s`` it needs a 20 m/s
+   speed error to produce 3 m/s^2, so the demand it actually produced while
+   trailing a comfort ramp was ~0.4 m/s^2 and the ego kept closing on the lead.
+   The controller therefore differentiates the target and adds ``dv*/dt``
+   directly to the acceleration demand; the PI law is left to remove the
+   residual error only.  The feed-forward is bounded by the actuator authority
+   and, on every non-emergency frame, by the planner's own target rate limit, so
+   it can never exceed the deceleration the planner asked for;
+4. an EMERGENCY FEED-FORWARD: when the caller flags an emergency the controller
    stops behaving like a comfort speed tracker and demands the deceleration that
    removes the whole remaining speed error within ``emergency_stop_time_s``,
    saturated at ``brake_authority_mps2``.  Without this the controller only ever
    saw the planner's rate-limited target, produced ~0.06 m/s^2 of demand during a
    full AEB event, and the safety arbiter was the only thing in the system that
    actually braked;
-4. a jerk limit on the commanded acceleration (``max_jerk_mps3``, relaxed to
-   ``max_jerk_emergency_mps3`` when the caller flags an emergency);
-5. pedal rate limits (``throttle_rate_per_s``, ``brake_apply_rate_per_s``), with
+5. a jerk limit on the commanded acceleration (``max_jerk_mps3``, relaxed to
+   ``max_jerk_emergency_mps3`` when the caller flags an emergency).  The
+   emergency jerk limit is sized from brake-system pressure build time, not from
+   comfort: at the previous 15 m/s^3 the controller needed 0.53 s to reach full
+   authority from coast, which is longer than the whole AEB event at urban
+   speeds and was the second reason the arbiter was the only effective brake;
+6. pedal rate limits (``throttle_rate_per_s``, ``brake_apply_rate_per_s``), with
    throttle release and emergency brake application exempt -- reducing tractive
    effort and applying the brake in an emergency are never rate-limited downward.
 
-All four pieces of state are committed only after the resulting command has passed
+All five pieces of state are committed only after the resulting command has passed
 :meth:`PIDLikeLongitudinalController._validate_command`, so a command the actuator
 never received cannot become the baseline the next frame is rate-limited against.
 This is defence in depth rather than a fix for an observed defect: today
@@ -52,10 +69,16 @@ Guarantees (asserted in ``tests/test_control.py``)
 * ``0 <= throttle <= max_throttle`` and ``0 <= brake <= max_brake`` always.
 * ``throttle > 0`` and ``brake > 0`` never hold at the same time.
 * ``throttle == 0`` on every frame the caller flags as an emergency.
+* an emergency stop is held to standstill: while ``emergency`` is set and the
+  vehicle is still moving toward a zero target the comfort deadband never
+  releases the brake.
 * ``|throttle[k] - throttle[k-1]| <= throttle_rate_per_s * dt`` for increases.
 * ``|brake[k] - brake[k-1]| <= brake_apply_rate_per_s * dt`` for increases outside
   an emergency.
 * the implied acceleration never changes faster than the jerk limit.
+* a plan whose target speed falls at rate ``r`` produces at least ``r`` of
+  commanded deceleration once the jerk limit has been served, so the vehicle
+  follows the planner's ramp instead of trailing it.
 
 Failure behaviour
 -----------------
@@ -105,6 +128,9 @@ class _LongitudinalState:
     accel_mps2: float
     integral_mps: float
     mode: str
+    target_mps: float
+    target_hist: list
+    clock_s: float
 
 
 @dataclass
@@ -152,7 +178,62 @@ class PIDLikeLongitudinalController:
     limit.  The comfort PI law still applies and the MORE severe of the two wins.
     """
     max_jerk_mps3: float = 4.0
-    max_jerk_emergency_mps3: float = 15.0
+    """Comfort jerk limit, m/s^3."""
+    max_jerk_emergency_mps3: float = 40.0
+    """Emergency jerk limit, m/s^3.
+
+    Sized from the brake actuator, not from comfort: a hydraulic service brake
+    develops full deceleration in roughly 0.2 s, so 8 m/s^2 / 0.2 s = 40 m/s^3.
+    At the previous 15 m/s^3 the controller took 0.53 s to reach full authority
+    from coast, during which an ego at 15 m/s travels a further 6 m; the AEB
+    stage was declared and actuated too slowly to matter and only the arbiter
+    (which is not rate limited at all) avoided the collision.
+    """
+    target_ff_window: int = 21
+    """Samples of target history the feed-forward slope is fitted over.
+
+    A one-frame difference of the target is unusable as a feed-forward: a 0.2 m/s
+    dither on the target is 4 m/s^2 of demand at dt = 50 ms, which alternates the
+    actuators every frame (``tests/test_control.py::
+    test_no_actuator_chatter_around_zero_speed_error`` fails outright with a plain
+    difference).  A least-squares slope over N samples multiplies white target
+    noise by ``sqrt(12 / (N (N^2-1))) / dt`` while returning a genuine ramp
+    EXACTLY, at the cost of ``(N-1)/2`` frames of LAG -- 0.5 s at 20 Hz, and
+    proportionally more if the pipeline runs slower, which is the one property to
+    re-check if the frame rate is ever lowered.
+
+    N and the deadband were chosen from a measured grid, not guessed
+    (window 7..31 x deadband 0.1..1.0, scored on pedal frames leaked from pure
+    target dither over 120,000 frames and on the min gap left in the
+    "lead brakes at 4 m/s^2 from 30 m" closed loop):
+    N = 11 / 0.5 leaked 16 frames in 400; N = 15 / 0.5 leaked 0 but left only
+    5.4 m; N = 21 / 0.4 leaks 0 in 120,000 and leaves 7.2 m.  The window must
+    also be FULL before the term is used at all -- a partial window has up to
+    30x the slope variance and leaks the same dither.  Must be >= 3.
+    """
+    target_ff_deadband_mps2: float = 0.4
+    """Soft deadband subtracted from |feed-forward|, m/s^2.
+
+    Applied as ``sign(ff) * max(0, |ff| - deadband)``, so it is continuous -- a
+    hard deadband would just move the chatter to its own edge.  With N = 21 the
+    worst fitted slope over 200,000 full windows of the worst target dither in
+    the test suite (uniform +/-0.2 m/s per frame, which the planner's own rate
+    limiter cannot even produce: it caps the step at ``max_decel_mps2 * dt`` =
+    0.15 m/s) is ~0.36 m/s^2, against an effective threshold of
+    ``deadband + kp_speed * speed_deadband_mps`` = 0.445 -- a 1.24x margin, and
+    zero leaked pedal frames in 120,000 measured.  The PI law covers the
+    magnitude the deadband removes; it is only the standing ramp LAG that the PI
+    law cannot cover, and that is what this term exists for.
+    """
+    target_ff_step_mps: float = 1.0
+    """A target change larger than this in one frame is a STEP, not a ramp.
+
+    Only the AEB stage can move the planner's target by this much in one frame
+    (the comfort law is rate-limited to ``max_decel_mps2 * dt``).  On a step the
+    regression window is discarded rather than smeared across the following
+    ``target_ff_window`` frames, and that one frame uses the clamped instant
+    difference; the jerk limit bounds what a single frame can do.
+    """
     throttle_rate_per_s: float = 2.0
     brake_apply_rate_per_s: float = 5.0
     brake_release_rate_per_s: float = 8.0
@@ -165,6 +246,10 @@ class PIDLikeLongitudinalController:
     _prev_throttle: float = field(default=0.0, init=False, repr=False, compare=False)
     _prev_brake: float = field(default=0.0, init=False, repr=False, compare=False)
     _mode: str = field(default="coast", init=False, repr=False, compare=False)
+    _prev_target_mps: float | None = field(default=None, init=False, repr=False, compare=False)
+    _target_hist: list = field(default_factory=list, init=False, repr=False, compare=False)
+    """Rolling ``[(elapsed_s, target_mps), ...]`` window for the feed-forward fit."""
+    _clock_s: float = field(default=0.0, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.kp_speed <= 0:
@@ -179,6 +264,19 @@ class PIDLikeLongitudinalController:
             raise ValidationError("Actuator authorities must be positive m/s^2 values")
         if self.max_jerk_mps3 <= 0 or self.max_jerk_emergency_mps3 < self.max_jerk_mps3:
             raise ValidationError("require 0 < max_jerk_mps3 <= max_jerk_emergency_mps3")
+        if not (math.isfinite(self.target_ff_deadband_mps2) and self.target_ff_deadband_mps2 >= 0):
+            raise ValidationError(
+                "target_ff_deadband_mps2 must be finite and non-negative, got "
+                f"{self.target_ff_deadband_mps2}"
+            )
+        if self.target_ff_window < 3:
+            raise ValidationError(
+                f"target_ff_window must be >= 3, got {self.target_ff_window}"
+            )
+        if not (math.isfinite(self.target_ff_step_mps) and self.target_ff_step_mps > 0):
+            raise ValidationError(
+                f"target_ff_step_mps must be positive, got {self.target_ff_step_mps}"
+            )
         if self.throttle_rate_per_s <= 0 or self.brake_apply_rate_per_s <= 0:
             raise ValidationError("Pedal rate limits must be positive")
         if self.speed_deadband_mps < 0 or self.speed_hysteresis_mps < 0:
@@ -208,6 +306,9 @@ class PIDLikeLongitudinalController:
         self._prev_throttle = 0.0
         self._prev_brake = 0.0
         self._mode = "coast"
+        self._prev_target_mps = None
+        self._target_hist = []
+        self._clock_s = 0.0
 
     @property
     def commanded_accel_mps2(self) -> float:
@@ -270,6 +371,9 @@ class PIDLikeLongitudinalController:
             self._prev_throttle = state.throttle
             self._prev_brake = state.brake
             self._mode = state.mode
+            self._prev_target_mps = state.target_mps
+            self._target_hist = state.target_hist
+            self._clock_s = state.clock_s
 
             logger.debug(
                 "Control: t=%.3f b=%.3f s=%.3f (v*=%.2f, v=%.2f, a*=%.2f m/s^2, mode=%s)",
@@ -295,7 +399,7 @@ class PIDLikeLongitudinalController:
     def _longitudinal(
         self, target_speed_mps: float, current_speed_mps: float, dt_s: float, emergency: bool
     ) -> "_LongitudinalState":
-        """PI -> emergency feed-forward -> jerk limit -> pedal map -> rate limit.
+        """PI -> target-rate FF -> emergency FF -> jerk limit -> pedal map -> rate limit.
 
         PURE with respect to ``self``: the new controller state is returned and the
         caller commits it only once the resulting command has validated.
@@ -337,7 +441,26 @@ class PIDLikeLongitudinalController:
             accel_cmd = self.kp_speed * error + self.ki_speed * integral
             accel_cmd = _clamp(accel_cmd, lower, upper)
 
-        # 3. Emergency feed-forward. In an emergency the plan is "stop", not "track
+        # 3. Target-rate feed-forward: dv*/dt.
+        #
+        #    The planner publishes a RATE-LIMITED target, so "brake at 3 m/s^2"
+        #    reaches the controller as a target that falls 0.15 m/s per frame,
+        #    never as a large speed error. A pure error law tracks a ramp with a
+        #    standing lag of (ramp rate / kp) = 20 m/s at kp = 0.15 1/s, which is
+        #    unreachable, so the controller settled at ~0.4 m/s^2 of demand while
+        #    the planner was asking for 3.0 and the ego kept closing. Adding the
+        #    derivative of the target removes the lag by construction and leaves
+        #    the PI to trim the residual.
+        #
+        #    Bounds: on any frame the planner produced, |dv*/dt| is already
+        #    limited to max_accel_mps2 / max_decel_mps2 by the planner's own rate
+        #    limiter, so this term cannot exceed the deceleration that was asked
+        #    for. The clamp to [lower, upper] bounds it for hand-built plans too,
+        #    and the jerk limit below shapes the onset either way.
+        target_rate, hist, clock = self._target_slope(target_speed_mps, dt_s)
+        accel_cmd = _clamp(accel_cmd + _clamp(target_rate, lower, upper), lower, upper)
+
+        # 4. Emergency feed-forward. In an emergency the plan is "stop", not "track
         #    a comfort speed profile": demand the deceleration that removes the
         #    remaining speed error inside emergency_stop_time_s and take whichever
         #    of that and the PI output is more severe. The comfort deadband does
@@ -346,15 +469,25 @@ class PIDLikeLongitudinalController:
             feed_forward = max(lower, error / self.emergency_stop_time_s)
             accel_cmd = min(accel_cmd, feed_forward)
 
-        # 4. Jerk limit on the commanded acceleration.
+        # 5. Jerk limit on the commanded acceleration.
         jerk_limit = self.max_jerk_emergency_mps3 if emergency else self.max_jerk_mps3
         max_step = jerk_limit * dt_s
         accel_cmd = _clamp(
             accel_cmd, self._prev_accel_mps2 - max_step, self._prev_accel_mps2 + max_step
         )
 
-        # 5. Pedal map with an actuator-switch hysteresis band.
-        accel_deadband = self.kp_speed * self.speed_deadband_mps
+        # 6. Pedal map with an actuator-switch hysteresis band.
+        #
+        #    The band exists to stop the two actuators hunting around zero error;
+        #    during an emergency there is no comfort requirement and no throttle
+        #    to hunt with, and the band actively hurts: at the end of an AEB stop
+        #    the emergency demand decays as |v| / emergency_stop_time_s, so below
+        #    kp_speed * speed_deadband_mps * emergency_stop_time_s (0.045 m/s
+        #    with the defaults) it fell inside the band, the brake was released
+        #    and the ego CREPT into the obstacle at 4 cm/s -- observed over the
+        #    last 0.11 m of the 25 m stationary-lead scenario. An AEB stop must
+        #    be held to standstill.
+        accel_deadband = 0.0 if emergency else self.kp_speed * self.speed_deadband_mps
         if accel_cmd > accel_deadband and not emergency:
             raw_throttle = _clamp(accel_cmd / self.accel_authority_mps2, 0.0, self.max_throttle)
             raw_brake = 0.0
@@ -368,7 +501,7 @@ class PIDLikeLongitudinalController:
             raw_brake = 0.0
             mode = "coast"
 
-        # 6. Pedal rate limits. Throttle release and emergency braking are exempt.
+        # 7. Pedal rate limits. Throttle release and emergency braking are exempt.
         throttle = min(raw_throttle, self._prev_throttle + self.throttle_rate_per_s * dt_s)
         throttle = _clamp(throttle, 0.0, self.max_throttle)
 
@@ -388,7 +521,71 @@ class PIDLikeLongitudinalController:
             accel_mps2=accel_cmd,
             integral_mps=integral,
             mode=mode,
+            target_mps=target_speed_mps,
+            target_hist=hist,
+            clock_s=clock,
         )
+
+    def _target_slope(self, target_speed_mps: float, dt_s: float) -> tuple:
+        """Least-squares dv*/dt over the rolling target window.
+
+        PURE with respect to ``self``: returns ``(slope_mps2, new_history,
+        new_clock)`` and the caller commits the history only once the resulting
+        command has validated, exactly like the other four pieces of state.
+
+        Returns 0.0 until a FULL window exists, and discards the window on a
+        target STEP so that an AEB target of 0 m/s is not smeared over the
+        following ``target_ff_window`` frames once the emergency clears.
+        """
+        clock = self._clock_s + dt_s
+        hist = list(self._target_hist)
+
+        step = (
+            self._prev_target_mps is not None
+            and abs(target_speed_mps - self._prev_target_mps) > self.target_ff_step_mps
+        )
+        if step:
+            instant = (target_speed_mps - self._prev_target_mps) / dt_s
+            return instant, [(clock, target_speed_mps)], clock
+
+        hist.append((clock, target_speed_mps))
+        if len(hist) > self.target_ff_window:
+            del hist[0 : len(hist) - self.target_ff_window]
+        # Rebase the window's clock on its oldest sample so that neither the
+        # stored times nor `clock` grow without bound over a multi-hour run and
+        # cost the regression its floating-point resolution.
+        base = hist[0][0]
+        if base != 0.0:
+            hist = [(t - base, y) for t, y in hist]
+            clock -= base
+        if len(hist) < self.target_ff_window:
+            # A PARTIAL window is not a cheap approximation of a full one: the
+            # slope variance goes as 1 / (n (n^2 - 1)), so a 3-sample window is
+            # 12x noisier than a 15-sample one and leaks target dither straight
+            # onto the pedals (frame 2 of
+            # test_feed_forward_ignores_target_noise, brake 0.024 out of nothing).
+            # The feed-forward stays off until the evidence is there; the PI law
+            # carries those frames exactly as it did before this term existed.
+            return 0.0, hist, clock
+
+        n = float(len(hist))
+        t_mean = sum(t for t, _ in hist) / n
+        y_mean = sum(y for _, y in hist) / n
+        s_tt = sum((t - t_mean) ** 2 for t, _ in hist)
+        if s_tt <= 1e-12:  # pragma: no cover - defensive, dt is validated > 1e-4
+            return 0.0, hist, clock
+        slope = sum((t - t_mean) * (y - y_mean) for t, y in hist) / s_tt
+        if not math.isfinite(slope):  # pragma: no cover - defensive
+            return 0.0, hist, clock
+
+        # Soft (continuous) deadband: shrink toward zero rather than truncate, so
+        # there is no edge for the actuators to chatter across.
+        band = self.target_ff_deadband_mps2
+        if slope > band:
+            return slope - band, hist, clock
+        if slope < -band:
+            return slope + band, hist, clock
+        return 0.0, hist, clock
 
     def _steering(self, target_steering_deg: float) -> float:
         """Normalise a road-wheel angle to [-1, 1] with a deadband."""

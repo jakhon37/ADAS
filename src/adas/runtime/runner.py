@@ -37,6 +37,15 @@ all timing and failure policy, and both are safety-relevant:
   budget, an operator stop) is distinguished by ``source.eof`` and gets a single
   zero-throttle, zero-brake release instead of a brake ramp.
 
+* **A clean exit still may not cancel an intervention.**  Releasing the THROTTLE
+  is right on every intended end.  Releasing the BRAKE is right only when the
+  arbiter was not braking.  If ``pipeline.last_arbitration.state`` is
+  ``MIN_RISK_MANEUVER`` or ``DISENGAGE`` when the loop ends, the settle holds the
+  arbiter's last brake and steering instead -- an operator who stops the service
+  during an AEB gets a stopped service, not a released brake.  Every exit path
+  now consults the arbiter; see :data:`INTERVENING_STATES` and
+  :meth:`PipelineRunner._settle`.
+
 * **Stopping is cooperative.**  :meth:`PipelineRunner.request_stop` sets a flag
   the loop checks once per iteration; the CLI's SIGTERM/SIGINT handler calls it,
   so ``systemctl stop`` and ``docker stop`` unwind through the normal shutdown
@@ -52,7 +61,7 @@ from typing import Any, Callable, Optional
 
 from adas.core.exceptions import SensorError
 from adas.core.logger import setup_logger
-from adas.core.models import ControlCommand, PerceptionFrame
+from adas.core.models import ControlCommand, PerceptionFrame, SafetyState
 from adas.runtime.capture import (
     EgoSpeedSource,
     FrameSource,
@@ -69,8 +78,11 @@ DT_CLAMP_LOW = 0.5
 DT_CLAMP_HIGH = 3.0
 
 #: How the frame loop ended.  The distinction is safety-relevant, not cosmetic:
-#: the first three are intended ends and release the throttle; the last two are
+#: the first three are intended ends and RELEASE THE THROTTLE; the last two are
 #: failures and run the minimum-risk hold.  See :meth:`PipelineRunner._settle`.
+#:
+#: The exit reason is only half of the settle decision.  The other half is the
+#: arbiter's state -- see :data:`INTERVENING_STATES`.
 EXIT_COMPLETED = "completed"
 EXIT_STOPPED = "stopped"
 EXIT_EOF = "eof"
@@ -79,6 +91,18 @@ EXIT_PIPELINE_DEAD = "pipeline_dead"
 
 #: Exits that mean a sensor or the decision path failed mid-stream.
 UNSAFE_EXITS = (EXIT_SOURCE_LOST, EXIT_PIPELINE_DEAD)
+
+#: Arbitration states in which the vehicle is being actively intervened on.
+#:
+#: An exit reason describes why the SOFTWARE stopped.  It says nothing about
+#: whether the road ahead is clear.  ``_settle`` used to conflate the two: any
+#: exit outside :data:`UNSAFE_EXITS` wrote ``ControlCommand(0, 0, 0)``, which on
+#: a frame-budget end, an end-of-file or -- worst -- an operator ``SIGTERM``
+#: actively CANCELLED an automatic emergency brake that the arbiter had
+#: commanded on the previous frame.  A shutdown is not evidence that the hazard
+#: went away.  While the arbiter is in one of these states the settle releases
+#: the throttle and HOLDS the brake; see :meth:`PipelineRunner._settle`.
+INTERVENING_STATES = (SafetyState.MIN_RISK_MANEUVER, SafetyState.DISENGAGE)
 
 
 @dataclass
@@ -98,6 +122,14 @@ class RunSummary:
     #: ended -- the minimum-risk hold, or the single release on a clean exit.
     #: Deliberately not counted in ``frames``: no frame was processed.
     settle_commands: int = 0
+    #: What :meth:`PipelineRunner._settle` did: ``"release"`` (throttle and brake
+    #: to zero), ``"hold"`` (throttle released, the arbiter's brake HELD because
+    #: it was mid-intervention) or ``"min_risk"`` (the fail-safe ramp after an
+    #: unsafe exit).  ``""`` means settle has not run.
+    settle_kind: str = ""
+    #: The brake value of the LAST command settle actuated.  A caller that wants
+    #: to know whether the vehicle was left braking reads this, not the log.
+    settle_brake: float = 0.0
     elapsed_s: float = 0.0
     busy_s: float = 0.0
     stopped_reason: str = ""
@@ -175,9 +207,10 @@ class PipelineRunner:
         hooks: optional operations callbacks.
         max_consecutive_failures: consecutive failed frames after which the loop
             stops.  Each failed frame still actuates the arbiter's fail-safe.
-        failsafe_hold_s: how long :meth:`_settle` keeps re-emitting the arbiter's
-            minimum-risk manoeuvre after an UNSAFE exit (a lost source or a dead
-            pipeline), seconds.  One command per nominal period.  ``0`` emits
+        failsafe_hold_s: how long :meth:`_settle` keeps re-emitting a post-loop
+            command -- the arbiter's minimum-risk manoeuvre after an UNSAFE exit
+            (a lost source or a dead pipeline), or the arbiter's held brake when
+            a CLEAN exit interrupted an intervention -- in seconds.  One command per nominal period.  ``0`` emits
             exactly one.  This is a bounded hold, not a substitute for a
             supervisor: the runner returns afterwards.
     """
@@ -192,6 +225,11 @@ class PipelineRunner:
     _stop: bool = field(default=False, init=False)
     _stop_reason: str = field(default="", init=False)
     _last_safety_state: str = field(default="nominal", init=False)
+    #: The arbitration from the last REAL frame, snapshotted by :meth:`_settle`
+    #: before the hold begins.  ``failsafe_command`` overwrites
+    #: ``pipeline.last_arbitration`` on every hold step.
+    _last_frame_arbitration: Any = field(default=None, init=False)
+    _floor_logged: bool = field(default=False, init=False)
     last_summary: Optional[RunSummary] = field(default=None, init=False)
 
     # ------------------------------------------------------------------ control
@@ -415,26 +453,74 @@ class PipelineRunner:
         latched until something else is written, so a mid-stream sensor loss that
         merely ``break``\ s leaves the previous frame's throttle applied -- the
         ADAS-DEC-21 failure this module claims to have fixed for the *exception*
-        path.  Both exits are handled here:
+        path.
 
-        * :data:`EXIT_SOURCE_LOST` and :data:`EXIT_PIPELINE_DEAD` are failures of
-          the sensing or decision path.  The runner re-emits
+        The decision has TWO inputs, and the bug this replaced used only one.
+        The exit reason says why the software stopped; the arbiter's state says
+        what the vehicle was being asked to do at the time.  What "shutting down
+        safely" means, per exit reason:
+
+        * :data:`EXIT_SOURCE_LOST` -- the camera stopped delivering mid-stream.
+          The vehicle is moving and blind.  Re-emit
           :meth:`~adas.runtime.pipeline.ADASPipeline.failsafe_command` -- the
           arbiter's minimum-risk manoeuvre -- once per nominal period for
           ``failsafe_hold_s`` seconds.  Re-emitting matters: the arbiter's brake
           demand is rate limited, so a single command stops the ramp partway.
-          The hold is bounded (see ``failsafe_hold_s``); it brings the demand up
-          and hands back to the caller, it does not supervise the vehicle
-          forever.
-        * :data:`EXIT_EOF`, :data:`EXIT_COMPLETED` and :data:`EXIT_STOPPED` are
-          intended ends.  One zero-throttle, zero-brake, zero-steering command is
-          emitted so a finished replay or a bounded ``--frames`` run does not
-          leave the last frame's throttle applied.
+        * :data:`EXIT_PIPELINE_DEAD` -- ``max_consecutive_failures`` frames in a
+          row failed.  The decision path is gone; identical treatment.
+        * :data:`EXIT_EOF` -- a finite recording ended.  There will be no more
+          evidence about the road, so an intervention in progress cannot be
+          shown to be over.
+        * :data:`EXIT_COMPLETED` -- the ``--frames`` budget ran out.  Same: the
+          budget expiring is a fact about the operator's request, not the road.
+        * :data:`EXIT_STOPPED` -- ``request_stop()``, i.e. how the CLI's
+          SIGINT/SIGTERM handler unwinds a ``systemctl stop``.  THIS is the one
+          that matters most: an operator stopping the service mid-emergency must
+          not thereby release the brake.
+
+        So the three intended ends release the THROTTLE unconditionally -- no
+        shutdown justifies drive torque -- and release the BRAKE only when the
+        arbiter was NOT BRAKING.  When it was, the arbiter's own last brake and
+        steering are held instead, for the same bounded ``failsafe_hold_s``.
+
+        The gate is the last commanded brake, not the arbitration STATE, and that
+        is a deliberate widening of the original fix.  400 frames of
+        ``example.mp4`` at 15 m/s produce twelve consecutive full-authority
+        (>= 0.9) brake frames -- frames 170-181, against a real tracked lead at
+        7.3-7.5 m with the headway violation ``headway_7.0m_below_rss_12.5m`` --
+        and the arbiter is in ``LIMITED`` for every one of them.  It never enters
+        ``MIN_RISK_MANEUVER`` on that clip at all.  A state-only gate would
+        therefore have protected exactly none of the real full-brake frames while
+        appearing to fix the defect.  The invariant that survives contact with
+        real footage is the simpler one: **settle never reduces the brake.**
+
+        The cost of the wider gate is that a shutdown during light comfort
+        braking latches that small brake instead of clearing it.  A 216-cell
+        sweep (ego 5-30 m/s x initial range 6-60 m x a stopped / half-speed /
+        speed-matched lead x EOF and frame-budget exits) holds in 190 cells and
+        releases in 26; the speed-matched cells hold a brake of only ~0.07,
+        which is drag rather than an intervention.  On the real clip the picture
+        is the other way round -- 342 of 400 frames command exactly zero brake,
+        including the last one, so a normal run still ends in a full release.
+        The trade is deliberate: latching 0.07 costs a slow coast-down, and
+        releasing 0.9 costs a collision.  It is reported in
+        ``RunSummary.settle_brake`` and logged rather than hidden.
+
+        :data:`INTERVENING_STATES` still matters: an arbiter that claims
+        ``MIN_RISK_MANEUVER`` while commanding no brake is a contradiction, and
+        that case falls back to the arbiter's fail-safe rather than coasting.
+
+        The hold is BOUNDED in every branch: the runner hands control back to its
+        caller afterwards, it does not supervise the vehicle forever.
         """
+        steps = self._settle_steps(nominal_dt_s)
+        # Snapshot BEFORE the hold: ``failsafe_command`` overwrites
+        # ``pipeline.last_arbitration`` on every step, so reading the floor
+        # inside the loop would read the decaying fail-safe back to itself.
+        self._last_frame_arbitration = self._safe_last_arbitration()
+        self._floor_logged = False
+
         if exit_kind in UNSAFE_EXITS:
-            steps = 1
-            if self.failsafe_hold_s > 0.0 and nominal_dt_s > 0.0:
-                steps = max(1, int(round(self.failsafe_hold_s / nominal_dt_s)))
             logger.critical(
                 "Frame loop exited on '%s' at frame %s: this is a safety event, not a "
                 "clean stop. Holding the minimum-risk manoeuvre for %d command(s) "
@@ -445,13 +531,17 @@ class PipelineRunner:
                 steps * nominal_dt_s,
                 nominal_dt_s * 1000.0,
             )
+            summary.settle_kind = "min_risk"
             last: Optional[ControlCommand] = None
             for _ in range(steps):
                 started = time.monotonic()
-                last = self.pipeline.failsafe_command(dt_s=nominal_dt_s)
+                last = self._floored(
+                    self.pipeline.failsafe_command(dt_s=nominal_dt_s), frame_id
+                )
                 self._actuate_settled(last, nominal_dt_s, frame_id, summary)
                 self._pace(started, nominal_dt_s)
             if last is not None:
+                summary.settle_brake = last.brake
                 logger.critical(
                     "Minimum-risk hold finished after %d command(s); last actuated "
                     "t%.2f/b%.2f/s%+.2f",
@@ -462,16 +552,173 @@ class PipelineRunner:
                 )
             return
 
+        state = self._arbitration_state()
+        held = self._held_command()
+        if held is None and state in INTERVENING_STATES:
+            # The arbiter says it is intervening but left no usable brake
+            # behind.  That is a contradiction, not a licence to coast: ask
+            # the arbiter directly, exactly as an unsafe exit does.
+            logger.critical(
+                "Frame loop finished ('%s') at frame %s with the arbiter in '%s' but "
+                "no usable brake on its last command; falling back to the arbiter's "
+                "fail-safe rather than releasing.",
+                exit_kind,
+                frame_id,
+                state.value,
+            )
+            summary.settle_kind = "min_risk"
+            last_fs: Optional[ControlCommand] = None
+            for _ in range(steps):
+                started = time.monotonic()
+                last_fs = self._floored(
+                    self.pipeline.failsafe_command(dt_s=nominal_dt_s), frame_id
+                )
+                self._actuate_settled(last_fs, nominal_dt_s, frame_id, summary)
+                self._pace(started, nominal_dt_s)
+            if last_fs is not None:
+                summary.settle_brake = last_fs.brake
+            return
+
+        if held is not None:
+            # The ACTUATION rule has no threshold in it -- the brake is held
+            # whatever its size.  Only the LOG LEVEL is graded, by the arbiter's
+            # own severity judgement, so that a 0.07 comfort brake held at the
+            # end of a normal run does not read like a cancelled AEB and drown
+            # the one that matters.  No number is invented for this.
+            emit = logger.critical if state in INTERVENING_STATES else logger.warning
+            emit(
+                "Frame loop finished ('%s') at frame %s WHILE THE ARBITER WAS BRAKING "
+                "(state '%s'). Releasing the throttle and HOLDING the brake at %.2f "
+                "(steering %+.2f) for %d command(s) (%.2f s). Ending the run is not "
+                "evidence that the hazard cleared, and stopping the service does not "
+                "cancel an intervention in progress.",
+                exit_kind,
+                frame_id,
+                "unknown" if state is None else state.value,
+                held.brake,
+                held.steering,
+                steps,
+                steps * nominal_dt_s,
+            )
+            summary.settle_kind = "hold"
+            summary.settle_brake = held.brake
+            for _ in range(steps):
+                started = time.monotonic()
+                self._actuate_settled(held, nominal_dt_s, frame_id, summary)
+                self._pace(started, nominal_dt_s)
+            return
+
         logger.info(
-            "Frame loop finished ('%s') at frame %s; releasing the throttle.",
+            "Frame loop finished ('%s') at frame %s with the arbiter in '%s'; "
+            "releasing the throttle and the brake.",
             exit_kind,
             frame_id,
+            "never ran" if state is None else state.value,
         )
+        summary.settle_kind = "release"
+        summary.settle_brake = 0.0
         self._actuate_settled(
             ControlCommand(throttle=0.0, brake=0.0, steering=0.0),
             nominal_dt_s,
             frame_id,
             summary,
+        )
+
+    def _floored(self, command: ControlCommand, frame_id: int) -> ControlCommand:
+        """Never actuate LESS brake on the way out than the arbiter last commanded.
+
+        The minimum-risk hold asks the arbiter for a fail-safe with NO tracks and
+        a failed perception status, so the arbiter sees ``no_in_path_lead`` and
+        demands only its generic ``mrm_decel_mps2``.  When the loop exited during
+        a full-authority AEB that is a REDUCTION: a lost camera walked a
+        measured, closing-lead brake of 1.00 down to 0.44 over the hold via the
+        brake release-rate limiter.  Going blind is not evidence that the lead
+        went away, so the last arbitrated brake becomes a floor for the whole
+        hold.  It can only ever raise the demand, and it cannot invent one: the
+        floor is 0.0 unless the arbiter had already commanded a brake on a real
+        frame.
+        """
+        floor = self._brake_floor()
+        if command.brake >= floor:
+            return command
+        if not self._floor_logged:
+            self._floor_logged = True
+            logger.critical(
+                "The fail-safe would have lowered the brake from %.2f to %.2f at frame "
+                "%s; holding it at %.2f instead. Losing the source is not evidence that "
+                "the hazard cleared.",
+                floor,
+                command.brake,
+                frame_id,
+                floor,
+            )
+        return ControlCommand(throttle=0.0, brake=floor, steering=command.steering)
+
+    def _brake_floor(self) -> float:
+        """The brake the arbiter last commanded on a REAL frame, or 0.0."""
+        arbitration = self._last_frame_arbitration
+        command = getattr(arbitration, "command", None) if arbitration is not None else None
+        try:
+            brake = float(getattr(command, "brake", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+        return brake if 0.0 < brake <= 1.0 else 0.0
+
+    def _settle_steps(self, nominal_dt_s: float) -> int:
+        """How many post-loop commands one bounded hold is worth."""
+        if self.failsafe_hold_s > 0.0 and nominal_dt_s > 0.0:
+            return max(1, int(round(self.failsafe_hold_s / nominal_dt_s)))
+        return 1
+
+    def _arbitration_state(self) -> Optional[SafetyState]:
+        """The arbiter's state as of the last frame, or ``None`` if it never ran.
+
+        Read defensively: this runs on the shutdown path, where a pipeline that
+        is already broken must not be able to turn a settle into a traceback and
+        so leave the actuators holding the last frame's command.
+        """
+        arbitration = self._safe_last_arbitration()
+        if arbitration is None:
+            return None
+        state = getattr(arbitration, "state", None)
+        return state if isinstance(state, SafetyState) else None
+
+    def _safe_last_arbitration(self):
+        try:
+            return self.pipeline.last_arbitration
+        except Exception as exc:  # noqa: BLE001 - shutdown must not raise
+            logger.error("Could not read the arbitration state at exit: %s", exc)
+            return None
+
+    def _held_command(self) -> Optional[ControlCommand]:
+        """The command to keep emitting when the loop ends mid-intervention.
+
+        The throttle is released and the arbiter's own last brake and steering
+        are HELD verbatim.  They are deliberately NOT re-derived and NOT
+        escalated: no new frame arrived, so there is no new evidence, and the
+        arbiter already floored the brake at its minimum-risk deceleration when
+        it entered the state (``_synthesise_command``).  Holding is the strongest
+        claim the runner can make honestly -- and it is strictly more brake than
+        the zero-brake release this replaced.
+
+        Returns ``None`` when there is no usable brake to hold, so the caller can
+        fall back to the arbiter's fail-safe instead of inventing a number.
+        """
+        arbitration = self._safe_last_arbitration()
+        command = getattr(arbitration, "command", None) if arbitration is not None else None
+        if command is None:
+            return None
+        try:
+            brake = float(command.brake)
+            steering = float(command.steering)
+        except (TypeError, ValueError, AttributeError):
+            return None
+        if not (brake > 0.0) or brake != brake:  # non-positive, or NaN
+            return None
+        return ControlCommand(
+            throttle=0.0,
+            brake=min(1.0, brake),
+            steering=max(-1.0, min(1.0, steering)),
         )
 
     def _actuate_settled(
@@ -639,6 +886,7 @@ __all__ = [
     "EXIT_PIPELINE_DEAD",
     "EXIT_SOURCE_LOST",
     "EXIT_STOPPED",
+    "INTERVENING_STATES",
     "UNSAFE_EXITS",
     "PipelineRunner",
     "RunSummary",

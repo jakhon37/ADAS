@@ -428,3 +428,148 @@ def test_integrator_always_unwinds_when_the_error_reverses():
     assert crossed, (
         "integrator never unwound past zero; it latched at %.4f" % controller._integral_mps
     )
+
+
+# --------------------------------------------------------------------------- #
+# AEB authority: the controller must be able to brake on its own
+#
+# Regression for the blocker "the planner+controller cannot execute an AEB; the
+# arbiter is the only thing that brakes hard enough to avoid a collision". Two
+# independent attenuators produced it and both are pinned here:
+#   (1) the emergency jerk limit was 15 m/s^3, so full authority took 0.53 s;
+#   (2) there was no target-rate feed-forward, so a plan asking for 3 m/s^2 of
+#       comfort deceleration produced ~0.4 m/s^2 of demand and the ego closed on
+#       the lead while the planner was already asking it to stop.
+# --------------------------------------------------------------------------- #
+
+
+def test_emergency_reaches_full_authority_inside_250ms():
+    """A held AEB target of 0 must saturate the brake within 5 frames at 20 Hz."""
+    controller = PIDLikeLongitudinalController()
+    brakes = []
+    for _ in range(10):
+        cmd = controller.to_command(_plan(0.0), current_speed_mps=15.0, dt_s=DT, emergency=True)
+        brakes.append(cmd.brake)
+    first_full = next(i for i, b in enumerate(brakes) if b >= 0.99)
+    assert first_full * DT <= 0.25, "full brake only at %.2f s: %s" % (first_full * DT, brakes)
+    assert brakes == sorted(brakes), "emergency brake must not back off while ramping"
+    assert all(b == 0.0 for b in [
+        controller.to_command(_plan(0.0), current_speed_mps=15.0, dt_s=DT, emergency=True).throttle
+    ])
+
+
+def test_emergency_ramp_is_still_jerk_limited():
+    """Fast is not instant: the first emergency frame must respect the jerk limit."""
+    controller = PIDLikeLongitudinalController()
+    cmd = controller.to_command(_plan(0.0), current_speed_mps=15.0, dt_s=DT, emergency=True)
+    ceiling = controller.max_jerk_emergency_mps3 * DT / controller.brake_authority_mps2
+    assert 0.0 < cmd.brake <= ceiling + 1e-9
+
+
+def test_comfort_ramp_is_followed_not_trailed():
+    """A target falling at 3 m/s^2 must produce ~3 m/s^2 of demand, not 0.4."""
+    controller = PIDLikeLongitudinalController()
+    target = 15.0
+    for _ in range(40):
+        target -= 3.0 * DT
+        cmd = controller.to_command(_plan(target), current_speed_mps=15.0, dt_s=DT)
+    # 3.0 asked for, minus the soft feed-forward deadband, plus whatever the PI
+    # contributes from the (by now large) speed error -- so at least 2.5 m/s^2.
+    assert cmd.brake * controller.brake_authority_mps2 >= 2.5
+    assert cmd.throttle == 0.0
+
+
+def test_feed_forward_ignores_target_noise():
+    """Target dither must not reach the pedals through the feed-forward."""
+    rng = random.Random(SEED + 11)
+    controller = PIDLikeLongitudinalController()
+    acted = 0
+    for _ in range(400):
+        cmd = controller.to_command(
+            _plan(15.0 + rng.uniform(-0.2, 0.2)), current_speed_mps=15.0, dt_s=DT
+        )
+        acted += int(cmd.brake > 0.0 or cmd.throttle > 0.0)
+    assert acted == 0, "%d frames of pedal action from pure target noise" % acted
+
+
+def test_target_step_is_not_smeared_across_the_window():
+    """After a target step the feed-forward must clear, not ring for N frames.
+
+    The brake still walks back down under the comfort jerk limit -- that is the
+    actuator model, not the feed-forward -- so what is pinned here is that it
+    only ever DECREASES after the step and reaches zero. A window still holding
+    the pre-step targets would re-brake part way through the tail.
+    """
+    controller = PIDLikeLongitudinalController()
+    for _ in range(20):
+        controller.to_command(_plan(15.0), current_speed_mps=15.0, dt_s=DT)
+    step = controller.to_command(
+        _plan(0.0), current_speed_mps=15.0, dt_s=DT, emergency=True
+    ).brake
+    tail = [
+        controller.to_command(_plan(15.0), current_speed_mps=15.0, dt_s=DT).brake
+        for _ in range(3 * controller.target_ff_window)
+    ]
+    assert max(tail) <= step + 1e-9, "brake rose again after the step: %s" % tail
+    assert tail == sorted(tail, reverse=True), "brake not monotone after step: %s" % tail
+    assert tail[-1] == 0.0, "feed-forward still braking after the step: %s" % tail
+
+
+def test_feed_forward_cannot_exceed_brake_authority():
+    """An absurd target ramp is clamped by the authority, not by luck."""
+    controller = PIDLikeLongitudinalController()
+    target = 40.0
+    for _ in range(30):
+        target = max(0.0, target - 20.0 * DT)
+        cmd = controller.to_command(_plan(target), current_speed_mps=40.0, dt_s=DT)
+        assert 0.0 <= cmd.brake <= 1.0
+        assert cmd.throttle == 0.0
+
+
+def test_reset_clears_the_feed_forward_window():
+    controller = PIDLikeLongitudinalController()
+    target = 15.0
+    for _ in range(20):
+        target -= 3.0 * DT
+        controller.to_command(_plan(target), current_speed_mps=15.0, dt_s=DT)
+    assert controller.to_command(_plan(target), current_speed_mps=15.0, dt_s=DT).brake > 0.0
+    controller.reset()
+    cmd = controller.to_command(_plan(target), current_speed_mps=target, dt_s=DT)
+    assert cmd.brake == 0.0 and cmd.throttle == 0.0
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"target_ff_window": 2},
+        {"target_ff_deadband_mps2": -0.1},
+        {"target_ff_step_mps": 0.0},
+        {"target_ff_step_mps": float("nan")},
+    ],
+)
+def test_feed_forward_tuning_is_validated(kwargs):
+    with pytest.raises(Exception):
+        PIDLikeLongitudinalController(**kwargs)
+
+
+def test_emergency_stop_is_held_to_standstill():
+    """No comfort deadband during an AEB: the brake must not let the car creep.
+
+    The emergency demand decays with the remaining speed, so with the comfort
+    pedal deadband still applied the brake was released at 0.043 m/s and the ego
+    coasted the last few centimetres into the obstacle.
+    """
+    controller = PIDLikeLongitudinalController()
+    speed = 15.0
+    released_while_moving = []
+    for _ in range(2000):
+        cmd = controller.to_command(_plan(0.0), current_speed_mps=speed, dt_s=DT, emergency=True)
+        if speed > 1e-3 and cmd.brake == 0.0:
+            released_while_moving.append(round(speed, 4))
+        speed = max(0.0, speed - 8.0 * cmd.brake * DT)
+        if speed <= 1e-3:
+            break
+    assert not released_while_moving, (
+        "brake released at %s m/s during an emergency stop" % released_while_moving[:5]
+    )
+    assert speed <= 1e-3, "never reached standstill, stuck at %.4f m/s" % speed

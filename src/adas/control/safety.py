@@ -146,6 +146,32 @@ class SafetyLimits:
     """Opt-in switch. Leave False and an uncalibrated camera reports
     ``camera_uncalibrated`` and floors the state at LIMITED."""
 
+    # --- evidence required before a closing RATE may authorise full braking ---
+    deferred_aeb_decel_mps2: float = 5.0
+    """Deceleration ceiling while an ACUTE emergency test has tripped on the safe
+    prior but the closing rate is not yet measured. Must sit between
+    ``comfort_decel_mps2`` and ``max_deceleration_mps2``."""
+    aeb_rate_corroboration_frames: int = 2
+    """Consecutive frames a rate-dependent emergency test must hold before it
+    authorises full-authority braking."""
+    aeb_min_rate_samples: int = 4
+    """Raw range measurements the arbiter needs before it calls its closing rate
+    MEASURED. Below this the rate is still the ``-ego_speed`` safe prior, and the
+    rate-dependent emergency tests are held to the graded response."""
+    aeb_min_rate_span_s: float = 0.15
+    """Elapsed time the same window must span."""
+    range_rate_window_s: float = 0.60
+    """Window the measured range slope is fitted over."""
+
+    # --- range-source stability ------------------------------------------------
+    range_source_dwell_frames: int = 5
+    range_confidence_hysteresis: float = 0.10
+    range_disagreement_hysteresis: float = 0.25
+
+    max_coast_frames: int = 5
+    """Frames of tracker coasting the arbiter will keep assessing a lead for during
+    a perception dropout, instead of forgetting the hazard it was braking for."""
+
     def to_arbiter_limits(self) -> ArbiterLimits:
         """Project these limits onto the arbiter's own limit object.
 
@@ -209,6 +235,15 @@ class SafetyLimits:
             allow_uncalibrated_range=self.allow_uncalibrated_range,
             throttle_rate_per_s=self.throttle_rate_per_s,
             brake_release_rate_per_s=self.brake_release_rate_per_s,
+            deferred_aeb_decel_mps2=self.deferred_aeb_decel_mps2,
+            aeb_rate_corroboration_frames=self.aeb_rate_corroboration_frames,
+            aeb_min_rate_samples=self.aeb_min_rate_samples,
+            aeb_min_rate_span_s=self.aeb_min_rate_span_s,
+            range_rate_window_s=max(self.range_rate_window_s, self.aeb_min_rate_span_s),
+            range_source_dwell_frames=self.range_source_dwell_frames,
+            range_confidence_hysteresis=self.range_confidence_hysteresis,
+            range_disagreement_hysteresis=self.range_disagreement_hysteresis,
+            max_coast_frames=self.max_coast_frames,
         )
 
 

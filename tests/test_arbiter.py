@@ -1139,30 +1139,65 @@ def test_an_uncalibrated_camera_is_reported_and_cannot_be_nominal():
 
 
 def test_a_stationary_obstacle_brakes_on_the_first_frame_it_is_seen():
-    """The repro (/tmp/rev_cutin.py frame 0), as a permanent test.
+    """The repro (/tmp/rev_cutin.py frame 0), as a permanent test -- and the exact
+    price of not letting the safe prior fire the AEB by itself.
 
-    A stationary car 15 m ahead, ego at 15 m/s, no track history: the arbiter used
-    to report ``state=nominal ttc=inf rate=+0.00 rss=13.7`` and command brake 0.000,
-    because a new track's rate started at zero -- the OPTIMISTIC prior -- which also
-    made ``lead_speed = ego_speed + 0`` and collapsed the RSS minimum gap from
-    ~27.8 m to 13.7 m so the headway test could not fire either. It was blind
-    exactly when a hazard appeared, on every new track, every occlusion exit and
-    every track-id change.
+    Two defects meet here and the test pins the boundary between them.
+
+    * A new track's rate used to start at ZERO -- the optimistic prior -- so a
+      stationary car 15 m ahead with the ego at 15 m/s reported ``ttc=inf`` and
+      commanded brake 0.000.  Blind exactly when a hazard appeared.
+    * Seeding the rate at ``-ego_speed`` fixed that and then let the AEB act on the
+      fabricated number, which braked at full authority for a lead holding a
+      constant 32.5 m (see the constant-range tests below).
+
+    What the arbiter does now: the seeded rate still drives the GRADED response
+    from the very first frame -- throttle cut, comfort-rate braking -- but the
+    rate-dependent AEB waits for ``aeb_min_rate_samples`` real measurements
+    spanning ``aeb_min_rate_span_s``.  The measured cost of that wait, on this
+    scenario, is the three frames asserted below.
     """
     arbiter = SafetyArbiter()
-    result = arbiter.arbitrate(
-        MotionPlan(15.0, 0.0, "cruise_clear"),
-        ControlCommand(0.8, 0.0, 0.0),
-        _context(15.0, tracks=[_track(track_id=1, distance_m=15.0)]),
-    )
-    lead = arbiter.last_lead
+    frames = []
+    distance = 15.0
+    speed = 15.0
+    for index in range(8):
+        result = arbiter.arbitrate(
+            MotionPlan(15.0, 0.0, "cruise_clear"),
+            ControlCommand(0.8, 0.0, 0.0),
+            _context(
+                speed,
+                tracks=[_track(track_id=1, distance_m=distance)],
+                timestamp_s=index * DT,
+            ),
+        )
+        frames.append((result, arbiter.last_lead))
+        distance -= speed * DT  # the obstacle is stationary; the ego closes on it
+
+    first, lead = frames[0]
     assert lead is not None
-    assert lead.range_rate_mps == pytest.approx(-15.0)
+    assert lead.range_rate_mps == pytest.approx(-15.0), "the safe prior is gone"
+    assert lead.rate_is_measured is False, "one sample is not a measurement"
     assert lead.ttc_s < 1.0
     assert lead.rss_min_gap_m > 25.0
-    assert result.state is SafetyState.MIN_RISK_MANEUVER
-    assert result.command.throttle == 0.0
-    assert result.command.brake > 0.5
+    # Frame 0 is NOT blind: throttle off and the graded response already braking.
+    assert first.command.throttle == 0.0
+    assert first.command.brake >= 3.0 / 8.0 - 1e-9, first.command.brake
+    assert any("aeb_deferred_unmeasured_rate" in v for v in first.violations)
+
+    # ... and full authority arrives as soon as the closure is MEASURED.
+    # Measured cost of the wait: three frames for the rate window plus one for the
+    # noise corroboration. The BRAKE arrives a frame before the state does -- the
+    # corroboration gates the manoeuvre, not the pedal.
+    aeb_frame = next(
+        i for i, (r, _) in enumerate(frames) if r.state is SafetyState.MIN_RISK_MANEUVER
+    )
+    assert aeb_frame <= 4, "full authority took %d frames" % aeb_frame
+    assert frames[aeb_frame][1].rate_is_measured is True
+    assert frames[aeb_frame][0].command.brake > 0.9
+    assert frames[aeb_frame][0].command.throttle == 0.0
+    full_brake_frame = next(i for i, (r, _) in enumerate(frames) if r.command.brake > 0.9)
+    assert full_brake_frame <= aeb_frame
 
 
 def test_the_seed_comes_from_the_ego_state_and_is_bounded_by_it():
@@ -1180,16 +1215,29 @@ def test_the_seed_comes_from_the_ego_state_and_is_bounded_by_it():
 
 
 def test_a_lead_that_keeps_pace_converges_off_the_seed_and_returns_to_nominal():
-    """The safe prior must be transient, not a permanent phantom brake."""
+    """The safe prior must be transient, not a permanent phantom brake.
+
+    The range is 20 m, INSIDE the 26 m radius in which the seed used to trip a
+    full-authority AEB on frame 0 at this speed. The previous version of this test
+    used 45 m, which is outside that radius, so it asserted nothing about the
+    failure it is named for.
+    """
     arbiter = SafetyArbiter()
     result = None
+    states = []
+    peak_brake = 0.0
     for index in range(40):
         result = arbiter.arbitrate(
             MotionPlan(15.0, 0.0, "follow"),
             ControlCommand(0.2, 0.0, 0.0),
-            _context(15.0, tracks=[_track(track_id=1, distance_m=45.0)], timestamp_s=index * DT),
+            _context(15.0, tracks=[_track(track_id=1, distance_m=20.0)], timestamp_s=index * DT),
         )
+        states.append(result.state)
+        peak_brake = max(peak_brake, result.command.brake)
+    assert SafetyState.MIN_RISK_MANEUVER not in states, "phantom AEB on a constant range"
+    assert peak_brake <= 3.0 / 8.0 + 1e-9, "more than the comfort rate: %.3f" % peak_brake
     assert abs(arbiter.last_lead.range_rate_mps) < 0.2
+    assert arbiter.last_lead.rate_is_measured is True
     assert result.state is SafetyState.NOMINAL
     assert result.command.brake == 0.0
 
@@ -1639,3 +1687,451 @@ def test_scenario_full_run_never_leaves_the_envelope():
     )
     _assert_command_envelope(history)
     _assert_no_collision(history, floor_m=0.0)
+
+
+# --------------------------------------------------------------------------- #
+# The phantom AEB -- a fabricated rate may inform caution, never full authority
+# --------------------------------------------------------------------------- #
+
+
+def _matched_rss_m(limits: ArbiterLimits, speed_mps: float) -> float:
+    """RSS gap for a lead travelling at exactly the ego speed -- no rate at all."""
+    return max(
+        limits.absolute_min_gap_m,
+        speed_mps * limits.reaction_time_s
+        + speed_mps ** 2 / (2.0 * limits.ego_brake_capability_mps2)
+        - speed_mps ** 2 / (2.0 * limits.lead_brake_capability_mps2),
+    )
+
+
+@pytest.mark.parametrize(
+    "speed_mps, old_phantom_radius_m", [(10.0, 13.0), (15.0, 26.0), (20.0, 43.0), (25.0, 66.0)]
+)
+def test_the_frame_one_aeb_radius_is_bounded_by_the_speed_matched_rss(
+    speed_mps, old_phantom_radius_m
+):
+    """/tmp/hunt2.py, as a permanent test.
+
+    The threshold sweep that found the blocker: on the FIRST frame of a brand-new
+    track -- which is also what a track-id change, an occlusion exit and a range
+    jump look like -- the arbiter used to authorise a full-authority stop for any
+    in-path object closer than 13 m at 10 m/s, 26 m at 15 m/s, 43 m at 20 m/s and
+    66 m at 25 m/s, whatever the object was actually doing. At motorway speed that
+    is inside a normal two-second following distance.
+
+    The only thing that may still fire on frame one is the RATE-INDEPENDENT test:
+    a gap inside half the distance you need behind a lead travelling at exactly
+    your own speed. That is 0.4-0.6 s of headway -- an emergency by inspection.
+    """
+    limits = ArbiterLimits()
+    boundary = limits.aeb_headway_frac * _matched_rss_m(limits, speed_mps)
+    assert boundary < old_phantom_radius_m / 2.0, "the test is not proving anything"
+
+    for distance_m in (boundary * 0.9, boundary * 1.1, old_phantom_radius_m * 0.9):
+        arbiter = SafetyArbiter()
+        result = arbiter.arbitrate(
+            MotionPlan(speed_mps, 0.0, "cruise"),
+            ControlCommand(0.5, 0.0, 0.0),
+            _context(speed_mps, tracks=[_track(track_id=1, distance_m=distance_m)]),
+        )
+        expected_aeb = distance_m < boundary
+        got_aeb = result.state is SafetyState.MIN_RISK_MANEUVER
+        assert got_aeb is expected_aeb, (
+            "ego %.0f m/s, new track at %.1f m: state=%s, rate-independent boundary %.2f m"
+            % (speed_mps, distance_m, result.state.value, boundary)
+        )
+        if not expected_aeb:
+            # Caution is still allowed, FULL AUTHORITY is not: the ceiling on a
+            # response driven by the safe prior alone is deferred_aeb_decel_mps2.
+            ceiling = limits.deferred_aeb_decel_mps2 / limits.brake_authority_mps2
+            assert result.command.brake <= ceiling + 1e-9, result.command.brake
+            assert ceiling < 1.0
+
+
+@pytest.mark.parametrize("speed_mps, distance_m", [(10.0, 12.0), (15.0, 25.0), (20.0, 40.0), (25.0, 60.0)])
+def test_a_lead_at_a_constant_range_is_never_emergency_braked(speed_mps, distance_m):
+    """/tmp/hunt9.py, as a permanent test.
+
+    A lead holding a CONSTANT range is not closing, at any speed and at any range.
+    The seed said otherwise on the first frame of every (re-)initialisation, and
+    the closed-loop consequence was an ego braked from 20.00 m/s to 0.00 m/s in
+    5.7 s behind a car that never moved.
+    """
+    arbiter = SafetyArbiter()
+    states = []
+    peak = 0.0
+    braked_frames = 0
+    for index in range(60):
+        result = arbiter.arbitrate(
+            MotionPlan(speed_mps, 0.0, "follow"),
+            ControlCommand(0.4, 0.0, 0.0),
+            _context(
+                speed_mps,
+                tracks=[_track(track_id=1, distance_m=distance_m)],
+                timestamp_s=index * DT,
+            ),
+        )
+        states.append(result.state)
+        peak = max(peak, result.command.brake)
+        if result.command.brake > 1e-6:
+            braked_frames += 1
+    assert SafetyState.MIN_RISK_MANEUVER not in states, "phantom AEB at %.0f m" % distance_m
+    ceiling = arbiter.limits.deferred_aeb_decel_mps2 / arbiter.limits.brake_authority_mps2
+    assert peak <= ceiling + 1e-9, "peak brake %.3f on a constant range" % peak
+    assert states[-1] is SafetyState.NOMINAL, "never recovered: %s" % states[-1].value
+    # The transient must be a PULSE, not a stop: the safe prior only holds until
+    # there is a measurement, which is the rate window plus a frame of brake-release
+    # shaping. Before the fix the brake never came off at all.
+    assert braked_frames <= 8, "%d of 60 frames braked on a constant range" % braked_frames
+
+
+def test_a_re_identified_track_does_not_re_arm_the_phantom():
+    """A track-id change is the commonest re-initialisation on real footage.
+
+    /tmp/hunt8.py: through the real tracker at 20 m/s behind a lead at a constant
+    32.5 m, the arbiter fired a full 8 m/s^2 stop on the frame the track appeared,
+    again after a 0.45 s detector miss, and again when the track was re-identified.
+    """
+    arbiter = SafetyArbiter()
+    peak = 0.0
+    saw_mrm = False
+    for index in range(60):
+        track_id = 1 if index < 20 else (2 if index < 40 else 3)  # two re-ids
+        result = arbiter.arbitrate(
+            MotionPlan(20.0, 0.0, "follow"),
+            ControlCommand(0.4, 0.0, 0.0),
+            _context(
+                20.0,
+                tracks=[_track(track_id=track_id, distance_m=32.5)],
+                timestamp_s=index * DT,
+            ),
+        )
+        peak = max(peak, result.command.brake)
+        saw_mrm = saw_mrm or result.state is SafetyState.MIN_RISK_MANEUVER
+    assert not saw_mrm, "a re-id re-armed the phantom AEB"
+    assert peak <= 3.0 / 8.0 + 1e-9, "peak brake %.3f across two re-ids" % peak
+
+
+
+# --------------------------------------------------------------------------- #
+# Range-source stability
+# --------------------------------------------------------------------------- #
+
+
+def test_a_flip_flopping_range_source_neither_reseeds_nor_brakes():
+    """The reviewer's frames 166-169 of /tmp/vidrun.log, as a permanent test.
+
+    The measured range was flat at 7.0-7.4 m, the fusion decision flipped
+    pinhole<->fused on every single frame, each flip called
+    ``_range_filter.forget()``, and the re-seeded ``-ego_speed`` rate held
+    ``brake = 1.00`` on a lead that was not moving relative to the ego.
+    """
+    arbiter = SafetyArbiter()
+    switches = 0
+    peak = 0.0
+    saw_mrm = False
+    measured_once = False
+    for index in range(80):
+        # The second channel is present on even frames and absent on odd ones --
+        # the exact provenance dither the real depth channel produces.
+        ranges = (
+            {1: RangeEstimate(distance_m=25.0, confidence=0.8, source=RangeSource.DEPTH_MODEL)}
+            if index % 2 == 0
+            else None
+        )
+        result = arbiter.arbitrate(
+            MotionPlan(15.0, 0.0, "follow"),
+            ControlCommand(0.3, 0.0, 0.0),
+            _context(
+                15.0,
+                tracks=[_track(track_id=1, distance_m=25.0)],
+                independent_ranges=ranges,
+                timestamp_s=index * DT,
+            ),
+        )
+        switches += sum(1 for v in result.violations if "range_source_switch" in v)
+        peak = max(peak, result.command.brake)
+        saw_mrm = saw_mrm or result.state is SafetyState.MIN_RISK_MANEUVER
+        # The opening frames legitimately carry the safe prior. What must never
+        # happen is the prior coming BACK: a source change re-anchors the filter,
+        # it does not discard and re-seed it.
+        if arbiter.last_lead.rate_is_measured:
+            measured_once = True
+        assert not (measured_once and not arbiter.last_lead.rate_is_measured), (
+            "frame %d threw the measured rate away and went back to the seed" % index
+        )
+        if measured_once:
+            assert abs(arbiter.last_lead.range_rate_mps) < 2.0, (
+                "frame %d: %.1f m/s on a flat range"
+                % (index, arbiter.last_lead.range_rate_mps)
+            )
+    assert not saw_mrm, "the provenance dither produced an emergency stop"
+    assert peak <= 3.0 / 8.0 + 1e-9, "peak brake %.3f on a flat range" % peak
+    assert switches <= 2, "%d reported source switches over 80 frames" % switches
+    assert arbiter.last_lead.rate_is_measured is True
+    assert abs(arbiter.last_lead.range_rate_mps) < 0.5
+
+
+def test_a_dithering_second_channel_confidence_does_not_toggle_the_source():
+    """Hysteresis plus dwell on the confidence gate, not a bare threshold."""
+    arbiter = SafetyArbiter()
+    switches = 0
+    for index in range(60):
+        confidence = 0.36 if index % 2 == 0 else 0.34  # straddling min_range_confidence
+        result = arbiter.arbitrate(
+            MotionPlan(15.0, 0.0, "follow"),
+            ControlCommand(0.3, 0.0, 0.0),
+            _context(
+                15.0,
+                tracks=[_track(track_id=1, distance_m=30.0)],
+                independent_ranges={
+                    1: RangeEstimate(
+                        distance_m=30.0, confidence=confidence, source=RangeSource.DEPTH_MODEL
+                    )
+                },
+                timestamp_s=index * DT,
+            ),
+        )
+        switches += sum(1 for v in result.violations if "range_source_switch" in v)
+    assert switches == 0, "%d source switches from a dithering confidence" % switches
+
+
+def test_a_non_finite_second_channel_confidence_is_discarded_not_propagated():
+    """/tmp/hunt3.py section J, as a permanent test.
+
+    ``nan < 0.35`` is False, so a NaN confidence passed the low-confidence gate,
+    NaN-weighted the blend and produced a NaN fused range. Every hazard comparison
+    against NaN is False, so a car 8 m dead ahead at 15 m/s produced
+    ``state=nominal brake=0.000 lead d=nan`` and the input throttle went straight
+    through to the actuators.
+    """
+    arbiter = SafetyArbiter()
+    distance = 8.0
+    first = None
+    result = None
+    for index in range(6):
+        result = arbiter.arbitrate(
+            MotionPlan(15.0, 0.0, "cruise"),
+            ControlCommand(0.5, 0.0, 0.0),
+            _context(
+                15.0,
+                tracks=[_track(track_id=1, distance_m=distance)],
+                independent_ranges={
+                    1: RangeEstimate(
+                        distance_m=distance,
+                        confidence=float("nan"),
+                        source=RangeSource.DEPTH_MODEL,
+                    )
+                },
+                timestamp_s=index * DT,
+            ),
+        )
+        if index == 0:
+            first = result
+            lead = arbiter.last_lead
+            assert lead is not None
+            assert math.isfinite(lead.distance_m), "a NaN confidence blinded the arbiter"
+            assert lead.distance_m == pytest.approx(8.0)
+            assert lead.source is RangeSource.PINHOLE
+        distance -= 15.0 * DT  # the obstacle is stationary
+    assert any("confidence_not_finite" in v for v in first.violations)
+    assert first.state is not SafetyState.NOMINAL
+    assert first.command.throttle == 0.0
+    assert first.command.brake >= 3.0 / 8.0 - 1e-9
+    # ... and once the closure is measured it is a full-authority stop, not a NaN.
+    assert result.state is SafetyState.MIN_RISK_MANEUVER
+    assert result.command.brake > 0.9
+
+
+# --------------------------------------------------------------------------- #
+# A perception dropout must not erase the hazard being braked for
+# --------------------------------------------------------------------------- #
+
+
+def test_a_dropout_keeps_assessing_the_coasted_lead_instead_of_forgetting_it():
+    """/tmp/hunt4.py, as a permanent test.
+
+    ``arbitrate()`` guarded the whole lead assessment with ``if perception.ok``.
+    The tracker coasts its tracks through a blink, so the arbiter was handed a
+    populated track list on exactly those frames and threw it away: the command
+    collapsed from the AEB demand to the flat 3.5 m/s^2 MRM floor for the duration
+    of the dropout, while still closing on the obstacle, and jumped straight back
+    the frame perception returned.
+    """
+    arbiter = SafetyArbiter()
+    speed = 15.0
+    distance = 25.0
+    brakes = []
+    for index in range(20):
+        ok = not (10 <= index < 15)
+        coast = 0 if ok else index - 9
+        result = arbiter.arbitrate(
+            MotionPlan(15.0, 0.0, "follow"),
+            ControlCommand(0.0, 0.0, 0.0),
+            _context(
+                speed,
+                tracks=[_track(track_id=1, distance_m=distance, time_since_update=coast)],
+                perception_ok=ok,
+                timestamp_s=index * DT,
+            ),
+        )
+        brakes.append(result.command.brake)
+        distance = max(1.0, distance - speed * DT)
+    before = brakes[9]
+    during = brakes[10:15]
+    assert before > 0.5, "the setup never established an emergency brake: %.3f" % before
+    for offset, value in enumerate(during):
+        assert value >= before - 1e-9, (
+            "dropout frame %d cut the brake %.3f -> %.3f" % (10 + offset, before, value)
+        )
+    assert min(during) > 3.5 / 8.0 + 0.05, "the brake fell back to the flat MRM floor"
+
+
+def test_a_coasted_range_cannot_by_itself_authorise_an_emergency_stop():
+    """An extrapolation is not a measurement.
+
+    A track that has been coasting since its first frame has no MEASURED range
+    history at all, so the rate-dependent AEB tests stay inhibited; only the
+    rate-independent ones (which read the coasted range, not a rate) can fire.
+    """
+    arbiter = SafetyArbiter()
+    distance = 18.0
+    for index in range(5):
+        result = arbiter.arbitrate(
+            MotionPlan(20.0, 0.0, "follow"),
+            ControlCommand(0.0, 0.0, 0.0),
+            _context(
+                20.0,
+                tracks=[_track(track_id=1, distance_m=distance, time_since_update=index + 1)],
+                perception_ok=False,
+                timestamp_s=index * DT,
+            ),
+        )
+        distance -= 20.0 * DT
+    assert arbiter.last_lead is not None
+    assert arbiter.last_lead.coasting is True
+    assert arbiter.last_lead.rate_is_measured is False, "an extrapolation became a measurement"
+    assert any("aeb_deferred_unmeasured_rate" in v for v in result.violations)
+
+
+def test_a_track_coasted_past_the_limit_is_dropped_rather_than_believed():
+    arbiter = SafetyArbiter()
+    limits = arbiter.limits
+    result = arbiter.arbitrate(
+        MotionPlan(15.0, 0.0, "follow"),
+        ControlCommand(0.0, 0.0, 0.0),
+        _context(
+            15.0,
+            tracks=[
+                _track(
+                    track_id=1,
+                    distance_m=6.0,
+                    time_since_update=limits.max_coast_frames + 1,
+                )
+            ],
+            perception_ok=False,
+        ),
+    )
+    assert arbiter.last_lead is None
+    assert any("too_stale" in v for v in result.violations)
+
+
+# --------------------------------------------------------------------------- #
+# The arbiter must not treat its own intervention as evidence for itself
+# --------------------------------------------------------------------------- #
+
+
+def test_an_mrm_releases_once_its_own_braking_is_the_only_remaining_finding():
+    """/tmp/hunt10.py and the 300-frame closed loop, as a permanent test.
+
+    The arbiter's own MRM braking opens a gap between the planner's target speed
+    and the measured ego speed; ``_check_plan`` turned that into
+    ``plan_accel_X_above_3.00``, which forced LIMITED, which reset the recovery
+    streak, so ``_latch`` could never de-escalate. The vehicle was braked to a
+    standstill on an open road. The plan target here is deliberately held at
+    20 m/s while the ego is slowed, which is exactly that confound.
+    """
+    arbiter = SafetyArbiter()
+    speed = 20.0
+    states = []
+    saw_induced = False
+    for index in range(120):
+        # A real hazard for the first 20 frames, then clear road.
+        tracks = [_track(track_id=1, distance_m=6.0)] if index < 20 else []
+        result = arbiter.arbitrate(
+            MotionPlan(20.0, 0.0, "cruise"),
+            ControlCommand(0.4, 0.0, 0.0),
+            _context(speed, tracks=tracks, timestamp_s=index * DT),
+        )
+        states.append(result.state)
+        saw_induced = saw_induced or any("arbiter_induced" in v for v in result.violations)
+        speed = max(0.0, speed - 8.0 * result.command.brake * DT + 2.5 * result.command.throttle * DT)
+    assert SafetyState.MIN_RISK_MANEUVER in states, "the real hazard never produced an MRM"
+    assert saw_induced, "the plan_accel confound never appeared, so nothing was proved"
+    tail = states[-60:]
+    assert SafetyState.MIN_RISK_MANEUVER not in tail, "still braking on an open road"
+    assert SafetyState.NOMINAL in tail, "never de-escalated: %s" % sorted({s.value for s in tail})
+    assert speed > 5.0, "the arbiter braked the vehicle to a crawl on an open road: %.2f" % speed
+
+
+def test_the_arbiters_own_deceleration_and_jerk_do_not_hold_it_degraded():
+    """The same principle on the kinematics channel.
+
+    A vehicle answering the arbiter's own emergency brake produces a deceleration
+    and a jerk spike. Counting those as unrecovered findings resets the recovery
+    streak every frame for as long as the arbiter keeps braking.
+    """
+    arbiter = SafetyArbiter()
+    speed = 20.0
+    induced = []
+    final = None
+    for index in range(60):
+        tracks = [_track(track_id=1, distance_m=5.0)] if index < 10 else []
+        # The plan target tracks the ego speed, so plan_accel cannot contribute and
+        # this test isolates the achieved-deceleration and jerk channel.
+        result = arbiter.arbitrate(
+            MotionPlan(speed, 0.0, "cruise"),
+            ControlCommand(0.4, 0.0, 0.0),
+            _context(speed, tracks=tracks, timestamp_s=index * DT),
+        )
+        induced.extend(
+            v for v in result.violations if "arbiter_commanded" in v or "jerk_" in v
+        )
+        # A deliberately violent plant so the jerk and decel checks trip.
+        speed = max(
+            0.0, speed - 12.0 * result.command.brake * DT + 2.5 * result.command.throttle * DT
+        )
+        final = result
+    assert induced, "the setup never produced a decel/jerk finding, so nothing was proved"
+    assert final.state is SafetyState.NOMINAL, "held degraded by its own braking"
+    assert arbiter.state is SafetyState.NOMINAL
+
+
+def test_a_held_mrm_steering_finding_does_not_hold_the_mrm_open():
+    """The lateral instance of the same class.
+
+    In MIN_RISK_MANEUVER the arbiter replaces the planner's steering with its own
+    hold, so a ``steering_rate`` or ``lateral_accel`` finding about the discarded
+    request is a report, not a reason to stay in the manoeuvre.
+    """
+    limits = _limits(max_steering_rate_rad_s=0.5, recovery_frames=5)
+    arbiter = SafetyArbiter(limits)
+    # Three dropouts put the arbiter in MRM; the planner keeps sawing at the wheel.
+    for index in range(4):
+        arbiter.arbitrate(
+            MotionPlan(10.0, 0.0, "x"),
+            ControlCommand(0.0, 0.0, 0.0),
+            _context(10.0, perception_ok=False, timestamp_s=index * DT),
+        )
+    assert arbiter.state is SafetyState.MIN_RISK_MANEUVER
+    result = None
+    for index in range(4, 30):
+        result = arbiter.arbitrate(
+            MotionPlan(10.0, 0.0, "x"),
+            ControlCommand(0.0, 0.0, 1.0 if index % 2 else -1.0),
+            _context(10.0, timestamp_s=index * DT),
+        )
+    assert any("steering_rate" in v for v in result.violations), "the setup raised nothing"
+    assert result.state is not SafetyState.MIN_RISK_MANEUVER, (
+        "the arbiter's own steering hold kept the manoeuvre alive: %s" % result.violations
+    )

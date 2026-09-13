@@ -165,9 +165,24 @@ class DataRecorder:
             "config": asdict(self.config),
         }
         self._since_flush = 0
+        self.metadata["environment"] = {}
         logger.info("DataRecorder initialised: %s", self.recording_dir)
 
     # ------------------------------------------------------------------ control
+
+    def note_environment(self, **facts: Any) -> None:
+        """Record facts about the pipeline that produced this recording.
+
+        These are the things a replay CANNOT re-derive from the frames and must
+        not guess at.  ``depth_channel`` is the load-bearing one: the independent
+        range channel is not recorded, so a recording made with it can never be
+        a faithful reproduction, and a replayer must be able to say so rather
+        than infer it from a range-source string that means something else (the
+        tracker reports ``fused`` for its own pinhole/width fusion with no depth
+        model anywhere in the run).  See
+        :func:`adas.tools.replayer.replay_fidelity_gaps`.
+        """
+        self.metadata.setdefault("environment", {}).update(facts)
 
     def start_recording(self) -> None:
         self.is_recording = True
@@ -393,6 +408,15 @@ class RecordingPipeline:
     def __init__(self, pipeline: Any, recorder: DataRecorder) -> None:
         self.pipeline = pipeline
         self.recorder = recorder
+        # The wrapper is the only object that can see both the pipeline and the
+        # recording, so it is where the replay-fidelity facts are captured.
+        recorder.note_environment(
+            depth_channel=getattr(pipeline, "depth_channel", None) is not None,
+            camera=getattr(pipeline, "camera", None) is not None,
+            detector=type(getattr(pipeline, "detector", None)).__name__,
+            lane_estimator=type(getattr(pipeline, "lane_estimator", None)).__name__,
+            lane_every_n_frames=getattr(pipeline, "lane_every_n_frames", None),
+        )
 
     def step(self, frame: PerceptionFrame, current_speed_mps: Optional[float] = None,
              dt_s: float = 0.05, ego: Optional[EgoState] = None):

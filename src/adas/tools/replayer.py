@@ -9,6 +9,32 @@ Two uses:
   :func:`replay_with_pipeline` does, and it is the only cheap way to tell whether
   a change to the planner or the arbiter alters behaviour on real data.
 
+What replay reproduces, and what it does not.  A regression harness that
+silently reproduces nothing is worse than no harness, so the envelope is stated
+here and enforced by :func:`replay_with_pipeline`:
+
+* **Reproduced exactly** -- the detections, the lane model, the ego state
+  (validity included), the frame geometry, the frame timestamps and the measured
+  ``dt`` of every frame.  Tracking, planning, control and arbitration are then
+  RE-RUN on that input, which is the point: a change to the planner or the
+  arbiter shows up as a difference against the recorded decision.
+* **Not reproduced** -- anything the recorder does not store.  The drivable-area
+  mask is stored as a flag, not a mask, and the depth channel is not stored at
+  all.  A recording that used either is replayed WITHOUT it and
+  :func:`replay_with_pipeline` says so, loudly, once per replay; the arbitration
+  can then legitimately differ and the caller has been told why.
+
+How the recorded perception reaches the pipeline.  ``ADASPipeline._run_perception``
+calls ``detector.infer(frame.rgb, ...)`` -- it hands the backend the IMAGE, not
+the :class:`PerceptionFrame` -- so a replay backend keyed on ``frame_id`` cannot
+find its frame from that argument alone.  It used to return ``[]`` instead, which
+was indistinguishable from "the recorded detector found nothing": a recorded
+full-authority AEB replayed as brake 0.0 on every frame with no error anywhere
+(ADAS-OPS-05).  The replay driver now sets the frame id on both backends before
+each step (:meth:`RecordedDetector.set_frame`), the ``rgb`` placeholder carries
+``frame_id`` as a second route, and a backend that STILL cannot tell which frame
+it is on raises instead of inventing an empty road.
+
 What changed and why: the previous version reconstructed a ``LaneModel`` with
 ``coefficients=``, ``lateral_offset_m=`` and ``heading_error_rad=`` keyword
 arguments, none of which are fields of ``LaneModel``, so
@@ -189,7 +215,15 @@ class DataReplayer:
         return frame
 
     def _load_image(self, data: dict) -> Any:
-        placeholder = {"width": int(data["width"]), "height": int(data["height"])}
+        # The placeholder carries ``frame_id`` because it is the ONLY thing the
+        # pipeline hands to the perception backends: ``_run_perception`` calls
+        # ``detector.infer(frame.rgb, ...)``.  Without it a replay backend cannot
+        # tell which frame it is on.  See the module docstring (ADAS-OPS-05).
+        placeholder = {
+            "width": int(data["width"]),
+            "height": int(data["height"]),
+            "frame_id": int(data["frame_id"]),
+        }
         image = data.get("image")
         if not self.config.load_images or not isinstance(image, dict):
             return placeholder
@@ -382,19 +416,68 @@ def _lane_from_dict(data: Dict[str, Any]) -> LaneModel:
     )
 
 
-class RecordedDetector:
+class _FrameKeyedBackend:
+    """Common frame-identification for the replay backends.
+
+    ``ADASPipeline._run_perception`` passes ``frame.rgb`` -- the image -- to the
+    backends, so a backend keyed on ``frame_id`` has three possible routes to it,
+    tried in this order:
+
+    1. the cursor the replay driver set with :meth:`set_frame` before the step.
+       This is the authoritative one and always available under
+       :func:`replay_with_pipeline`; it works even when ``load_images`` is on and
+       ``rgb`` is a bare numpy array carrying no identity at all.
+    2. ``frame.frame_id`` when the caller passed the whole
+       :class:`~adas.core.models.PerceptionFrame`.
+    3. ``rgb["frame_id"]`` from the replayer's placeholder dict.
+
+    If none of them resolves, the backend RAISES.  It must not return an empty
+    result: "I could not tell which frame this is" and "there was nothing on this
+    frame" are different claims, and conflating them is what let a recorded AEB
+    replay as a clear road (ADAS-OPS-05).  The raise surfaces through
+    ``_run_perception`` as a perception FAILURE, which the arbiter degrades on --
+    visible, rather than silent.
+    """
+
+    def __init__(self) -> None:
+        self._cursor: Optional[int] = None
+
+    def set_frame(self, frame_id: Optional[int]) -> None:
+        """Tell the backend which recorded frame the pipeline is about to step."""
+        self._cursor = None if frame_id is None else int(frame_id)
+
+    def _frame_id(self, frame: Any) -> int:
+        if self._cursor is not None:
+            return self._cursor
+        candidate = getattr(frame, "frame_id", None)
+        if candidate is None and isinstance(frame, dict):
+            candidate = frame.get("frame_id")
+        if candidate is None:
+            raise ConfigurationError(
+                "%s could not identify the frame it was asked about (%r). A replay "
+                "backend must never answer 'nothing here' when it means 'I do not "
+                "know which frame this is'; call set_frame() before stepping the "
+                "pipeline, or use replay_with_pipeline()."
+                % (type(self).__name__, type(frame).__name__)
+            )
+        return int(candidate)
+
+
+class RecordedDetector(_FrameKeyedBackend):
     """Detector backend that replays a recording's detections.
 
     This is what makes offline regression possible without a GPU: the pipeline
     calls ``infer`` exactly as it would call YOLOX, and gets the boxes that were
-    actually produced on that frame.  A frame id absent from the recording yields
-    an empty list -- which correctly means "the recorded detector found nothing",
-    because a recording only omits detections when there were none.
+    actually produced on that frame.  A frame id that IS resolved but is absent
+    from the index yields an empty list -- that correctly means "the recorded
+    detector found nothing", because a recording only omits detections when there
+    were none.  An UNRESOLVABLE frame id raises; see :class:`_FrameKeyedBackend`.
     """
 
     is_mock = False
 
     def __init__(self, replayer: "DataReplayer") -> None:
+        super().__init__()
         self.by_frame: Dict[int, List[BoundingBox]] = {}
         for idx in range(len(replayer)):
             frame = replayer.get_perception_frame(idx)
@@ -402,36 +485,85 @@ class RecordedDetector:
                 self.by_frame[frame.frame_id] = list(frame.detections)
 
     def infer(self, frame: Any, width: int, height: int) -> List[BoundingBox]:
-        frame_id = getattr(frame, "frame_id", None)
-        if frame_id is None and isinstance(frame, dict):
-            frame_id = frame.get("frame_id")
-        return list(self.by_frame.get(int(frame_id), [])) if frame_id is not None else []
+        return list(self.by_frame.get(self._frame_id(frame), []))
 
     def close(self) -> None:
         self.by_frame.clear()
 
 
-class RecordedLaneEstimator:
-    """Lane backend that replays a recording's lane models."""
+class RecordedLaneEstimator(_FrameKeyedBackend):
+    """Lane backend that replays a recording's lane models.
+
+    ``drivable_area`` always returns ``None``: the recorder stores whether a
+    drivable area existed, not its mask.  :func:`replay_with_pipeline` warns when
+    a recording it is replaying contained one, because its absence can change
+    ``in_ego_lane`` and therefore the arbitration.
+    """
 
     name = "recorded"
     is_mock = False
 
     def __init__(self, replayer: "DataReplayer") -> None:
+        super().__init__()
         self.by_frame: Dict[int, Optional[LaneModel]] = {}
         for record in replayer.frames:
             lane = record.get("lane")
             self.by_frame[int(record["frame_id"])] = _lane_from_dict(lane) if lane else None
 
     def estimate(self, frame: Any, width: int, height: int) -> Optional[LaneModel]:
-        frame_id = getattr(frame, "frame_id", None)
-        return self.by_frame.get(int(frame_id)) if frame_id is not None else None
+        return self.by_frame.get(self._frame_id(frame))
 
     def drivable_area(self):
         return None
 
     def close(self) -> None:
         self.by_frame.clear()
+
+
+def replay_fidelity_gaps(replayer: "DataReplayer") -> List[str]:
+    """What this recording contains that a replay cannot reproduce.
+
+    Empty means the replay is a faithful reproduction of the decision path for
+    this recording.  Non-empty is not an error -- it is the list of reasons the
+    replayed arbitration may legitimately differ from the recorded one, and it is
+    what a caller comparing the two must be told.
+    """
+    gaps: List[str] = []
+    if any(record.get("drivable") for record in replayer.frames):
+        gaps.append(
+            "the recording used a drivable-area mask; the recorder stores only a "
+            "flag, so tracking replays without it and in_ego_lane may differ"
+        )
+
+    environment = replayer.metadata.get("environment")
+    used_depth = None
+    if isinstance(environment, dict) and "depth_channel" in environment:
+        used_depth = bool(environment["depth_channel"])
+    elif any(
+        track.get("range_source") == "depth_model"
+        for record in replayer.frames
+        for track in record.get("tracks", [])
+    ):
+        # A pre-``environment`` recording. Note that ``fused`` is NOT evidence of
+        # a depth channel: the tracker reports it for its own pinhole/width
+        # fusion, with no depth model in the run at all.
+        used_depth = True
+    if used_depth:
+        gaps.append(
+            "the recording used the independent depth range channel; it is not "
+            "recorded, so replayed ranges come from the pinhole model alone"
+        )
+    elif used_depth is None:
+        gaps.append(
+            "the recording predates environment capture, so whether the depth "
+            "range channel was in use is unknown and cannot be reproduced either way"
+        )
+    if not any("arbitration" in record for record in replayer.frames):
+        gaps.append(
+            "the recording predates arbitration; there is no arbitrated command "
+            "to compare a replay against"
+        )
+    return gaps
 
 
 def build_replay_backends(replayer: "DataReplayer"):
@@ -462,13 +594,27 @@ def replay_with_pipeline(replayer: DataReplayer, pipeline: Any, dt_s: float = 0.
 
     The recorded :class:`EgoState` -- validity included -- is replayed, so a
     recording made with no ego speed replays as degraded rather than as 0 m/s.
+
+    Fidelity is reported, not assumed: :func:`replay_fidelity_gaps` is evaluated
+    up front and every gap is logged as a WARNING before the first frame, so a
+    caller that then finds a difference knows whether the recording could ever
+    have reproduced.  The depth channel is also detached for the duration --
+    replaying recorded boxes through a LIVE depth model would mix a recorded
+    range with a freshly computed one and produce a decision that never happened.
     """
+    for gap in replay_fidelity_gaps(replayer):
+        logger.warning("Replay is not a faithful reproduction: %s", gap)
     saved = (pipeline.detector, pipeline.lane_estimator)
+    saved_depth = getattr(pipeline, "depth_channel", None)
     pipeline.detector, pipeline.lane_estimator = build_replay_backends(replayer)
+    if saved_depth is not None:
+        pipeline.depth_channel = None
     try:
         yield from _replay_frames(replayer, pipeline, dt_s)
     finally:
         pipeline.detector, pipeline.lane_estimator = saved
+        if saved_depth is not None:
+            pipeline.depth_channel = saved_depth
 
 
 def _replay_frames(replayer: DataReplayer, pipeline: Any, dt_s: float):
@@ -477,6 +623,13 @@ def _replay_frames(replayer: DataReplayer, pipeline: Any, dt_s: float):
         perception = replayer.get_perception_frame(replayer.current_frame_idx)
         if perception is None:
             continue
+        # Tell the replay backends which frame this is BEFORE stepping. The
+        # pipeline hands them ``frame.rgb``, not the frame, so this is the only
+        # route that works for every recording -- images or not (ADAS-OPS-05).
+        for backend in (pipeline.detector, pipeline.lane_estimator):
+            setter = getattr(backend, "set_frame", None)
+            if setter is not None:
+                setter(perception.frame_id)
         recorded_dt = frame_data.get("timing", {}).get("dt_s", dt_s)
         plan, command = pipeline.step(perception, dt_s=float(recorded_dt), ego=perception.ego)
         yield frame_data, (plan, command)
@@ -488,5 +641,6 @@ __all__ = [
     "RecordedLaneEstimator",
     "ReplayConfig",
     "build_replay_backends",
+    "replay_fidelity_gaps",
     "replay_with_pipeline",
 ]

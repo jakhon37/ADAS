@@ -562,41 +562,197 @@ def test_cli_reports_a_bad_config_as_exit_code_two(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_record_and_replay_round_trip(tmp_path):
-    from adas.runtime.capture import SyntheticSource as _Synthetic  # noqa: F401
+def _record_a_run(tmp_path, frames=8, name="run"):
+    """Record ``frames`` frames of the mock pipeline and return the replayer."""
     from adas.tools import (
         DataRecorder,
         DataReplayer,
         RecordingConfig,
         RecordingPipeline,
         ReplayConfig,
-        replay_with_pipeline,
     )
 
     pipeline, _config = build_mock_pipeline()
-    recorder = DataRecorder(RecordingConfig(output_dir=str(tmp_path), recording_name="run"))
+    recorder = DataRecorder(RecordingConfig(output_dir=str(tmp_path), recording_name=name))
     recorder.start_recording()
     wrapper = RecordingPipeline(pipeline, recorder)
-
     runner = PipelineRunner(wrapper, target_fps=0.0, ego_source=SimulatedEgoSpeed(10.0))
-    runner.run(source_type="synthetic", max_frames=8)
+    runner.run(source_type="synthetic", max_frames=frames)
     recorder.stop_recording()
-
     assert recorder.errors == 0, "recording a lane used to raise AttributeError"
-    replayer = DataReplayer(ReplayConfig(recording_dir=str(tmp_path / "run"), playback_speed=0.0))
+    return DataReplayer(
+        ReplayConfig(recording_dir=str(tmp_path / name), playback_speed=0.0)
+    )
+
+
+def test_record_and_replay_round_trip(tmp_path):
+    """A replay must reproduce the DECISION, not just the frame count.
+
+    The regression (ADAS-OPS-05): ``pipeline._run_perception`` hands the backends
+    ``frame.rgb``, not the frame, so the recorded-perception backends could not
+    tell which frame they were on, returned empty, and OVERWROTE the detections
+    the replayer had correctly loaded.  A recorded full-authority AEB replayed as
+    brake 0.000 on every frame, silently:
+
+        frame | recorded brake | replayed brake
+          2   |     1.000      |     0.000
+          5   |     0.960      |     0.000
+
+    So this asserts the whole arbitrated command and the state, not the brake
+    alone, and it asserts that the recorded perception actually reached the
+    pipeline -- which is the defect, and which does not move when the arbiter's
+    thresholds are retuned.
+    """
+    from adas.runtime.capture import SyntheticSource as _Synthetic  # noqa: F401
+    from adas.tools import replay_with_pipeline
+
+    replayer = _record_a_run(tmp_path, frames=8)
     assert len(replayer) == 8
     assert replayer.get_perception_frame(0) is not None
     assert replayer.get_ego(0).valid is True
 
+    # Anti-vacuity guard, deliberately NOT "the recorded brake was 1.0": that
+    # depends on the arbiter's thresholds and would quietly stop testing anything
+    # the next time they move.  What must be true for this test to mean something
+    # is that perception reached the pipeline, which is exactly the defect.
+    recorded_detections = [len(f.get("detections", [])) for f in replayer.frames]
+    assert sum(recorded_detections) > 0, "precondition: something was detected"
+
     pipeline2, _c2 = build_mock_pipeline()
+    seen = []
+    inner_step = pipeline2.step
+
+    def spy(frame, *args, **kwargs):
+        result = inner_step(frame, *args, **kwargs)
+        seen.append(len(frame.detections))
+        return result
+
+    pipeline2.step = spy  # type: ignore[assignment]
     results = list(replay_with_pipeline(replayer, pipeline2))
+    assert seen == recorded_detections, (
+        "the replayed pipeline saw %s detections for a recording of %s -- the "
+        "replay is not reproducing the decision path" % (seen, recorded_detections)
+    )
     assert len(results) == 8
     for recorded, (_plan, command) in results:
+        where = "frame %s" % recorded["frame_id"]
         assert recorded["arbitration"]["command"]["brake"] == pytest.approx(
             command.brake, abs=1e-6
-        )
+        ), where
+        assert recorded["arbitration"]["command"]["throttle"] == pytest.approx(
+            command.throttle, abs=1e-6
+        ), where
+        assert recorded["arbitration"]["command"]["steering"] == pytest.approx(
+            command.steering, abs=1e-6
+        ), where
+    assert pipeline2.last_arbitration.state.value == replayer.frames[-1]["arbitration"]["state"]
+
     summary_path = replayer.export_summary()
     assert summary_path.exists()
+
+
+def test_replay_actually_re_runs_perception_into_the_pipeline(tmp_path):
+    """The specific silent failure: zero detections on every replayed frame."""
+    from adas.tools import replay_with_pipeline
+
+    replayer = _record_a_run(tmp_path, frames=6, name="perc")
+    recorded_counts = [len(f.get("detections", [])) for f in replayer.frames]
+    assert sum(recorded_counts) > 0, "precondition: something was detected"
+
+    pipeline2, _c2 = build_mock_pipeline()
+    seen = []
+    original_step = pipeline2.step
+
+    def spy(frame, *args, **kwargs):
+        result = original_step(frame, *args, **kwargs)
+        seen.append(len(frame.detections))
+        return result
+
+    pipeline2.step = spy  # type: ignore[assignment]
+    list(replay_with_pipeline(replayer, pipeline2))
+    assert seen == recorded_counts, (
+        "the pipeline must see the RECORDED detections on every replayed frame; "
+        "got %s for a recording of %s" % (seen, recorded_counts)
+    )
+
+
+def test_a_replay_backend_that_cannot_identify_its_frame_raises(tmp_path):
+    """'I do not know which frame this is' must never be reported as 'nothing here'.
+
+    That conflation is what made the round-trip failure silent, so it is now an
+    error instead of an empty list.
+    """
+    from adas.core.exceptions import ConfigurationError
+    from adas.tools import build_replay_backends
+
+    replayer = _record_a_run(tmp_path, frames=4, name="raise")
+    detector, lane = build_replay_backends(replayer)
+
+    with pytest.raises(ConfigurationError):
+        detector.infer(object(), 1280, 720)
+    with pytest.raises(ConfigurationError):
+        lane.estimate(object(), 1280, 720)
+
+    # ... but an anonymous buffer WITH the cursor set is fine, which is the
+    # load_images=True case (a bare numpy array carries no identity).
+    detector.set_frame(0)
+    lane.set_frame(0)
+    assert detector.infer(object(), 1280, 720) == list(detector.by_frame[0])
+    assert lane.estimate(object(), 1280, 720) == lane.by_frame[0]
+
+    # A RESOLVED frame id that is not in the recording is still an empty road.
+    detector.set_frame(9999)
+    assert detector.infer(object(), 1280, 720) == []
+
+
+def test_the_rgb_placeholder_carries_the_frame_id(tmp_path):
+    """The pipeline passes frame.rgb to the backends; it must be identifiable."""
+    replayer = _record_a_run(tmp_path, frames=3, name="rgb")
+    for idx in range(3):
+        frame = replayer.get_perception_frame(idx)
+        assert isinstance(frame.rgb, dict)
+        assert frame.rgb["frame_id"] == frame.frame_id
+
+
+def test_replay_declares_the_fidelity_it_cannot_deliver(tmp_path):
+    """Narrowed scope, stated explicitly: what a replay does NOT reproduce.
+
+    The recorder stores whether a drivable-area mask existed, not the mask, and
+    does not store the depth channel at all.  Rather than pretend, the replayer
+    enumerates the gaps so a caller comparing decisions knows which differences
+    are legitimate.  A recording with neither reports no gaps -- i.e. it IS a
+    faithful reproduction of the decision path.
+    """
+    # NOTE: imported from the module, not the package: src/adas/tools/__init__.py
+    # is not owned by this workstream and does not re-export it yet (see handoff).
+    from adas.tools.replayer import replay_fidelity_gaps
+
+    replayer = _record_a_run(tmp_path, frames=4, name="fidelity")
+    assert replay_fidelity_gaps(replayer) == [], (
+        "the mock run uses neither a drivable mask nor the depth channel, so its "
+        "replay is faithful and must declare no gaps"
+    )
+
+    replayer.frames[1]["drivable"] = {"width": 1280, "height": 720, "has_mask": True}
+    replayer.metadata["environment"]["depth_channel"] = True
+    gaps = replay_fidelity_gaps(replayer)
+    assert len(gaps) == 2, gaps
+    assert any("drivable-area" in g for g in gaps)
+    assert any("depth range channel" in g for g in gaps)
+
+    # "fused" is the tracker's OWN pinhole/width fusion and is NOT evidence of a
+    # depth channel -- inferring one from it is what made the first attempt at
+    # this report cry wolf on every mock recording.
+    replayer.metadata["environment"]["depth_channel"] = False
+    replayer.frames[2].setdefault("tracks", []).append(
+        {"track_id": 1, "distance_m": 20.0, "range_source": "fused"}
+    )
+    assert not any("depth range channel" in g for g in replay_fidelity_gaps(replayer))
+
+    # A recording from a build that predates environment capture cannot say
+    # either way, and must admit that rather than claim fidelity.
+    replayer.metadata.pop("environment")
+    assert any("predates environment capture" in g for g in replay_fidelity_gaps(replayer))
 
 
 # --------------------------------------------------------------------------- #

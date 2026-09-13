@@ -602,3 +602,132 @@ def test_planner_reset_re_arms_the_log_gates(caplog):
         if r.levelno >= logging.WARNING and "no usable ego speed" in r.getMessage()
     ]
     assert len(warnings) == 2
+
+
+# --------------------------------------------------------------------------- #
+# The primary path must be able to stop the car BY ITSELF
+#
+# Regression for the blocker "the planner+controller still cannot execute an AEB
+# on their own; the arbiter is the only thing that brakes hard enough to avoid a
+# collision". The arbiter is meant to be an independent backstop; if it is the
+# only effective brake there is no redundancy and every arbiter defect is a
+# single point of failure. None of these tests instantiate an arbiter.
+# --------------------------------------------------------------------------- #
+
+W_PX, H_PX = 1280, 720
+ACCEL_AUTHORITY = 2.5
+BRAKE_AUTHORITY = 8.0
+
+
+def _lead_track(gap_m, closing_mps, frame_index=0):
+    return TrackedObject(
+        track_id=1,
+        box=BoundingBox(600.0, 300.0, 680.0, 400.0, 0.9, "car"),
+        velocity_mps=closing_mps,
+        distance_m=gap_m,
+        age_frames=frame_index,
+        hits=frame_index,
+        time_since_update=0,
+        in_ego_lane=True,
+    )
+
+
+def _drive_closed_loop(gap0, ego_v0, lead_v0, lead_accel, frames, dt=DT):
+    """Plant driven by the CONTROLLER ONLY. Returns (rows, collided)."""
+    from adas.control import PIDLikeLongitudinalController
+
+    planner = BehaviorPlanner(ego_lane_half_width_frac=0.25)
+    controller = PIDLikeLongitudinalController()
+    v, lead_v, gap, t = ego_v0, lead_v0, gap0, 0.0
+    rows = []
+    for i in range(frames):
+        plan = planner.plan(
+            frame_width_px=W_PX,
+            lane_center_px=W_PX / 2.0,
+            objects=[_lead_track(gap, v - lead_v, i)],
+            ego=EgoState(speed_mps=v, valid=True, timestamp_s=t),
+            perception_valid=True,
+            dt_s=dt,
+            frame_height_px=H_PX,
+        )
+        emergency = "aeb" in plan.reason
+        cmd = controller.to_command(plan, v, dt_s=dt, emergency=emergency)
+        rows.append((t, gap, v, plan.target_speed_mps, cmd.throttle, cmd.brake, plan.reason))
+        v = max(0.0, v + (ACCEL_AUTHORITY * cmd.throttle - BRAKE_AUTHORITY * cmd.brake) * dt)
+        lead_v = max(0.0, lead_v + lead_accel(t) * dt)
+        gap += (lead_v - v) * dt
+        t += dt
+        if gap <= 0.0:
+            return rows, True
+    return rows, False
+
+
+def test_planner_and_controller_alone_stop_behind_a_decelerating_lead():
+    """No arbiter anywhere: the primary path must avoid the collision by itself."""
+    rows, collided = _drive_closed_loop(
+        gap0=30.0, ego_v0=15.0, lead_v0=15.0, lead_accel=lambda t: -4.0, frames=300
+    )
+    assert not collided, "collided; min gap %.2f m" % min(r[1] for r in rows)
+    assert min(r[1] for r in rows) > 1.0
+    assert rows[-1][2] < 0.5, "ego never stopped: v=%.2f" % rows[-1][2]
+
+
+def test_planner_and_controller_alone_reach_full_brake_in_a_cut_in():
+    """The CONTROLLER's own brake column, not the arbiter's, must saturate."""
+    rows, _ = _drive_closed_loop(
+        gap0=15.0, ego_v0=15.0, lead_v0=0.0, lead_accel=lambda t: 0.0, frames=20
+    )
+    assert "aeb" in rows[0][6], rows[0][6]
+    full = next((r[0] for r in rows if r[5] >= 0.99), None)
+    assert full is not None, "controller never reached full brake: %s" % [
+        round(r[5], 3) for r in rows
+    ]
+    assert full <= 0.25, "full brake only at %.2f s: %s" % (
+        full,
+        [round(r[5], 3) for r in rows],
+    )
+
+
+def test_closed_loop_recovers_to_no_brake_when_the_hazard_clears():
+    """Feed-forward is an output that becomes an input; it must not self-sustain."""
+
+    def profile(t):
+        if t < 2.0:
+            return 0.0
+        if t < 5.0:
+            return -4.0
+        if t < 9.0:
+            return 0.0
+        if t < 13.0:
+            return 2.0
+        return 0.0
+
+    rows, collided = _drive_closed_loop(
+        gap0=40.0, ego_v0=15.0, lead_v0=15.0, lead_accel=profile, frames=400
+    )
+    assert not collided
+    tail = rows[-60:]
+    assert all(r[5] == 0.0 for r in tail), "still braking after recovery: %s" % [
+        round(r[5], 3) for r in tail
+    ]
+    # Settled on the constant-time-gap equilibrium, not oscillating around it.
+    gaps = [r[1] for r in tail]
+    assert max(gaps) - min(gaps) < 1.0, "gap still ringing: %.2f m" % (max(gaps) - min(gaps))
+    switches = 0
+    previous = "coast"
+    for r in rows:
+        mode = "throttle" if r[4] > 0 else ("brake" if r[5] > 0 else "coast")
+        if mode != previous and "coast" not in (mode, previous):
+            switches += 1
+        previous = mode
+    assert switches <= 2, "%d direct throttle<->brake switches in 400 frames" % switches
+
+
+def test_no_braking_when_the_gap_is_already_at_equilibrium():
+    """400 frames at the spacing policy's own fixed point: zero pedal action."""
+    rows, collided = _drive_closed_loop(
+        gap0=42.0, ego_v0=15.0, lead_v0=15.0, lead_accel=lambda t: 0.0, frames=400
+    )
+    assert not collided
+    assert max(r[5] for r in rows) == 0.0
+    assert max(r[4] for r in rows) == 0.0
