@@ -56,7 +56,7 @@ see [README.md](README.md#calibration).
 ```bash
 git clone --recurse-submodules https://github.com/jakhon37/ADAS.git
 cd ADAS
-PYTHONPATH=src python3 -m pytest tests/ -q          # 743 tests
+PYTHONPATH=src python3 -m pytest tests/ -q          # 859 pass, 1 known failure
 ```
 
 Or use the staged installer, which copies into
@@ -209,6 +209,11 @@ What to check, in order:
    engine, `perception.ok`, at least one completed frame, and a fresh snapshot.
 2. `adas_lane_is_mock == 0` and `engines` contains no `"mock"`. A mock backend on
    a vehicle unit is an alerting condition.
+2b. `engine_sha256` in `/healthz` lists every engine this process verified against
+   `models/MANIFEST.json`, and `adas_ram_mb` is a real number (never `0`; an
+   unmeasurable RSS exports `NaN`). An engine the manifest does not list loads with a
+   WARNING and does **not** appear there — on a vehicle unit that is an alerting
+   condition too.
 3. `adas_ego_speed_valid == 1`. It is 1 only for an ego source that is both valid
    **and** a measurement — a simulated or declared speed reports 0.
 4. `adas_safety_state{state="nominal"} == 1` in steady traffic. Persistent
@@ -252,3 +257,20 @@ There is no vehicle interface in this repository. `ControlCommand` is
 arbitrating against the driver, and handling actuator faults are all outside it.
 The ROS 2 bridge is the nearest thing and it has never been executed. Nothing
 here has been through ISO 26262 work of any kind.
+
+Four more things a deployment does not get, stated so nobody assumes otherwise:
+
+* **No soak evidence.** The longest run ever performed against this codebase is a few
+  hundred frames — about 25 seconds of clip. There is no 8 h result, no RSS curve, no
+  file-descriptor audit. `MemoryMax=3G` in the unit is a guess against a process
+  measured at 1.09 GiB RSS / 1.38 GiB high-water over 300 frames.
+* **No camera has ever been attached** to the development board, so the CSI path in
+  `deploy/` has never moved a frame.
+* **The unit has never been started.** `sudo` needs a password in this environment.
+  Everything under `deploy/` is validated by `systemd-analyze verify` and review only.
+* **Several safety thresholds are not reachable from a config file.** The new
+  `SafetyLimits` fields — including `min_dt_s`, `max_dt_s`, `max_frame_gap_s` and the
+  whole `aeb_*` group, two of which can latch the terminal DISENGAGE state — are
+  settable programmatically but have no key in `SafetyConfig` or
+  `adas.cli.build_safety_limits`. A deployed config file therefore cannot pin them.
+  So are `failsafe_hold_s`, `emergency_stop_time_s` and the log-gate periods.

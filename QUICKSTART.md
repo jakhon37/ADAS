@@ -15,7 +15,8 @@ share this hardware.
 ```bash
 cd ~/myspace/ADAS
 
-# 1. Tests. 743 pass; the engine-backed ones skip when a file is missing.
+# 1. Tests. 859 pass, 1 fails (a known replayer defect - see README "Testing").
+#    The engine-backed ones skip when a file is missing.
 flock /tmp/jetson-gpu.lock -c "PYTHONPATH=src python3 -m pytest tests/ -q"
 
 # 2. Real engines, blank frames. Proves the engines deserialise and the loop runs.
@@ -29,26 +30,41 @@ flock /tmp/jetson-gpu.lock -c "PYTHONPATH=src python3 -m adas.cli \
   --frames 200 --fps 0"
 ```
 
-Actual output of (3):
+Actual output of (3), re-run on 2026-09-13 at 16:47 KST with the board carrying
+loadavg 2.9:
 
 ```
-frames=200 failures=0 dropped=0 reconnects=0 elapsed=13.09s
-measured=15.28 FPS busy=15.44 FPS (64.8 ms/frame) reason=completed
+frames=200 failures=0 dropped=0 reconnects=0 settle=1 elapsed=12.49s
+measured=16.01 FPS busy=16.16 FPS (61.9 ms/frame) reason=completed
   Detections:       136 (avg 0.68/frame)
   Tracks:           154 (avg 0.77/frame)
   Lane detected:    100.0% of frames
+  Perception fails: 0
+  Safety:           58 violations, 15 warnings
 ```
 
-A representative per-frame line:
+`settle=1` is the runner's post-loop release: on a clean exit it emits exactly one
+zero-throttle command so nothing stays latched on the actuators.
+
+A representative per-frame line from the second half of that run:
 
 ```
 frame=198 det=1 trk=2 lane=yes lead=8.0m plan=follow_gap_8.0m|lane_center_err_0.11
-          safety=nominal cmd=t0.00/b0.12/s+0.06
+          safety=min_risk_maneuver cmd=t0.00/b0.44/s+0.05
 ```
 
 `cmd=` is the **arbitrated** command — what the actuators would receive — not the
 controller's request. When they differ, the line is logged at WARNING with the
 violations that caused it.
+
+**Do not expect `safety=nominal`.** With `--ego-source simulated` the point-mass
+plant closes on a lead the tracker puts 7–13 m ahead at 15 m/s, so this command
+spends most of its second half in `min_risk_maneuver`: 58 violations over 200 frames,
+mostly `jerk_*_above_4.0` (the plant's own step response) and `range_source_switch_*`.
+That is the arbiter working. It also means this bench command is not a demonstration
+of a clean run, and the arbiter emits **one WARNING line per frame** while it is in a
+steady non-nominal state — measured: exactly 200 `adas.control.arbiter` lines in a
+200-frame run. Use `--log-level ERROR` if that is in the way.
 
 ## Without engines, or on any other machine
 

@@ -1,7 +1,9 @@
 # ADAS on this Jetson
 
-Last verified on hardware: **2026-09-13**. Workspace `/home/nvidia/myspace/ADAS`,
-branch `production-v1`, version 0.3.0.
+Last verified on hardware: **2026-09-13, 16:47–17:00 KST**. Workspace
+`/home/nvidia/myspace/ADAS`, branch `production-v1`, version 0.3.0 plus an
+unreleased hardening pass. Every number below was re-taken in that window with the
+GPU mutex held and the board carrying loadavg 2.6–4.0 from other agents' work.
 
 This is the document to read before doing anything on this board.
 
@@ -47,8 +49,12 @@ and be converted with on-board `trtexec`.
 * **Lane** — UFLD-v2 CULane ResNet-18 FP16 with the canonical preprocessing.
   YOLOP is built and works (lane + drivable area + vehicles) but must be
   scheduled at 2–5 Hz.
-* **Depth** — MiDaS v2.1 small, wired as an independent range channel, **off by
-  default** (`depth.backend: off`).
+* **Depth** — MiDaS v2.1 small, **demoted**. It is wired, it is off by default
+  (`depth.backend: off`), and even when switched on it publishes **no metric range**:
+  every box comes back `RangeSource.UNAVAILABLE`, confidence 0. Its measured
+  per-object rank correlation with the reference range on this clip is 0.14–0.25
+  against the 0.80 bar it now audits itself against. There is currently **no
+  independent range channel on this board** — the arbiter runs on pinhole alone.
 * **Tracking** — Kalman range filter + Hungarian association, M-of-N
   confirmation, per-class height priors, truncation flags, metric lateral offset.
 * **Planning / control** — constant time-gap ACC with a separate AEB stage, a
@@ -58,26 +64,45 @@ and be converted with on-board `trtexec`.
   the pipeline returns.
 * **Operations** — `/healthz`, `/readyz`, `/metrics` on `127.0.0.1:8090`, a JSONL
   event log, systemd notify + watchdog, SIGTERM/SIGHUP handling, `--frames 0`.
-* **743 tests pass** on host Python 3.8.
+* **859 tests pass, 1 fails** on host Python 3.8 (50.75 s). The failure is
+  `tests/test_integration.py::test_record_and_replay_round_trip` and it is a real
+  defect in `src/adas/tools/replayer.py`, not a flake — see item 11 below.
 
-### Measured, 2026-09-13
+### Measured, 2026-09-13 16:47–17:00 KST
 
-200 frames of `example.mp4`, YOLOX-Nano + UFLD-v2, unpaced, GPU mutex held:
+All unpaced (`--fps 0`), GPU mutex held, board at loadavg 2.6–4.0.
+
+200 frames of `example.mp4`, YOLOX-Nano + UFLD-v2, `--ego-source simulated`:
 
 ```
-frames=200 failures=0 dropped=0 reconnects=0 elapsed=13.09s
-measured=15.28 FPS busy=15.44 FPS (64.8 ms/frame)
+frames=200 failures=0 dropped=0 reconnects=0 settle=1 elapsed=12.49s
+measured=16.01 FPS busy=16.16 FPS (61.9 ms/frame)
 detections=136  tracks=154  lane detected in 100% of frames
+safety: 58 violations, 15 warnings
 ```
 
-Per-stage (ms): detect 14.05 mean / 12.73 p50 · lane 42.92 / 40.57 ·
-track 0.93 / 0.11 · plan 0.20 / 0.18 · control 0.07 / 0.06 · arbitrate 0.44 / 0.30.
+Per-stage (ms, mean / p50 / p95): detect 12.68 / 12.37 / 15.32 ·
+lane 41.17 / 38.73 / 46.82 · track 0.95 / 0.11 / 3.04 · plan 0.21 / 0.18 / 0.29 ·
+control 0.08 / 0.07 / 0.10 · arbitrate 0.46 / 0.29 / 0.97 ·
+frame interval 61.38 / 58.56 / 75.06.
 
-The decision layer costs **1.6 ms/frame**. The budget is entirely perception, and
-within it, entirely UFLD-v2's host-side pre/post-processing: 16.5 ms of that
-42.9 ms is GPU compute (`trtexec`), the rest is CPU.
+The decision layer costs **1.70 ms/frame mean**. The budget is entirely perception,
+and within it, entirely UFLD-v2's host-side pre/post-processing: 16.5 ms of that
+41.2 ms is GPU compute (`trtexec`), the rest is CPU.
 
-Mock backends: 3.5 ms/frame, ~282 FPS busy.
+Backend matrix, same session, same clip:
+
+| detector + lane | frames | FPS | ms/frame |
+|---|---:|---:|---:|
+| YOLOX-Nano + UFLD-v2 | 200 | 16.01 | 61.9 |
+| YOLOX-Nano + UFLD-v2 + MiDaS | 100 | 16.81 | 59.1 |
+| YOLOX-Nano + YOLOP (auto `every_n_frames=4`) | 100 | 26.42 | 37.4 |
+| YOLOv5n + UFLD-v2 (AGPL, dev only) | 100 | 13.71 | 72.4 |
+| YOLOX-Nano + TwinLiteNet | — | refuses to start (no engine) | — |
+| mock + mock (no GPU) | 200 | 285.86 | 3.0 |
+
+Memory, measured on a live 300-frame run with the health endpoint up:
+`adas_ram_mb 1091.6`, `VmRSS 1.07 GiB`, `VmHWM 1.32 GiB`.
 
 ## What does NOT work yet
 
@@ -103,6 +128,8 @@ Mock backends: 3.5 ms/frame, ~282 FPS busy.
    engine first (measured: works at ~1.1 GB available in that order, fails in the
    other). It does not remove the risk. Check `free -m` first.
 5. **No overlay or saved debug video.** Still the highest-value debugging gap.
+5b. **No soak test.** The longest run against this codebase is a few hundred frames
+   — about 25 seconds of clip. No 8 h result, no RSS curve over time, no FD audit.
 6. **ROS 2 bridge never executed.** `rclpy` is not installed. The module imports
    fine and refuses to construct a node.
 7. **The systemd unit has never been started**, and
@@ -117,6 +144,23 @@ Mock backends: 3.5 ms/frame, ~282 FPS busy.
 10. **Nothing is calibrated against ground truth.** Sign conventions, detector
     thresholds and every planner/arbiter constant are engineering defaults tuned
     on one flat-highway clip.
+11. **`tests/test_integration.py::test_record_and_replay_round_trip` fails.**
+    `RecordedDetector.infer` reads `getattr(frame, "frame_id")` but
+    `ADASPipeline.step` hands it `frame.rgb`, so every replayed frame returns zero
+    detections and the replay re-runs the decision layers on an empty road. The
+    record/replay tooling is not a usable regression harness until that is fixed.
+12. **The `camera_uncalibrated` safety violation is implemented but not wired.**
+    `src/adas/runtime/pipeline.py` does not pass `camera.calibrated` into the
+    `SafetyContext`, so a live run on the shipped `calibrated: false` camera reports
+    `safety=nominal` while acting on assumed metric ranges. `/healthz` does carry the
+    note `"camera is not calibrated: metric outputs are assumptions"` — verified in a
+    live run today — but the arbiter itself raises nothing.
+13. **The arbiter logs one WARNING per frame** in a steady non-nominal state.
+    Measured today: exactly 200 `adas.control.arbiter` lines in a 200-frame run
+    (270 log lines total). At 20 Hz that is 72,000 lines an hour. The planner layers
+    were fixed with a `LogGate`; `arbiter.py` has not been converted.
+14. **Several safety thresholds are unreachable from a YAML/JSON config**, including
+    two that can latch the terminal DISENGAGE state. See `DEPLOYMENT.md`.
 
 ## How to run
 
@@ -198,17 +242,23 @@ engine must be rebuilt, and `TrtEngine` says so in its deserialisation error.
   Docker run cannot be removed without sudo. `pyproject.toml` redirects pytest's
   cache to `/tmp/adas-pytest-cache`, so they are inert.
 * `tests/test.txt` is a stray prose file inside `tests/` claiming "32 passed".
-  The real number is 743.
+  The real number today is 859 passed / 1 failed.
 * Running with the default config writes `data/events.jsonl` into the repository
   (the lab path for the event log). Use `--no-events`, or set `events.path`, if
   that is unwelcome.
 
 ## Next, in order
 
+0. **Fix `src/adas/tools/replayer.py`** so the record/replay round trip actually
+   replays perception. It is one failing test today, but the consequence is that the
+   only offline regression harness this project has is silently comparing every
+   change against an empty road.
 1. **Calibrate the camera** and wire `LaneCalibrator` into a startup routine or a
    `scripts/calibrate_camera.py`. Everything metric is blocked on this, and the
    measured self-consistency improvement is large (lane width 3.86 ± 0.346 m →
-   3.646 ± 0.135 m).
+   3.646 ± 0.135 m). While you are there, pass `camera.calibrated` into the
+   `SafetyContext` from `pipeline.py` — one line, and it turns on a safety violation
+   that is already written and tested.
 2. **Overlay and saved debug video** — boxes, track ids, range, lane, plan,
    arbiter state, throttle/brake. Same idea as the DMS replay tool.
 3. **A real ego speed channel**, even a recorded one, so the closed loop is not

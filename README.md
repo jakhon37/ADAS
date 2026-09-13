@@ -16,9 +16,15 @@ safety arbiter** whose command is the only one that reaches an actuator.
 > [What is not production ready](#what-is-not-production-ready) — that list is
 > the most important section of this file.
 
-**Version 0.3.0.** Measured on this Xavier NX on 2026-09-13: 200 frames of
-`example.mp4` through YOLOX-Nano + UFLD-v2 + tracker + planner + controller +
-arbiter at **15.3 FPS end to end**, 0 failures, 743/743 tests passing.
+**Version 0.3.0**, plus an unreleased safety-hardening pass — see
+[CHANGELOG.md](CHANGELOG.md#unreleased--2026-09-13-safety-hardening-pass).
+
+Re-measured on this Xavier NX on **2026-09-13 at 16:47 KST**, GPU mutex held, board
+shared with other work (loadavg 2.9): 200 frames of `example.mp4` through YOLOX-Nano
++ UFLD-v2 + tracker + planner + controller + arbiter at **16.0 FPS end to end**
+(61.9 ms/frame), 0 perception failures. Test suite: **859 passed, 1 failed** — the
+failure is named and explained under [Testing](#testing). Every number in this
+document was re-taken on that date; nothing is carried over.
 
 ---
 
@@ -31,51 +37,67 @@ arbiter at **15.3 FPS end to end**, 0 failures, 743/743 tests passing.
 | Lane perception | UFLD-v2 CULane ResNet-18 (TensorRT FP16) | **Real.** Canonical preprocessing, per-dataset anchors, ego boundaries by index |
 | Lane + free space | YOLOP (TensorRT FP16) | **Real.** Lane fit is noisier than UFLD; the drivable-area mask is good. Must be scheduled at 2–5 Hz |
 | Lane (TwinLiteNet) | — | **Honest stub.** No engine exists on this board; the decoder is written, the constructor refuses to run without weights, and the stub reports `is_mock=True` and never invents a lane |
-| Independent range | MiDaS v2.1 small (TensorRT FP16) | **Real, off by default.** Inverse *relative* depth, affine-aligned per frame against road-plane anchors. A cross-check, not a metric sensor |
+| Relative depth (ordinal only) | MiDaS v2.1 small (TensorRT FP16) | **Loaded but demoted; off by default.** It publishes **no metric range at all**: `update()` returns `RangeSource.UNAVAILABLE`, confidence 0, for every box. The engine runs and the road-plane affine fit is good, but the measured per-object rank correlation against the reference range is 0.14–0.25 against the 0.80 bar the channel now audits itself against, so metres are gated shut and only a unitless ordinal signal (`ordinal_readings()`) is exposed. The full measurement table is the `adas.perception.depth` module docstring |
 | Camera geometry | Pinhole + flat-ground homography | **Real, UNCALIBRATED by default.** Every derived metric value is confidence-capped and labelled |
 | Tracking | Kalman range filter + Hungarian association | **Real.** M-of-N confirmation, class-keyed height priors, truncation flags, per-track TTC |
-| Longitudinal | Constant time-gap ACC + separate AEB stage | **Real** |
+| Longitudinal | Constant time-gap ACC + separate AEB stage | **Real.** An AEB decision now publishes a 0 m/s target on the frame it fires, with no downward rate limit, and the controller has an emergency feed-forward — previously the planner's AEB decision could not be executed by the control path at all |
 | Lateral | Speed-scheduled pixel law; Stanley law behind a calibrated camera | **Real (non-metric path active)**. The metric law refuses to engage on an uncalibrated camera |
-| Safety arbitration | Independent arbiter with its own lead selection, range filter and kinematics | **Real, and authoritative** |
+| Safety arbitration | Independent arbiter with its own lead selection, range filter and kinematics | **Real, and authoritative.** Its in-path corridor is anchored on the image centre and never reads the tracker's `in_ego_lane` or the lane model's centre (see [Safety architecture](#safety-architecture)). It is a second opinion on the *decision*, not a second sensor |
 | Operations | Prometheus `/metrics`, `/healthz`, `/readyz`, JSONL event log, systemd notify + watchdog | **Real and wired** |
 | ROS 2 bridge | `adas.ros2` | **Written, NEVER EXECUTED.** `rclpy` is not installed on this board |
 | Mock detector / mock lane | — | **Honest stubs.** `is_mock=True`, loud banners, refused unless `--allow-mock` |
 
 ### Measured numbers
 
-All on the Xavier NX (MODE_20W_6CORE), 2026-09-13, GPU mutex held.
+All on the Xavier NX (MODE_20W_6CORE), **2026-09-13, 16:47–16:55 KST**, GPU mutex
+held, board shared with other agents (loadavg 2.5–3.0 throughout). Every run is
+`--fps 0` (unpaced), `--no-health --no-events`, source
+`Ultra-Fast-Lane-Detection-v2/example.mp4`.
 
-**End to end, 200 frames of `Ultra-Fast-Lane-Detection-v2/example.mp4`, YOLOX-Nano
-+ UFLD-v2, unpaced:**
+**Backend matrix — one command per row, `--ego-source simulated --ego-speed 15`:**
 
-```
-frames=200 failures=0 dropped=0 reconnects=0 elapsed=13.09s
-measured=15.28 FPS  busy=15.44 FPS  (64.8 ms/frame)
-detections=136  tracks=154  lane detected in 100% of frames
-```
+| detector + lane | frames | measured FPS | ms/frame | detections | lane rate | perception fails |
+|---|---:|---:|---:|---:|---:|---:|
+| YOLOX-Nano + UFLD-v2 | 200 | **16.01** | 61.9 | 136 | 100.0% | 0 |
+| YOLOX-Nano + UFLD-v2 + MiDaS | 100 | 16.81 | 59.1 | 0 | 100.0% | 0 |
+| YOLOX-Nano + YOLOP (auto `every_n_frames=4`) | 100 | 26.42 | 37.4 | 0 | 100.0% | 0 |
+| YOLOv5n + UFLD-v2 (AGPL, dev only) | 100 | 13.71 | 72.4 | 1 | 100.0% | 0 |
+| YOLOX-Nano + TwinLiteNet | — | — | — | — | — | refuses to start: no engine |
 
-Per-stage latency from that run (ms):
+The `detections=0` rows are not a fault: over the **first 100 frames** of this clip
+YOLOX-Nano finds essentially nothing, and the 136 detections of the 200-frame run all
+arrive in its second half. That is a property of the clip and of YOLOX-Nano's recall,
+and it is the same effect recorded in [docs/JETSON.md](docs/JETSON.md) item 8. Do not
+read the 100-frame rows as a detector comparison.
+
+**Per-stage latency, the 200-frame YOLOX-Nano + UFLD-v2 run (ms):**
 
 | stage | mean | p50 | p95 | max |
-|---|---|---|---|---|
-| detect (YOLOX-Nano 416) | 14.05 | 12.73 | 15.64 | 133.5 |
-| lane (UFLD-v2) | 42.92 | 40.57 | 54.05 | 131.7 |
-| track | 0.93 | 0.11 | 2.83 | 4.29 |
-| plan | 0.20 | 0.18 | 0.27 | 1.68 |
-| control | 0.07 | 0.06 | 0.12 | 0.27 |
-| arbitrate | 0.44 | 0.30 | 0.85 | 1.08 |
+|---|---:|---:|---:|---:|
+| detect (YOLOX-Nano 416) | 12.68 | 12.37 | 15.32 | 60.82 |
+| lane (UFLD-v2) | 41.17 | 38.73 | 46.82 | 148.07 |
+| track | 0.95 | 0.11 | 3.04 | 4.53 |
+| plan | 0.21 | 0.18 | 0.29 | 1.29 |
+| control | 0.08 | 0.07 | 0.10 | 0.38 |
+| arbitrate | 0.46 | 0.29 | 0.97 | 2.57 |
+| **frame interval** | **61.38** | **58.56** | **75.06** | **174.33** |
 
-The first-frame `max` values are engine warm-up. The decision layer (track +
-plan + control + arbitrate) costs **1.6 ms/frame**; the budget is entirely
-perception.
+The `max` column on the first two rows is engine warm-up on frame 0. The decision
+layer (track + plan + control + arbitrate) costs **1.70 ms/frame mean**; the budget is
+still entirely perception, and within perception it is still UFLD-v2's host-side
+pre/post-processing — 16.5 ms of that 41.2 ms is GPU compute per `trtexec`.
 
-**Mock backends (no GPU):** 3.5 ms/frame, ~282 FPS busy.
+**What the arbiter did in that run, and why it is not `nominal`.** With
+`--ego-source simulated` the plant closes on a lead the tracker puts 7–13 m ahead at
+15 m/s, so the run spends most of its second half in `min_risk_maneuver` with
+`cmd=t0.00/b0.44`. Over 200 frames: **58 safety violations, 15 warnings**, the
+commonest being `jerk_*_above_4.0` (the point-mass plant's own step response) and
+`range_source_switch_*` (the fused/pinhole channel alternating on one track). That is
+the arbiter working, not a defect — but it means **`safety=nominal` is not the steady
+state of the shipped bench command**, and any claim that it is should be distrusted.
 
-**Raw engine compute** (`trtexec`, batch 1, FP16 — from `models/README.md`):
-YOLOX-Nano 4.69 ms · MiDaS 6.33 ms · YOLOX-Tiny 6.43 ms · YOLOv5n 7.23 ms ·
-UFLD-v2 16.53 ms · YOLOP 26.98 ms. The gap between 16.5 ms of UFLD GPU compute
-and 42.9 ms of measured lane stage is host-side pre/post-processing plus
-`TrtEngine`'s copies.
+**Mock backends (no GPU):** see [Testing](#testing) — the mock path is a CPU-only
+smoke test, not a performance claim about anything the vehicle would run.
 
 ### Memory, and one load-order rule that matters
 
@@ -150,11 +172,21 @@ a wider gap, and past the last sample, the value is held for at most
 `ego.max_age_s` and then reported invalid — a frozen speed is exactly what makes
 a dead bus look healthy.
 
-With a realistic recorded channel the whole system runs clean: 50 frames of
-`example.mp4` with YOLOX-Nano and a 0.1–0.5 s spaced speed CSV gave
-**0 safety violations, 0 warnings, `safety=nominal` throughout**, with the
-throttle rising from 0.00 to 0.24 as the controller closed on the 15 m/s cruise
-target from a measured ~12 m/s.
+**How clean a recorded channel actually is, measured twice on 2026-09-13.** With a
+0.5 s-spaced speed CSV and YOLOX-Nano:
+
+| frames | detections | safety violations | warnings |
+|---:|---:|---:|---:|
+| 50 | 0 | **0** | **0** |
+| 400 | 456 | **303** | 13 |
+
+The 50-frame result is the one this README used to quote on its own, and it does
+reproduce — `safety=nominal` on every frame, throttle rising 0.00 → 0.09 as the
+controller closes on cruise. But it is 50 frames of clip in which the detector finds
+**nothing at all**, so it measures an empty road, not a clean system. Over the full
+400 frames, where 456 detections and 493 tracks appear, the arbiter intervenes on the
+great majority of frames — mostly `jerk_*_above_4.0` from the plant's own step
+response and `range_source_switch_*` on a single track. Quote the 400-frame row.
 
 ---
 
@@ -167,28 +199,64 @@ capture → detect → lane → track → depth cross-check → plan → control
 ```
 
 The arbiter (`adas.control.arbiter.SafetyArbiter`) is deliberately independent of
-the planner: its own lead selection over the raw track list (ordered by TTC, then
-range), its own alpha-beta range filter with a jump gate, its own kinematics from
-measured ego speed, its own RSS minimum-gap test. It never reads
-`TrackedObject.velocity_mps`. On any violation the command the pipeline returns
-is the arbiter's rate-shaped fail-safe, not the controller's request.
+the planner. What that independence actually consists of, as the code stands today:
 
-Two properties are enforced by tests in `tests/test_pipeline.py`:
+* **Its own lead selection**, over the raw track list, ordered by TTC then range.
+  Its in-path corridor is anchored on the **image centre** with a half width of at
+  least `ArbiterLimits.min_in_path_half_width_frac` (0.30 of the frame width), and
+  membership is by box overlap. It does **not** read `TrackedObject.in_ego_lane`
+  (the tracker computes that from the same lane model the planner reads) and a lane
+  model may only *widen* the corridor, never move or narrow it, and only when the
+  lane is not mock, its centre is finite and inside the frame, and its confidence is
+  at least `lane_trust_confidence` (0.50). A bad lane centre can therefore no longer
+  hide a real lead from the arbiter.
+* **Its own alpha-beta range filter**, seeded on a new or re-initialised track from
+  `-max(0, ego_speed)` — the safe prior that an unknown object is stationary in the
+  world. It does not read `TrackedObject.velocity_mps`.
+* **Its own kinematics** differenced from measured ego speed, and its own RSS
+  minimum-gap test.
+* **Its own output invariant**: the returned command is never more energetic than the
+  input. Throttle is only ever reduced; **brake is only ever increased**, enforced
+  structurally by a final `max(brake, cmd_in.brake)`. There is deliberately no brake
+  *apply*-rate limit in the arbiter — brake application jerk belongs to the
+  controller, which owns the emergency exemption. Only the throttle apply-rate and
+  the brake *release*-rate floor survive as output shaping.
+
+**What is NOT independent, and matters.** `SafetyContext.tracks` is the tracker's
+output, so a detection perception never produced is invisible to the arbiter too, and
+`EgoState` is the same object the planner reads, so a wrong ego speed fools both
+channels identically. The arbiter is a second opinion on the **decision**, not a
+second sensor.
+
+Three properties are enforced by tests in `tests/test_pipeline.py` and
+`tests/test_arbiter.py`:
 
 * **A runaway controller cannot actuate.**
   `test_arbiter_command_is_what_the_pipeline_returns` installs a controller that
   always commands full throttle and asserts the returned throttle is 0.
 * **A perception failure is a fault, not an empty road.** An exception from the
   detector or lane estimator produces `PerceptionStatus(ok=False)` with a rising
-  `consecutive_failures`; the tracker is **not** advanced with a synthetic empty
-  detection list (which would read as "every object vanished"), and the planner
-  is told `perception_valid=False`. An empty detection list from a *working*
-  detector still means the road is clear.
+  `consecutive_failures`, and the planner is told `perception_valid=False`. No
+  detection is fabricated and no track is corrected, but the tracker **is** advanced
+  by a predict-only step (`ADASPipeline._coast_tracks`): live tracks coast with
+  growing covariance and rising `time_since_update`, their range estimate becomes
+  `RangeSource.UNAVAILABLE`, and they are deleted at `max_missed`. Freezing them —
+  which is what the previous build did — made the recovery frame associate a real
+  measurement against an N-frame-stale prediction that still claimed full confidence.
+  An empty detection list from a *working* detector still means the road is clear.
+* **Leaving the frame loop is a command too.** `PipelineRunner` classifies every loop
+  exit. On a *clean* exit (EOF, frame budget, operator stop) it emits exactly one
+  zero-throttle, zero-brake release. On an **unsafe** exit — `source_lost` or
+  `pipeline_dead` — it re-emits `ADASPipeline.failsafe_command()` once per nominal
+  period for `failsafe_hold_s` (default 1.0 s, i.e. 20 commands at 20 Hz) so the
+  arbiter's brake ramp actually reaches the minimum-risk manoeuvre. The hold is
+  **bounded**, not indefinite: it hands back to the caller, and `deploy/adas.service`
+  is the thing that restarts the process. Previously a mid-stream sensor loss took
+  `break` and left the last throttle latched on the actuators for ever.
 
 When `pipeline.step` raises, the runner actuates
-`ADASPipeline.failsafe_command()` — the arbiter's minimum-risk command — and
-counts the failure; ten consecutive failures stop the loop. It never latches the
-previous command on the actuators.
+`ADASPipeline.failsafe_command()` and counts the failure; ten consecutive failures
+stop the loop. It never latches the previous command on the actuators.
 
 ---
 
@@ -214,7 +282,7 @@ Start from `config.example.json` and change these:
   "allow_mock": false,
   "detector": { "backend": "yolox", "model_path": "models/yolox_nano.engine" },
   "lane":     { "backend": "ufld",  "model_path": "models/ufldv2_culane_res18.engine" },
-  "depth":    { "backend": "midas", "cadence_frames": 5 },
+  "depth":    { "backend": "off", "cadence_frames": 5 },
   "camera": {
     "enabled": true, "calibrated": true, "label": "vehicle-2026-09-13",
     "image_width": 1280, "image_height": 720,
@@ -229,8 +297,14 @@ Start from `config.example.json` and change these:
 ```
 
 Do **not** set `"calibrated": true` until you have actually measured the mount
-height and pitch. It is the switch that tells the whole stack its metres are
-real.
+height and pitch. It is the switch that tells the whole stack its metres are real.
+
+`depth` stays `off`. Turning it to `"midas"` costs an engine load and buys nothing
+today: the channel publishes no metric range (see the model table), so the arbiter
+runs on the pinhole channel alone either way. Measured on this board, adding
+`--depth midas` to the reference run changed the frame rate from 16.0 to 16.8 FPS —
+i.e. within the board's own run-to-run noise — and produced zero
+`range_channel_*` findings, because there is nothing for the fusion to consume.
 
 ### Calibration
 
@@ -273,13 +347,39 @@ curl -s http://127.0.0.1:8090/metrics | grep adas_safety_state
   needs `allow_remote` set on purpose, since the body carries live safety state,
   ego speed and lead range.
 * `/metrics` — ~55 series including `adas_safety_state{state}`,
-  `adas_stage_duration_ms{stage}`, `adas_lane_is_mock`, `adas_ego_speed_valid`
-  and `adas_build_info`.
+  `adas_stage_duration_ms{stage}`, `adas_lane_is_mock`, `adas_ego_speed_valid`,
+  `adas_ram_mb` and `adas_build_info`.
+
+Two fields on `/healthz` are new and are worth knowing about:
+
+* **`ram_mb`** is now populated on every probe and every scrape (re-read from
+  `/proc/self/statm`, rate-limited to once a second). It used to be `null` always,
+  because nothing called `HealthState.refresh_process()`, while `adas_ram_mb` scraped
+  as the literal `0` for a process holding over a gigabyte. When RAM genuinely cannot
+  be measured the gauge now exports `NaN`, never `0`.
+* **`engine_sha256`** maps engine filename → the sha256 this process actually
+  verified. Engines are verified against `models/MANIFEST.json` **before** they are
+  deserialised, and a digest mismatch or a manifest/runtime TensorRT version mismatch
+  refuses the load (`EngineIntegrityError`). An engine the manifest does not list
+  logs a WARNING and loads as unverifiable. There is no environment-variable bypass.
+  Copying an engine in by hand without updating the manifest will now stop the
+  process, by design.
 
 The event log (`data/events.jsonl` in a lab profile) records lifecycle,
 safety-state transitions, perception dropouts, engine failures and source events
 as JSON lines. Entering `MIN_RISK_MANEUVER` or `DISENGAGE` is CRITICAL and is
 `fsync`ed immediately.
+
+**The event schema is now v2, and the ordering rules changed.** Sort by `seq`: it
+continues from the last record already in the file at startup, so it is the
+authoritative order of a file *across a restart*. `t` is stamped unconditionally from
+`time.monotonic()` inside the writer — one field, one clock domain, never
+caller-supplied — and is comparable only within one `boot` id, because the kernel
+monotonic clock restarts at zero at boot. A previous version of this documentation
+claimed `boot` + `t` gave "a total order across restarts"; that was false and has been
+removed. `ts` (wall clock) can step backwards at an NTP correction. A new 12-hex-digit
+`run` field distinguishes two writer instances sharing one file. No field orders
+records written into *different* files.
 
 `SIGTERM`/`SIGINT` stop the loop after the current frame and unwind through the
 normal shutdown path; `SIGHUP` reopens the event log for `logrotate`.
@@ -345,36 +445,75 @@ This is the list to read before quoting anything above.
    above all `brake_authority_mps2 = 8.0`, which converts a required deceleration
    into a pedal fraction. If the real vehicle delivers less at `brake = 1.0` the
    arbiter under-brakes by exactly that ratio and no software can detect it.
-5. **The arbiter is not input-diverse for ego speed.** It runs its own range
-   filter, lead selection and kinematics, but it consumes the same `EgoState` the
-   planner does. A wrong ego speed fools both channels identically. It does at
-   least reject implausible and stale states.
-6. **The depth cross-check is off by default and is not a second calibrated
-   sensor.** Its absolute scale is borrowed from the same camera homography, so a
-   wrong calibration makes both channels wrong by the same factor. What is
-   independent is the per-object measurement — whether an object's surface sits
-   where its box implies, relative to the road and to other objects in the frame.
-7. **The flat-road assumption is unbounded.** On a crest, a dip or a banked curve
+5. **The arbiter is not input-diverse for ego speed, nor for perception.** It runs
+   its own range filter, lead selection, in-path corridor and kinematics, but it
+   consumes the same `EgoState` the planner does and the same tracker output. A wrong
+   ego speed fools both channels identically, and a detection perception never
+   produced is invisible to both. It does at least reject implausible and stale
+   states. It is a second opinion on the decision, not a second sensor.
+6. **There is no independent range channel. The depth cross-check has been
+   demoted.** MiDaS v2.1 small was documented here as an independent metric range
+   cross-check; it is not one and it never was. Measured on this board over the
+   reference clip, its per-object rank correlation with the reference range is
+   **0.14–0.25** (best variant found: 0.686, still short of the 0.80 bar and still
+   collapsing the far field), it compressed a true 5.3–61.5 m spread into 3.7–13.4 m,
+   and at frame 300 it reported the 54 m car *nearer* than the 13 m car. The channel
+   now publishes `RangeSource.UNAVAILABLE` with confidence 0 for every box by
+   default; `publish_metric=True` is a *request* that only takes effect if a rolling
+   self-audit measures a Spearman correlation of at least 0.80 over at least 24 pairs,
+   and it fails closed. So: **the arbiter is running on the pinhole channel alone**,
+   and the "two-channel cross-check" in the architecture diagram is currently one
+   channel plus a gate. The road-plane affine fit still works and is still reported
+   in `stats()`; it is the per-object sampling that carries no range information.
+7. **An uncalibrated camera raises no violation in a live run.** The arbiter has the
+   mechanism — `SafetyContext.camera_calibrated=False` appends `camera_uncalibrated`,
+   floors the state at LIMITED and cuts throttle unless
+   `safety.allow_uncalibrated_range` is set — and it is unit-tested. But
+   `src/adas/runtime/pipeline.py` does not pass `camera.calibrated` into the
+   `SafetyContext`, so on this board today a run with the shipped
+   `CameraConfig(calibrated=False)` still reports `safety=nominal` while acting on
+   assumed metric ranges. One line in `pipeline.py` turns it on.
+8. **The flat-road assumption is unbounded.** On a crest, a dip or a banked curve
    the road-plane homography has no valid answer and will confidently return a
    wrong number. There is no road-slope estimator and no gate on one.
-8. **Nobody has validated accuracy on real driver-facing data.** The engine
+9. **Nobody has validated accuracy on real driver-facing data.** The engine
    contracts are verified for shape and range semantics; sign and axis
    conventions, detector recall and the 0.35/0.50 thresholds have not been tuned
    on anything but one flat-highway clip. YOLOX-Nano finds noticeably fewer
    objects than YOLOv5n in the first ~120 frames of that clip.
-9. **The systemd unit has never been started** and the Jetson container image has
+10. **The systemd unit has never been started** and the Jetson container image has
    never been built. Both are reviewed, not tested.
-10. **The ROS 2 bridge has never been executed.** `rclpy` is not installed here.
-11. **`confirm_hits = 3` costs up to 150 ms of latency** before a genuinely new
+11. **The ROS 2 bridge has never been executed.** `rclpy` is not installed here.
+12. **`confirm_hits = 3` costs up to 150 ms of latency** before a genuinely new
     obstacle reaches the planner (~2 m at 15 m/s closing). That is the deliberate
     price of killing the phantom-braking path; it must be a conscious decision by
     whoever owns the safety case.
-12. **`recovery_frames` and `disengage_after_frames` are frame counts, not
+13. **`recovery_frames` and `disengage_after_frames` are frame counts, not
     times**, so they mean different durations at a frame rate other than 20 Hz.
-13. **UFLD-v2 needs 413 MB in one contiguous allocation** and will fail to load
+14. **UFLD-v2 needs 413 MB in one contiguous allocation** and will fail to load
     under memory pressure. The load order mitigates it; it does not remove it.
-14. **No ISO 26262 work has been done.** No HIL/SIL validation, no redundancy
+15. **No ISO 26262 work has been done.** No HIL/SIL validation, no redundancy
     analysis, no hazard analysis, no certification.
+16. **No soak test exists.** The longest run in this repository's history is a few
+    hundred frames — about 25 seconds of clip. There is no 8 h result, no RSS curve
+    over time, no file-descriptor audit and no evidence about what the alpha-beta
+    filters, the event log rotation or the tracker's id space do after an hour.
+17. **One test fails and is left failing.**
+    `tests/test_integration.py::test_record_and_replay_round_trip` asserts a recorded
+    arbitration brake of 1.0 against a replayed 0.0. The cause is in
+    `src/adas/tools/replayer.py`: `RecordedDetector.infer` looks up
+    `getattr(frame, "frame_id")`, but `ADASPipeline.step` hands it `frame.rgb` — a raw
+    image, which has no `frame_id` — so **every replayed frame returns zero
+    detections** and the replay re-runs planning, control and arbitration on an empty
+    road. The test only passed before because the recorded side also happened to
+    command brake 0. The replay tooling is therefore not a usable regression harness
+    until that is fixed.
+18. **The arbiter logs one WARNING per frame** in a steady degraded state (no ego
+    speed, or a persistent hazard). A 200-frame bench run produces ~200 arbiter
+    WARNING lines. The planner and lateral/behaviour layers were fixed with a
+    `LogGate` (entry, one repeat per period with a suppressed count, one exit line);
+    `src/adas/control/arbiter.py` has not been converted and `grep -c LogGate` on it
+    returns 0. At 20 Hz that is 72,000 lines an hour into the journal.
 
 ---
 
@@ -422,11 +561,24 @@ asked for and why it was changed, read `pipeline.last_arbitration`.
 flock /tmp/jetson-gpu.lock -c "PYTHONPATH=src python3 -m pytest tests/ -q"
 ```
 
-**743 tests, all passing** on this board (2026-09-13). Tests marked `engine`
-exercise a real TensorRT engine and skip when the file is absent, so the suite is
-green on a laptop too. Coverage is not uniform: `adas.io`, `core.metrics` and
-`core.logger` are gated at 80% in CI; `runtime/capture.py`, `ros2/` and
-`tools/` are covered by `tests/test_integration.py` but thinly.
+**860 tests collected: 859 passed, 1 failed**, measured on this board on 2026-09-13
+in 50.75 s. The single failure is
+`tests/test_integration.py::test_record_and_replay_round_trip` (`assert 1.0 == 0.0 ±
+1e-06`), and it is a real defect in `src/adas/tools/replayer.py`, not a flake — see
+item 17 of [What is not production ready](#what-is-not-production-ready). It is left
+failing deliberately rather than deleted or skipped.
+
+`pyproject.toml` no longer sets `addopts = "-q"`. It used to, and because the
+documented command *also* passes `-q`, pytest read `-q -q` as `-qq` and suppressed the
+pass/fail summary entirely — the project's own test command printed no counts. The
+verbosity flag now comes from the invocation.
+
+Tests marked `engine` exercise a real TensorRT engine and skip when the file is
+absent, so the suite runs on a laptop too. Coverage is not uniform: `adas.io`,
+`core.metrics` and `core.logger` are gated at 80% in CI; `runtime/capture.py`, `ros2/`
+and `tools/` are covered by `tests/test_integration.py` but thinly. And coverage is
+not correctness: **nothing in this repository has been validated against ground
+truth.**
 
 ---
 
@@ -465,5 +617,10 @@ MIT for the source; see [Licensing](#licensing) for the models. See `LICENSE`.
 
 ---
 
-**Version:** 0.3.0 · **Last verified on hardware:** 2026-09-13, Jetson Xavier NX,
-JetPack 5.1.6, TensorRT 8.5.2.2, Python 3.8.10
+**Version:** 0.3.0 (plus an unreleased hardening pass) ·
+**Last verified on hardware:** 2026-09-13 16:47–17:00 KST, Jetson Xavier NX,
+JetPack 5.1.6, TensorRT 8.5.2.2, Python 3.8.10, board shared (loadavg 2.6–4.0).
+
+Every number in this file was taken in that window by running the commands written
+here. Where a claim could not be reproduced it was corrected or deleted; where
+something has not been measured, the text says so.

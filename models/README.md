@@ -10,6 +10,21 @@ names/shapes/dtypes, preprocessing (resize mode, colour order, scale,
 mean/std), output semantics, and the GPU compute time measured by `trtexec` on
 this board. Read it before writing any pre- or post-processing code.
 
+**As of 2026-09-13 the manifest is enforced at runtime, not just documentation.**
+`adas.infer.trt_engine.verify_engine_file` checks an engine's sha256 and the
+manifest's recorded TensorRT version *before* the plan is deserialised, and
+`TrtEngine.__init__` does it by default, so every call site is covered. A mismatch
+raises `EngineIntegrityError` and the process refuses to start; there is deliberately
+no environment-variable bypass. An engine the manifest does not list logs a WARNING
+and loads as *unverifiable*. The digests that were verified are published on
+`/healthz` as `engine_sha256`. Until this change, nothing passed `expected_sha256`
+anywhere in the production path and a swapped `.engine` loaded silently into the
+detector that feeds AEB.
+
+Consequence for the workflow: `scripts/build_engines.py` writes the digests after a
+real build, so a normal rebuild is unaffected — but **an engine copied in by hand
+without updating the manifest will now stop the process, by design.**
+
 ## Reproducing the model set
 
 ```bash
@@ -48,7 +63,7 @@ directly without that lock.
 | `yolov5n` | object detection | **AGPL-3.0-only** | Development baseline only — see the licence warning below |
 | `ufldv2_culane_res18` | lane detection | MIT | Real lane geometry; replaces the hardcoded 36 %/64 % mock |
 | `yolop` | detection + drivable area + lane mask | MIT | Free-space source and cross-check; schedule below the detection rate |
-| `midas_v21_small` | monocular relative depth | MIT | Independent range channel — **relative, not metres** |
+| `midas_v21_small` | monocular relative depth | MIT | **Demoted.** Ordinal signal only; publishes no metric range at all — see below |
 
 ### Licence warning: yolov5n is AGPL-3.0
 
@@ -113,6 +128,15 @@ Three traps worth repeating:
   decoded detections above 0.30: BGR + raw `0…255` gives 10 (max conf 0.640),
   RGB + raw gives 9 (0.600), and **either `/255` variant gives 0**. Dividing by
   255 does not degrade this model, it silences it — with no error raised.
+
+  **Correction, re-measured 2026-09-13:** those counts are **pre-NMS**, and
+  `MANIFEST.json` → `yolox_nano.preprocessing.verified_empirically` does not say so.
+  Running the *shipped* detector on that exact frame with
+  `confidence_threshold=0.30` and `class_ids="all"` yields **3** detections after NMS
+  (0.640, 0.340, 0.306), not 10. The max-confidence figure reproduces exactly, so the
+  preprocessing conclusion — BGR, raw 0…255 — stands unchanged; only the count was
+  misleading. `MANIFEST.json` is not owned by this file and still carries the
+  unqualified number.
 * **UFLDv2 is a stretch, not a letterbox**, so the x and y scale factors back
   to the original frame differ. The vendored
   `Ultra-Fast-Lane-Detection-v2/deploy/trt_infer.py` uses a different,
@@ -120,7 +144,39 @@ Three traps worth repeating:
   it. The canonical transform is `data/dataloader.py::get_test_loader`.
 * **MiDaS output is inverse relative depth**, unitless, with an unknown affine
   scale and shift per frame. Larger means closer. It must never be published as
-  a metric range without a per-frame alignment against a metric reference.
+  a metric range without a per-frame alignment against a metric reference — and on
+  this model, at this resolution, on this footage, **even with that alignment it must
+  not be published as a metric range at all**. See the next section.
+
+### MiDaS is not a range channel on this board
+
+`adas.perception.depth.DepthRangeChannel` used to publish
+`RangeEstimate(source=DEPTH_MODEL, distance_m=..., confidence≈0.70)` per detection,
+and the safety arbiter substituted it into the lead range that TTC, RSS and AEB are
+computed from. Measured on this board against the reference range over the replay
+clip, that output carried almost no range information:
+
+| what was measured | result |
+|---|---|
+| per-object Spearman rank correlation vs reference range | **0.14–0.25** across eight sampling strategies, plus a 3×-zoomed second inference pass |
+| best variant found (road strip just below the box bottom edge) | 0.686 — still short of 0.80, still collapsing the far field, and it consumes `box.y2`, the same pixel row `ground_plane_range` already uses, so it forfeits the independence that was the channel's entire justification |
+| true range spread vs reported spread | 5.3–61.5 m compressed into 3.7–13.4 m |
+| single worst case | at frame 300 the 54 m car was reported *nearer* (8.51 m) than the 13 m car (10.18 m) |
+| road-plane affine fit quality (this part works) | relative residual 0.041–0.076 |
+
+The channel is therefore **demoted, not repaired**. `update()` returns
+`RangeSource.UNAVAILABLE` with confidence 0 for every box.
+`DepthRangeChannel(publish_metric=True)` is a *request*, not a switch: a rolling
+self-audit computes Spearman over the last 240 (reference range, sampled disparity)
+pairs and metres flow only while that measures ≥ 0.80 over ≥ 24 pairs. It fails
+closed — too few pairs, or a NaN correlation from constant disparity, keeps the gate
+shut. A separate `OrdinalDepth` record (disparity, rank, of, normalized) carries the
+unitless signal; it has no `distance_m`, no confidence and no `source`, and it is not
+a `RangeEstimate`, so the arbiter's range fusion cannot consume it by accident.
+
+There is no config key plumbed through to `publish_metric`. That is deliberate: a
+YAML flag that turns a demoted channel back on is the wrong affordance. Restoring
+metric depth here needs a calibrated camera **and** a better model, not tuning.
 
 ## Measured performance
 
@@ -181,17 +237,18 @@ Every engine in the table was checked three ways on this board:
    so they bracket the vehicle with a plausible ~750–910 px lane width at the
    bottom of the image. The lane model produces real geometry, not noise.
 
-### Known defect in the current UFLD preprocessing
+### The UFLD preprocessing defect is fixed
 
-`src/adas/perception/ufld.py` (owned by the perception workstream, not changed
-here) feeds the engine **BGR, `/255`, no ImageNet normalisation**, and crops
-differently from the canonical transform. Measured side by side on the frames
-above, that variant drives the existence head into saturation: it reports the
-ego-lane markings present at **all 72 of 72 row anchors**, including anchors
-above the horizon, where the canonical transform reports 44–47. The bottom-of-
-frame x positions happen to agree, so the failure is silent — but the extra
-phantom points sit in the sky and will bias the quadratic lane fit. Switch that
-module to the canonical transform documented above.
+A previous revision of this file recorded that `src/adas/perception/ufld.py` fed the
+engine **BGR, `/255`, no ImageNet normalisation** with a non-canonical crop, which
+drove the existence head into saturation (ego-lane markings reported present at all
+72 of 72 row anchors, including anchors above the horizon, where the canonical
+transform reports 44–47). **That is no longer the case.** `ufld.py` now implements
+the canonical transform documented above — RGB, stretch to 1600×533, `/255` then
+ImageNet mean/std (folded into a single `px * scale - shift` pass), bottom 320 rows —
+and binds its output tensors by name. Verified by inspection of `ufld.py` on
+2026-09-13; the 100%-lane-detection rate in every run in `docs/JETSON.md` is with the
+canonical transform.
 
 ## When a model cannot be built
 

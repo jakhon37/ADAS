@@ -1,6 +1,230 @@
 # Changelog
 
+## [Unreleased] — 2026-09-13 safety-hardening pass
+
+Four adversarial reviewers re-verified the 0.3.0 claims on the target Jetson from
+scratch and proved a set of defects with numerical repro scripts; three of the four
+returned "not ready". This entry records what was fixed, what was **demoted**, and
+what is still broken. It is deliberately not a release: the version in
+`pyproject.toml` is still `0.3.0`.
+
+Re-measured on the Xavier NX on **2026-09-13, 16:47 KST**, GPU mutex held, board
+shared with other work (loadavg 2.9): 200 frames of `example.mp4` through YOLOX-Nano
++ UFLD-v2 + tracker + planner + controller + arbiter at **16.0 FPS end to end**
+(61.9 ms/frame), 0 perception failures, 136 detections, 154 tracks, lane detected on
+100% of frames. Suite: **859 passed, 1 failed** (was 743 passed at 0.3.0; the
+failure is real and is listed under *Still broken*).
+
+### Safety — the arbiter stopped doing four unsafe things
+
+- **It no longer disengages itself during normal driving.** `_decide_state`
+  incremented the DISENGAGE latch counter on *any* finding, and "findings" included
+  ordinary successfully-mitigated clamps — a frame arriving faster than `min_dt_s`,
+  a lateral-accel clamp, a steering-rate clamp, a measured jerk. On an empty road at
+  20 Hz the arbiter latched the terminal DISENGAGE state at frame 47. Findings are
+  now split into three disjoint lists carried through `arbitrate`: `faults` (health:
+  perception dropout, missing/implausible ego, non-finite command, missing/non-finite
+  plan, invalid or stale timestamp, dt above `max_dt_s`) which alone increments the
+  latch; `mitigated` (clamps that worked, and measurements) which forces LIMITED and
+  can never reach DISENGAGE; and `hazards` (traffic) which forces LIMITED/MRM.
+  `result.violations` is still the concatenation, so nothing stopped being logged.
+- **It no longer reduces an emergency brake.** `_synthesise_command` applied a
+  5.0/s brake apply-rate limit against its own previous output, so an input brake of
+  1.00 came out 0.250 / 0.500 / 0.750 / 1.000 over four frames — 200 ms, about 3 m
+  at 15 m/s — while the docstring claimed "brake only ever increased" and the unit
+  test encoded the reduction as *expected*. `ArbiterLimits.brake_apply_rate_per_s` is
+  removed and the invariant is now structural: a final
+  `brake = max(brake, clamp(cmd_in.brake))`. The brake *release*-rate floor is kept;
+  it only ever holds the brake on longer. Brake application jerk belongs to the
+  controller, which owns the emergency exemption.
+- **A bad lane centre can no longer hide a real lead.** `_in_path` short-circuited on
+  `TrackedObject.in_ego_lane` — computed by the tracker from the same lane model the
+  planner reads — and otherwise tested an image band centred on the lane model with
+  no confidence or `is_mock` check. The corridor is now anchored on the **image
+  centre** with half width at least `min_in_path_half_width_frac` (0.30 of frame
+  width), membership is by box overlap, and a lane model may only *widen* it, never
+  move or narrow it, and only when it is not mock, is finite, is inside the frame and
+  has confidence ≥ `lane_trust_confidence` (0.50).
+- **The AEB backstop is no longer blind on a new track.** The closing-rate estimate
+  started at 0.0 and took ~0.55 s to converge, so `lead_speed = ego_speed` was assumed
+  exactly when a hazard appeared, collapsing the RSS minimum gap. `_AlphaBetaRange`
+  now seeds every (re-)initialisation from `-max(0, ego_speed)` — the safe prior that
+  an unknown object is stationary in the world, bounded by ego speed and taken from
+  the ego state, not from `TrackedObject.velocity_mps`. Switching range channel now
+  re-seeds instead of differencing across the signal discontinuity, which had been
+  manufacturing −45 m/s of "closing" for a stationary car.
+- **The minimum-risk manoeuvre no longer straightens the wheel in a bend.** In
+  MRM/DISENGAGE the steering was replaced by `_last_good_steering`, which was only
+  written in NOMINAL — so an MRM entered in a curve commanded steering 0.0 while
+  braking, bypassed the lateral-accel ceiling, and regenerated a `steering_rate`
+  fault against its own hold every frame. It now holds the last commanded angle,
+  re-checks it against the lateral-accel ceiling at the current speed, slews it, and
+  straightens only below `mrm_straighten_speed_mps` (1.0 m/s).
+- **`_fuse_range` no longer takes `min(pinhole, depth)`.** Four explicit cases: no
+  usable second channel → pinhole, no finding at all if the channel is simply off;
+  agreement → confidence-weighted blend; disagreement with the second channel
+  **nearer** → the pinhole is used until `range_corroboration_frames` (3) consecutive
+  disagreeing frames on that track; disagreement **farther** → never adopted. A
+  second-channel confidence below `min_range_confidence` (0.35) is discarded outright
+  rather than down-weighted. A single-frame phantom close reading at highway speed
+  used to produce a full-authority emergency stop.
+- **An uncalibrated camera can raise a violation.** `SafetyContext.camera_calibrated`
+  and `ArbiterLimits.allow_uncalibrated_range` were added; a `False` camera appends
+  `camera_uncalibrated`, floors the state at LIMITED and cuts throttle. **This is not
+  wired**: `src/adas/runtime/pipeline.py` does not pass `camera.calibrated`, so it
+  does not fire in a live run. See *Still broken*.
+- **`SafetyLimits.to_arbiter_limits` stopped dropping limits on the floor.** It
+  silently discarded 14 fields, two of which can latch the terminal DISENGAGE state.
+  All are now projected, and a test enumerates `dataclasses.fields(ArbiterLimits)`
+  and fails on any field with no `SafetyLimits` counterpart.
+
+### The frame loop and the runner
+
+- **Leaving the loop is a command.** Every loop exit is now classified
+  (`completed` / `stopped` / `eof` / `source_lost` / `pipeline_dead`) and
+  `PipelineRunner._settle` runs on all of them. A clean exit emits one
+  zero-throttle release; an **unsafe** exit re-emits the arbiter's minimum-risk
+  command once per nominal period for `failsafe_hold_s` (default 1.0 s) so the brake
+  ramp actually completes. Previously a mid-stream sensor loss took `break` and left
+  the last throttle latched on the actuators for ever — the exact failure the runner
+  docstring claimed to have fixed. The hold is **bounded** and hands back to the
+  caller; `deploy/adas.service` is the supervisor.
+- **Tracks coast honestly through a perception dropout.** `ADASPipeline._coast_tracks`
+  runs a predict-only tracker step: no detection is fabricated and no track is
+  corrected, but covariance grows, `time_since_update` rises, the range estimate
+  becomes `RangeSource.UNAVAILABLE` and tracks are deleted at `max_missed`. The
+  previous build froze every track at its pre-dropout position with
+  `time_since_update == 0`, so the recovery frame associated a real measurement
+  against an N-frame-stale prediction claiming full confidence.
+- `failsafe_command` now stamps `timestamp_s`, so a run of failed frames no longer
+  leaves the recovery frame flagged `timing_stale_input` with its `dt` forced to
+  `max_dt_s`.
+
+### Planning and control
+
+- **The planner's AEB decision can now be executed.** `LongitudinalPlanner.plan`
+  rate-limited its *own* AEB target at `emergency_decel_mps2 · dt` (0.4 m/s per 50 ms
+  frame), so the published target trailed the vehicle, the controller's residual
+  speed error stayed ~0.4 m/s, and it commanded essentially no brake — the arbiter
+  was the only thing in the system that actually braked. The AEB branch now publishes
+  0 m/s on the frame it fires, with no downward rate limit; the comfort branch keeps
+  its `max_decel_mps2` limit and both branches keep the upward `max_accel_mps2` limit.
+- **The controller gained an emergency feed-forward.** Between the PI law and the
+  jerk limit, an emergency frame demands the deceleration that erases the whole
+  remaining speed error inside `emergency_stop_time_s` (1.0 s), saturated at
+  `brake_authority_mps2`. The comfort deadband is skipped and throttle is forced to 0
+  on every emergency frame. Measured on the reviewers' cut-in repro, the controller's
+  own brake went from 0.094 to 1.000 within four frames.
+- **Log flood fixed in the planner layers.** A `LogGate` (one line on entry, at most
+  one repeat per period carrying the suppressed count, one line on exit) replaced the
+  per-frame WARNING for the permanent `ego.source: none` state. Measured: 1200
+  WARNING lines over 1200 frames → 1. `src/adas/control/arbiter.py` has **not** been
+  converted; see *Still broken*.
+
+### Perception
+
+- **MiDaS is demoted, not repaired.** It was published as a metric range channel —
+  `RangeEstimate.distance_m` in metres, `source=DEPTH_MODEL`, confidence 0.69–0.72 —
+  and the arbiter substituted it into the range that TTC, RSS and AEB are computed
+  from. Measured per-object rank correlation against the reference range: **0.14–0.25
+  across eight sampling strategies plus a 3×-zoomed second inference pass**, a true
+  5.3–61.5 m spread compressed to 3.7–13.4 m, and at frame 300 the 54 m car reported
+  nearer than the 13 m car. `DepthRangeChannel.update()` now returns
+  `RangeSource.UNAVAILABLE` with confidence 0 for every box.
+  `publish_metric=True` is a *request*: a rolling self-audit computes Spearman over
+  the last 240 (reference range, sampled disparity) pairs and metres flow only while
+  that is ≥ 0.80 over ≥ 24 pairs. It fails closed. A new `OrdinalDepth` record
+  (disparity, rank, of, normalized) is exposed instead — no `distance_m`, no
+  confidence, no `source`, and not a `RangeEstimate`, so the arbiter's range fusion
+  cannot consume it by accident. The road-plane affine fit still runs and is still
+  reported in `stats()` (relative residual 0.041–0.076); it is the per-object
+  sampling that carries no range information.
+
+### Operations and provenance
+
+- **Engines are verified at load.** `models/MANIFEST.json` was documentation only:
+  no production caller passed `expected_sha256`, so a swapped or corrupted `.engine`
+  loaded silently into the detector that feeds AEB. `trt_engine.verify_engine_file`
+  now checks the digest and the manifest/runtime TensorRT version *before*
+  deserialisation, memoises per (path, size, mtime), and records every verified
+  engine. `TrtEngine.__init__` defaults `verify_manifest=True`, so all call sites are
+  covered. There is no environment-variable bypass. An engine the manifest does not
+  list logs a WARNING and loads as unverifiable.
+- **`/healthz` reports real memory.** `HealthState.refresh_process()` had zero call
+  sites, so `ram_mb` was always `null` and `adas_ram_mb` scraped as the literal `0`
+  for a process holding over a gigabyte. It is now refreshed from the frame loop and
+  from every probe and scrape, rate-limited to 1 s (measured cost 0.3 ms). An
+  unmeasurable RAM exports `NaN`, never `0`. `/healthz` also gained an
+  `engine_sha256` object.
+- **Event log schema 1 → 2.** `t` is stamped unconditionally from `time.monotonic()`
+  inside the writer, so one file no longer mixes two clock domains from two callers;
+  `seq` continues from the last record already in the file at startup, so it is the
+  authoritative order across a restart; a new 12-hex-digit `run` field distinguishes
+  two writer instances. The claim that `boot` "makes `t` orderable across restarts"
+  was false — the kernel monotonic clock restarts at zero at boot — and is removed.
+- `pyproject.toml` no longer sets `addopts = "-q"`. Combined with the documented
+  `pytest -q`, pytest read `-qq` and printed no pass/fail summary at all.
+- The engine-missing message no longer prints the same directory twice; it names the
+  absolute file paths actually tried.
+
+### Documentation honesty
+
+Every headline number in `README.md`, `QUICKSTART.md`, `DEPLOYMENT.md`,
+`docs/JETSON.md` and `models/README.md` was re-measured on 2026-09-13 and replaced;
+where a claim could not be reproduced it was deleted or explicitly marked
+unverified. Specifically corrected:
+
+- "743/743 tests passing" → 859 passed, 1 failed, with the failure named.
+- "15.3 FPS" → 16.0 FPS, with the backend matrix and the loadavg it was taken at.
+- The MiDaS row's "Real, off by default … affine-aligned per frame against
+  road-plane anchors. A cross-check, not a metric sensor" → demoted, with the
+  measured correlation.
+- "the arbiter's rate-shaped fail-safe" → the braking direction is not rate-shaped
+  downward at all any more.
+- "in-path test: `in_ego_lane`, else its own wider image band" → image-centre anchor,
+  lane as a widen-only second anchor.
+- "the nearer of (blend, pinhole, depth) is used" → the four-case rule.
+- `models/MANIFEST.json`'s `yolox_nano.preprocessing.verified_empirically` claimed
+  "BGR + raw 0..255 gave 10 detections above 0.30" on frame 150; re-running the
+  shipped detector at that threshold yields **3** after NMS. The max-confidence
+  figure (0.640) reproduces exactly, so the preprocessing conclusion stands — the
+  count was a pre-NMS number and the manifest did not say so.
+
+### Still broken, and deliberately left visible
+
+- `tests/test_integration.py::test_record_and_replay_round_trip` **fails**.
+  `RecordedDetector.infer` reads `getattr(frame, "frame_id")` but `ADASPipeline.step`
+  hands it `frame.rgb`, so every replayed frame returns zero detections and the replay
+  re-runs the decision layers on an empty road. The test passed before only because
+  the recorded side also happened to command brake 0. The replay tooling is not a
+  usable regression harness until `src/adas/tools/replayer.py` is fixed.
+- The `camera_uncalibrated` violation is implemented and tested but **not wired**:
+  `src/adas/runtime/pipeline.py` does not pass `camera.calibrated` into the
+  `SafetyContext`.
+- The arbiter still logs one WARNING per frame in a steady degraded state.
+  `LogGate` exists and is importable; `arbiter.py` has not been converted.
+- The new `SafetyLimits` fields (including every threshold that can latch DISENGAGE)
+  are reachable programmatically but **not from a YAML config file**:
+  `adas.cli.build_safety_limits` and `SafetyConfig` have no keys for them.
+- `failsafe_hold_s`, `emergency_stop_time_s` and the log-gate periods are code-level
+  fields with no CLI flag or config key.
+- The arbiter's in-path corridor is an **image-space** band, not a metric ego-width
+  corridor projected through a calibrated camera. It does not narrow with range.
+- The arbiter's own range filter is still not advanced through a perception dropout:
+  `_assess_lead` sits behind the `if perception.ok` gate, so a long dropout can still
+  read as a range jump on the recovery frame.
+- Metric depth is not restored and is not restorable with this model at this
+  resolution on this footage. It needs a calibrated camera **and** a better model.
+- No camera, no soak test, no systemd start, no certification. See
+  *What is not production ready* in `README.md`.
+
+---
+
 ## [0.3.0] - 2026-09-13
+
+> The 0.3.0 numbers below are the historical record of that release and were correct
+> when it was cut. They have since been superseded — see the hardening pass above for
+> the 2026-09-13 re-measurement (16.0 FPS, 859 passed / 1 failed).
 
 ### Real models, an authoritative safety arbiter, and an operable process
 

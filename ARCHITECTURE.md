@@ -105,10 +105,18 @@ what the ops layer and most tests build against.
   weighted fusion in inverse range, truncation policy, metric lane fitting, and
   `LaneCalibrator` for monocular self-calibration. `calibrated=False` caps every
   derived confidence at 0.6 and is the default.
-* **`depth.py`** — MiDaS as an *independent* range channel. The affine scale is
-  fitted against road-plane anchors projected through the homography, so the
-  object range shares no pixels with the box-height estimate. Reduced cadence
-  (default every 5 frames) with linearly decaying confidence and a hard expiry.
+* **`depth.py`** — MiDaS as a *relative* depth channel, **demoted from a metric
+  range channel** and off by default. The road-plane affine fit still runs (its
+  anchors genuinely read no detection box, and its relative residual is 0.041–0.076),
+  but the per-object output is sampled from pixels *inside* a box the detector drew,
+  and that sample was measured to carry almost no range information: Spearman 0.14–0.25
+  against the reference range over the replay clip, against the 0.80 bar the channel
+  now holds itself to. `update()` therefore returns `RangeSource.UNAVAILABLE` with
+  confidence 0 for every box. `publish_metric=True` is a *request*: a rolling audit
+  over the last 240 (reference range, disparity) pairs must measure ≥ 0.80 Spearman
+  over ≥ 24 pairs, and it fails closed. A separate `OrdinalDepth` record — no
+  `distance_m`, no confidence, no `source`, not a `RangeEstimate` — carries the
+  ordinal signal so the arbiter's range fusion cannot consume it by accident.
   No engine ⇒ honest stub, everything `RangeSource.UNAVAILABLE`.
 
 ### `adas.tracking` — Kalman + Hungarian
@@ -155,18 +163,48 @@ the authority. It is independent of the planner *by construction*:
 | quantity | planner | arbiter |
 |---|---|---|
 | lead selection | nearest in-lane | smallest TTC, then smallest range, over the RAW track list |
-| range rate | tracker's Kalman | its own alpha-beta filter with a jump gate |
-| in-path test | `in_ego_lane`, else lane centre | `in_ego_lane`, else its own wider image band |
+| range rate | tracker's Kalman | its own alpha-beta filter, seeded from ego speed, with a jump gate |
+| in-path test | `in_ego_lane`, else lane centre | **image-centre** corridor, ≥ `min_in_path_half_width_frac` (0.30) of frame width, box-overlap membership; **never** reads `in_ego_lane` |
+| lane model | the geometry it steers on | a *widen-only* second anchor, and only if not mock, finite, in frame, confidence ≥ 0.50 |
 | kinematics | plan over a horizon | differenced from measured ego speed |
 | headway rule | time gap | RSS minimum gap |
 
-It also cross-checks range against a second channel when one is supplied
-(`SafetyContext.independent_ranges`), degrades on >30% disagreement and uses the
-nearer value. State machine: NOMINAL → LIMITED → MIN_RISK_MANEUVER → DISENGAGE,
-escalation immediate, de-escalation only after `recovery_frames` clean frames,
-DISENGAGE latched until `reset()`. Only *faults* accumulate toward DISENGAGE;
-*hazards* are traffic the arbiter exists to handle, so a long approach to a
-stopped queue keeps braking rather than disengaging.
+**What is not diverse.** `SafetyContext.tracks` is the tracker's output and
+`EgoState` is the planner's ego state, so a detection perception never produced is
+invisible to both, and a wrong ego speed fools both identically. The arbiter is a
+second opinion on the *decision*, not a second sensor.
+
+Range fusion (`_fuse_range`) is four explicit cases, not `min(pinhole, depth)`:
+no usable second channel → pinhole, and no finding at all if the channel is simply
+off; agreement within `range_disagreement_frac` → confidence-weighted blend;
+disagreement with the second channel **nearer** → the pinhole is used until
+`range_corroboration_frames` (3) consecutive disagreeing frames on that track;
+disagreement **farther** → never adopted. A second-channel confidence below
+`min_range_confidence` (0.35) is discarded outright. Taking the minimum of two
+channels is a systematic downward bias, not a fusion, and a single-frame phantom
+close reading at highway speed used to produce a full-authority emergency stop.
+
+Findings are split three ways and only one of them can latch the terminal state:
+
+| list | contents | consequence |
+|---|---|---|
+| `faults` | perception dropout, missing/invalid/implausible ego, non-finite command, missing or non-finite plan, non-monotonic/invalid/stale timestamp, `dt` above `max_dt_s` | increments the DISENGAGE counter |
+| `mitigated` | clamps that worked, and measurements: lateral accel, steering rate, plan over-speed/steer/accel, command range clamps, range disagreement/jump/source switch, measured accel and jerk, lane departure, `camera_uncalibrated` | forces LIMITED, can **never** reach DISENGAGE |
+| `hazards` | traffic | forces LIMITED / MRM |
+
+`result.violations` is still all three concatenated, so nothing stopped being logged.
+Before this split, an ordinary successfully-mitigated clamp incremented the latch and
+the arbiter disengaged itself on an empty road at frame 47.
+
+State machine: NOMINAL → LIMITED → MIN_RISK_MANEUVER → DISENGAGE, escalation
+immediate, de-escalation only after `recovery_frames` clean frames, DISENGAGE latched
+until `reset()`.
+
+**Output shaping.** The output is never more energetic than the input: throttle is
+only ever reduced and **brake is only ever increased**, enforced by a final
+`max(brake, cmd_in.brake)`. There is deliberately no brake *apply*-rate limit here —
+that belongs to the controller, which owns the emergency exemption. Only the throttle
+apply-rate and the brake *release*-rate floor survive.
 
 The legacy raise-based `SafetyMonitor` methods still exist and are documented in
 code as **ADVISORY**. Nothing on the actuation path calls them any more; the
@@ -182,11 +220,17 @@ implementations, each declaring `measured`.
 **`pipeline.py`** runs one frame. Three behaviours are the point of the module:
 
 1. The returned command is the arbiter's.
-2. A perception exception sets `PerceptionStatus(ok=False)`, does **not** advance
-   the tracker (an empty detection list would read as "every object vanished"),
-   and tells the planner `perception_valid=False`. A detector fault and a lane
-   fault are tracked separately. An empty list from a working detector still
-   means the road is clear.
+2. A perception exception sets `PerceptionStatus(ok=False)` and tells the planner
+   `perception_valid=False`. No detection is fabricated and no track is corrected,
+   but the tracker **is** advanced by a predict-only step (`_coast_tracks`): live
+   tracks coast with growing covariance and rising `time_since_update`, their range
+   estimate becomes `RangeSource.UNAVAILABLE`, and they are deleted at `max_missed`.
+   Freezing them at their pre-dropout position — the previous behaviour — made the
+   recovery frame associate a real measurement against an N-frame-stale prediction
+   that still claimed full confidence. A detector fault and a lane fault are tracked
+   separately. An empty list from a working detector still means the road is clear.
+   *Not yet done*: the arbiter's own alpha-beta range filter is still not advanced
+   through a dropout, because `_assess_lead` sits behind the `if perception.ok` gate.
 3. Lane scheduling is honest. With `lane.every_n_frames > 1`, a reused model is
    republished with its confidence scaled by `1 − age/(max_age+1)` and dropped
    entirely past `lane.max_age_frames`. Old evidence is labelled as old evidence.
@@ -202,6 +246,17 @@ claim from "the second opinion is 0 m".
 and — when `step` raises — `pipeline.failsafe_command()` on the actuators plus a
 consecutive-failure counter that stops the loop, never a `continue` that latches
 the last command.
+
+It also classifies every way the loop can *exit* (`completed` / `stopped` / `eof` /
+`source_lost` / `pipeline_dead`) and runs `_settle` on all of them. A clean exit emits
+exactly one zero-throttle, zero-brake, zero-steering release. An unsafe exit
+(`source_lost`, `pipeline_dead`) re-emits the minimum-risk command once per nominal
+period for `failsafe_hold_s` (default 1.0 s) so the arbiter's brake ramp completes;
+re-emission drives the plant, refreshes health and logs the transition, but
+deliberately does **not** tick the watchdog, because the frame id has not advanced and
+a runner that lost its source must stay visible to systemd. The hold is bounded and
+hands back to the caller — it is not a supervisor. Before this, `break` on a lost
+source left the last throttle latched on the actuators exactly as `continue` had.
 
 ### `adas.io` — operations
 
@@ -243,7 +298,10 @@ through.
 | no second range channel | key absent from `independent_ranges` | lead keeps `RangeSource.PINHOLE` |
 | range unmeasurable (tiny box) | `RangeSource.UNAVAILABLE` | not fused, not zero |
 | `step` raised | `ADASException` | runner actuates `failsafe_command()` |
+| frame loop exited unsafely | `source_lost` / `pipeline_dead` | runner holds the MRM for `failsafe_hold_s`, then returns |
 | engine missing | `PerceptionError` at build | process refuses to start |
+| engine digest ≠ `models/MANIFEST.json` | `EngineIntegrityError` before deserialisation | process refuses to start; no bypass |
+| depth channel has no ordering skill | audit gate shut | `RangeSource.UNAVAILABLE`, not a low-confidence metre value |
 
 Nothing in that table is represented by a plausible default value. That is the
 single design rule this codebase is organised around.
