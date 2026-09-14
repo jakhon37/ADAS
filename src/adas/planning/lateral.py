@@ -202,6 +202,21 @@ class LateralLimits:
     """Below this the a_lat cap is not applied (v^2 makes it vacuous anyway)."""
     assumed_speed_when_unknown_mps: float = 33.0
     """Used for the gain schedule and a_lat cap when ego speed is unavailable."""
+    lane_center_damping_s: float = 1.3
+    """Derivative time of the non-metric lane-keeping law, seconds.
+
+    Steering commands a yaw rate, so lateral position is the double integral of
+    the command and a purely proportional law is an undamped oscillator.  At
+    20 m/s the shipped gain places the natural frequency near 1.2 rad/s, so
+    1.3 s of derivative time puts the damping ratio near 0.8.  See
+    :meth:`LateralPlanner._pixel_law`.
+    """
+    lane_rate_filter_alpha: float = 0.4
+    """Low-pass factor on the differentiated lane error.
+
+    The rate is differentiated from a lane estimate, and a lane estimate is
+    noisy; 0.4 costs about a frame of phase, which the damping margin absorbs.
+    """
 
     def __post_init__(self) -> None:
         if self.max_steering_deg <= 0:
@@ -216,6 +231,10 @@ class LateralLimits:
             raise ValidationError(f"speed_ref_mps must be positive, got {self.speed_ref_mps}")
         if self.lane_center_gain < 0:
             raise ValidationError("lane_center_gain must be non-negative")
+        if self.lane_center_damping_s < 0:
+            raise ValidationError("lane_center_damping_s must be non-negative")
+        if not (0.0 < self.lane_rate_filter_alpha <= 1.0):
+            raise ValidationError("lane_rate_filter_alpha must be in (0, 1]")
 
 
 @dataclass
@@ -248,10 +267,21 @@ class LateralPlanner:
         self.limits = limits or LateralLimits()
         self.camera = camera
         self._invalid_lane_gate = LogGate(degraded_log_period_s)
+        self._prev_error_frac: float | None = None
+        self._error_rate = 0.0
+        self._dt_s = 0.05
 
     def reset(self) -> None:
-        """Clear the log latch. The steering law itself carries no state."""
+        """Clear the log latch and the derivative state.
+
+        The law is no longer stateless: it carries a filtered rate of the lane
+        error, which is what damps the loop.  Call this on replay restart or the
+        first frame of the new run differentiates against the last frame of the
+        old one.
+        """
         self._invalid_lane_gate.reset()
+        self._prev_error_frac = None
+        self._error_rate = 0.0
 
     def max_steering_deg_at(self, ego_speed_mps: float | None) -> float:
         """Largest road-wheel angle allowed at this speed by the a_lat cap.
@@ -277,6 +307,7 @@ class LateralPlanner:
         ego_speed_mps: float | None = None,
         lane: LaneModel | None = None,
         frame_height_px: int | None = None,
+        dt_s: float = 0.05,
     ) -> SteeringDecision:
         """Produce one steering setpoint.
 
@@ -295,8 +326,11 @@ class LateralPlanner:
         """
         if frame_width_px <= 0:
             raise ValidationError(f"Invalid frame width: {frame_width_px}")
+        self._dt_s = dt_s if (math.isfinite(dt_s) and dt_s > 1e-4) else 0.05
 
         if lane_center_px is None or not math.isfinite(lane_center_px):
+            self._prev_error_frac = None
+            self._error_rate = 0.0
             return SteeringDecision(0.0, "no_lane", limited_by="no_lane")
 
         if not (0.0 <= lane_center_px <= float(frame_width_px)):
@@ -362,13 +396,47 @@ class LateralPlanner:
     def _pixel_law(
         self, frame_width_px: int, lane_center_px: float, ego_speed_mps: float | None
     ) -> tuple[float, str]:
-        """Non-metric fallback: speed-scheduled proportional control on pixel error."""
+        """Non-metric fallback: speed-scheduled PROPORTIONAL-DERIVATIVE control.
+
+        The derivative term is not a refinement, it is what makes the loop
+        stable.  Steering commands a yaw RATE, so lateral position is the double
+        integral of the command: a purely proportional law on lateral error is an
+        undamped oscillator, ``y'' = -w^2 y``, and it rings.  In the shipped
+        version the ringing was hidden by the 0.5 deg steering deadband, which
+        acted as a dead zone about 0.85 m wide at motorway speed and stopped the
+        loop before it could overshoot -- at the cost of leaving the vehicle up
+        to 0.85 m off the lane centre in steady state, on top of whatever the
+        lane estimator itself got wrong.  Shrink the deadband and the oscillation
+        appears; keep it and the vehicle wanders half a lane.  Neither is a
+        lane-keeping controller.
+
+        With the rate term the loop is a damped second order system.  At 20 m/s
+        the shipped gain places the natural frequency near 1.2 rad/s, so
+        ``lane_center_damping_s`` of 1.3 s puts the damping ratio near 0.8 --
+        fast, and with the small overshoot a passenger reads as decisive rather
+        than nervous.  The ratio rises as the vehicle slows, which is the right
+        direction: an over-damped low-speed loop is merely lazy.
+
+        The rate is low-pass filtered, because it is differentiated from a lane
+        estimate and a lane estimate is noisy; the filter costs about a frame of
+        phase, which the damping margin above absorbs.
+        """
         lim = self.limits
         img_center = frame_width_px / 2.0
         error_frac = (lane_center_px - img_center) / img_center
         speed = self._effective_speed(ego_speed_mps)
+
+        rate = 0.0
+        if self._prev_error_frac is not None and self._dt_s > 1e-6:
+            raw = (error_frac - self._prev_error_frac) / self._dt_s
+            if math.isfinite(raw):
+                self._error_rate += lim.lane_rate_filter_alpha * (raw - self._error_rate)
+                rate = self._error_rate
+        self._prev_error_frac = error_frac
+
         gain = lim.lane_center_gain / (1.0 + speed / lim.speed_ref_mps)
-        normalised = _clamp(gain * error_frac, -1.0, 1.0)
+        shaped = error_frac + lim.lane_center_damping_s * rate
+        normalised = _clamp(gain * shaped, -1.0, 1.0)
         return normalised * lim.max_steering_deg, "lane_center_err_%.2f" % error_frac
 
     def _metric_law(

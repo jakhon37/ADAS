@@ -303,8 +303,15 @@ The census is now computed by `library.coverage_census()` and enforced by
 `tests/test_scenarios.py::test_harness_fidelity_features_are_exercised`, which
 fails when any row is empty. Counted over `report.all_scenarios()` (52 cases):
 
+> **Updated 2026-09-14.** The corpus is now **53** scenarios, not 52, and the
+> census gained a row: `sense_latency_s != 0.055` is exercised by 1 case,
+> `degraded_latency_stationary_20mps_at_36m`. Certification finding 2 was that
+> the corpus contained exactly ONE value of the number every budget in this
+> document is a function of. The counts below are otherwise unchanged.
+
 | feature | scenarios | which |
 |---|---|---|
+| `sense_latency_s != 0.055` | 1 | `degraded_latency_stationary_20mps_at_36m` (80 ms) |
 | `range_noise_m > 0` | 4 | `noisy_range_20m_030m_noise`, `noisy_range_40m_030m_noise`, `noisy_stationary_36m_030m_noise`, `hostile_sensor_constant_range_40m` |
 | `range_bias_frac != 0` | 2 | `range_bias_far_10pct_stationary_36m`, `range_bias_near_10pct_constant_range_47m` |
 | `lateral_noise_m > 0` | 1 | `hostile_sensor_constant_range_40m` |
@@ -725,6 +732,154 @@ The envelope sweep, run as the gate, agrees and adds the boundaries:
 Read the signatures rather than the totals: `25e3ba5` is phantom-heavy and
 `1ce4886` is collision-heavy, which is exactly what the two commit messages
 claim and what three rounds of tuning oscillated between.
+
+---
+
+## 7a. Status of the system under test — 2026-09-14
+
+Measured on the Jetson Xavier NX, this working tree, by the author of this
+section. Every number below was produced by the command named beside it; none is
+quoted from an earlier report.
+
+### The four gates
+
+| gate | command | result |
+|---|---|---|
+| scenario corpus | `PYTHONPATH=src:. python3 -m tests.scenarios.report` | **53 passed, 0 failed** — 0 known, 0 NEW, 0 WORSENED against the regenerated `baseline.json` |
+| envelope sweep | `python3 scripts/run_safety_sweep.py --gate` | **exit 1** — `LATE=2`. Also `COLLISION_UNAVOIDABLE=5`, `CORRECT=113` of 120 graded |
+| harness backtest | `pytest tests/test_backtest.py` | **13 passed** — both known-broken commits still caught, in both directions |
+| full suite | `PYTHONPATH=src pytest tests/ -p no:warnings` | **1059 passed, 2 skipped, 0 failed** |
+
+Against the arbiter this redesign replaces:
+
+```
+HEAD (1ce4886's arbiter)  FAIL: BAND_UNWARRANTED=19, COLLISION=21, EARLY=17, LATE=14, PHANTOM=7
+now                       FAIL: LATE=2
+```
+
+`PHANTOM`, `EARLY`, `MISSED` and `BAND_UNWARRANTED` are **zero**. So is
+`COLLISION`: the five cells that still make contact are the ones the sweep now
+grades `COLLISION_UNAVOIDABLE`, and the next section is the measurement that
+justifies that grading.
+
+### The gate's floor, measured
+
+`sweep.classify_cell` used to return `COLLISION` unconditionally, with no
+counterpart to the scenario suite's `collided_unavoidable`. It now exempts a cell
+whose `lost_frame` is 0 — i.e. one where `oracle.full_braking_min_gap` from frame
+0 already contacts. That counterfactual is an omniscient controller committing
+full authority on the first frame, through the same plant, under the same 0.15 s
+brake rise and the same 20 m/s³ jerk ceiling R4 imposes.
+
+Five of the 120 gate cells are in that state, all in the `rate -8 / lead_decel 6`
+family. Minimum gap for the omniscient frame-0 counterfactual, measured with
+`oracle.full_braking_min_gap(states[0], lead)`:
+
+| cell | jerk-limited (R4-compliant) | instantaneous step (R4 forbids) |
+|---|---|---|
+| ego 15, range 12 | **−0.00 m** | +1.39 m |
+| ego 20, range 12 | **−0.11 m** | −0.06 m |
+| ego 20, range 16 | **−0.01 m** | +2.15 m |
+| ego 25, range 12 | **−0.11 m** | −0.16 m |
+| ego 25, range 16 | **−0.07 m** | +0.15 m |
+
+State it precisely: three of the five are unavoidable for **any** controller, and
+two more (ego15/r12 and ego20/r16) are unavoidable for any controller that obeys
+this specification's own jerk ceiling and avoidable only by a 160 m/s³ step that
+`excess_jerk` forbids. Grading either group as a failure asks for behaviour the
+specification punishes elsewhere.
+
+### The two cells that remain, and why they are not closable
+
+Both are `LATE`, both in the same family, and neither is a shortfall of authority
+— the arbiter commits the full 8.00 m/s² in both, and does so from frame 3.
+
+| cell | mandate frame | first emergency frame | causal requirement at the mandate frame | omniscient requirement there |
+|---|---|---|---|---|
+| ego 15, range 16 | 1 | 3 | **2.53 m/s²** | 6.49 m/s² |
+| ego 25, range 26 | 2 | 3 | **1.60 m/s²** | 6.86 m/s² |
+
+The mandate frame is computed from the lead's **true future script**. The causal
+requirement is what `oracle.required_decel_mps2` returns from the same geometry
+with the only lead acceleration a causal system can have at that frame, namely
+none — because the sweep charges no sense latency, so frame *f* carries *f+1*
+distinct captures, a closing rate needs two of them (frame 1), a curvature needs
+three (frame 2), and an *uncertainty* on that curvature needs a fourth (frame 3),
+since a three-point quadratic fit is exact and has no residual to estimate from.
+
+Both figures are below the 3.5 m/s² emergency threshold. There is therefore no
+measurement available at the mandate frame from which an emergency follows, and
+the only way to fire there is to assume every lead is braking at 6 m/s² — which
+is the constant-range phantom the whole `constant_range` family exists to pin.
+
+This is section 3's own rule being broken by the sweep: the true-future
+assumption is declared usable "only to bound how *late* an intervention was,
+**never to require an earlier one**", and here it requires one. It is recorded as
+a harness finding rather than worked around in the design, because inventing a
+`LATE` exemption sized to this estimator would be tuning the harness to the code,
+which is the failure this whole programme exists to prevent.
+
+**Consequence for anyone scoring a future round: `--gate` exit 0 is not currently
+reachable.** The floor is these two cells until the sweep's lateness grading
+charges observability the way `scenario.evaluate` already does with
+`earliest_actionable_frame`.
+
+### Harness changes made in this pass, and their authority
+
+Four, all authorised in the landing brief, none touching a scenario expectation:
+
+1. `sweep.Verdict.COLLISION_UNAVOIDABLE` and the `lost_frame == 0` exemption in
+   `classify_cell`, above.
+2. `library.py` now **imports** `REQUIRED_CLEARANCE_M`, `COMFORT_DECEL_MPS2` and
+   `JUSTIFICATION_WINDOW_FRAMES` from `oracle.py` instead of re-stating them as
+   independent literals. Certification measured the consequence of the
+   duplication: weakening the *oracle* copy from 2.0 m to 0.5 m changed only the
+   report header and left `test_backtest.py` at 13 passed.
+   `test_harness_shared_constants_have_exactly_one_definition` pins it.
+3. `report.build_baseline()` now calls `tests.scenarios.baseline_header()`, so a
+   regeneration carries its provenance block instead of silently dropping it —
+   which is what `baseline.json`'s own `staleness_check` text asked for.
+4. `tests/test_scenarios.py` gained a probe for `late_intervention`. The
+   reachability test previously listed that code in `COLLISION_HALF` and in no
+   probe, so it could only pass while the production system was still braking
+   late somewhere: a correct implementation made it red. Fixed with a probe, not
+   an exemption, so the coverage it enforces is preserved.
+
+One scenario was added, also authorised:
+
+* **`degraded_latency_stationary_20mps_at_36m`** — closes certification finding 2.
+  All 52 previous scenarios used `sense_latency_s = 0.055`, so the corpus
+  contained exactly one value of the number every budget here is a function of,
+  and a design could be tuned to 55 ms and fail at 80. 80 ms is the measured p95
+  stage sum (66.54 ms) plus 20%. Measured with `scenario.feasibility()`: the
+  first actionable frame moves 2 → 3 and the reachable clearance at 36 m falls
+  4.70 m → 3.70 m, against 2.00 m demanded, leaving **+0.050 s** of affordable
+  decision latency — one frame, the tightest budget in the corpus.
+  `report.py --reference` puts the reference controller through it at 2.41 m, so
+  it is satisfiable and is not a demand for clairvoyance.
+
+  **It caught a real defect on the first run**, which is the point of adding it.
+  The arbiter was stamping its range window with the DECISION clock rather than
+  the capture time. With a constant 55 ms latency the two differ by a constant
+  and a slope does not care; at 80 ms the same capture is republished on
+  consecutive decision frames, and deduplicating those left the survivors stamped
+  with the decision time of first sight — three captures 50 ms apart fitted as
+  though they were 0, 150 and 200 ms apart. Measured: a reported closing rate of
+  9.23 m/s for a true 20 m/s, the misplaced fit's residuals holding the
+  four-sigma gate shut for two further frames, first emergency-grade command at
+  frame 9 instead of 7, and a finish 1.17 m from the obstacle against the 2.00 m
+  required. `SafetyContext.measurement_t_s` now carries the capture time
+  explicitly. The case then passes at **2.87 m**, and the fix also improved the
+  55 ms sibling: `stationary_20mps_at_36m` went from 2.97 m to **3.53 m** of
+  clearance.
+
+### The reference controller
+
+`report.py --reference` reports **53 of 53 satisfied, 0 mis-specified, 0
+unsatisfiable**, so the corpus is still empirically satisfiable after the
+addition.
+
+---
 
 ## 8. Changing this specification
 

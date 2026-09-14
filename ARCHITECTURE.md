@@ -135,12 +135,40 @@ records which tier decided each track.
 
 ### `adas.planning` — longitudinal and lateral
 
-`LongitudinalPlanner` is one continuous constant-time-gap law with no branches
-(`d_desired = d₀ + T·v`, `v = clamp(v + k_d·(d − d_desired) + k_v·v_rel, 0,
-cruise)`) plus a separate AEB stage on TTC, required deceleration and the
-standstill gap. A stateful rate limiter bounds how fast the target may fall or
-rise; a coasting lead blocks any increase. An invalid ego speed degrades to
-hold-and-ramp-down and reports `ego_speed_unavailable` — it never guesses.
+`LongitudinalPlanner` runs **two laws and takes the larger deceleration**, and
+the split is the point:
+
+* a **constant time gap** for following (`d_desired = d₀ + T·v`), whose
+  contribution is capped at `headway_decel_mps2`. Headway keeping is not
+  collision avoidance and must not be able to produce an emergency;
+* an **evidence-gated avoidance law**, `evidence.required_decel_mps2`, gated on
+  the four-sigma lower confidence bound of a closure the planner measures itself
+  and sized on the unbiased estimate of the same closure.
+
+It publishes two numbers and they are not interchangeable. `target_speed_mps` is
+a comfort request the throttle may serve; `decel_demand_mps2` is the
+authoritative braking figure, already jerk shaped. The published target passes
+through one rate limiter (`_rate_limited_target_mps`): rising is always bounded
+by `max_accel_mps2·dt` because the vehicle cannot follow a step and the only
+thing a step does is wind up the controller's integrator, falling by
+`max_decel_mps2·dt`, and an **AEB frame is exempt and publishes 0 m/s at once** —
+a target that trailed the vehicle down during an emergency is how the primary
+path came to contribute 0.06 m/s² while the arbiter did all the braking.
+
+An invalid ego speed degrades to hold-and-ramp-down and reports
+`ego_speed_unavailable` — it never guesses. A perception dropout holds the last
+avoidance demand for `blind_hold_frames` and then makes a minimum-risk stop at
+the comfort rate; a detection miss holds it for `miss_hold_frames`. Neither a
+dropped frame nor a missed detection is evidence of an empty road.
+
+**The primary path can stop the vehicle on its own.** That is a structural claim,
+not a tuning one, and the harness holds it to it:
+`primary_alone_stops_for_stationary` discards the arbiter's command entirely and
+requires the planner and controller to stop for a parked car — measured
+clearance **2.53 m**. When the only brake in a system is its safety monitor,
+every tuning change has to trade phantom braking against missed braking, because
+there is nothing else to carry the ordinary case; that is the oscillation this
+module was redesigned out of.
 
 `LateralPlanner` has two laws behind one interface. The non-metric law
 (shipping) is speed-scheduled proportional control on the normalised pixel error
@@ -149,6 +177,21 @@ metric Stanley law needs a calibrated camera and
 `CameraGeometry.from_camera_config` refuses an uncalibrated one, because an
 assumed mount height would turn `lateral_error_m` into a fabricated measurement
 wearing metric units. Both are capped by `δ_max = atan(a_lat_max·L/v²)`.
+
+### `adas.control.evidence` — the arithmetic both layers share
+
+New, and the reason the two layers can be co-designed without being coupled.
+It holds the range estimation (`RangeEvidence`, `EvidenceBook`), the stopping
+kinematics (`required_decel_mps2`, `stopping_distance_m`), the jerk shaper and
+the sub-emergency guard, as pure functions and small stateful objects with no
+knowledge of either consumer.
+
+`LongitudinalPlanner` and `SafetyArbiter` each construct their **own**
+`EvidenceBook`, fed from their **own** lead selection. Shared maths, disjoint
+state, disjoint decisions: a corrupted window in one cannot reach the other, and
+`EvidenceLimits` is a separate instance on each side so a deployment can demand
+different amounts of evidence of the primary path and of the backstop without
+either setting reaching the other.
 
 ### `adas.control` — controller and arbiter
 
@@ -162,27 +205,90 @@ the authority. It is independent of the planner *by construction*:
 
 | quantity | planner | arbiter |
 |---|---|---|
-| lead selection | nearest in-lane | smallest TTC, then smallest range, over the RAW track list |
-| range rate | tracker's Kalman | its own alpha-beta filter, seeded from ego speed, with a jump gate |
-| in-path test | `in_ego_lane`, else lane centre | **image-centre** corridor, ≥ `min_in_path_half_width_frac` (0.30) of frame width, box-overlap membership; **never** reads `in_ego_lane` |
+| lead selection | nearest in-lane | largest REQUIRED DECELERATION, then nearest, over the RAW track list |
+| range rate | its own `EvidenceBook` | its **own** `EvidenceBook`, a separate instance with separate state |
+| in-path test | `in_ego_lane`, else lane centre | METRIC corridor from the object's own `lateral_offset_m`, widened by `lateral_gate_margin_m`; **never** reads `in_ego_lane` |
 | lane model | the geometry it steers on | a *widen-only* second anchor, and only if not mock, finite, in frame, confidence ≥ 0.50 |
 | kinematics | plan over a horizon | differenced from measured ego speed |
 | headway rule | time gap | RSS minimum gap |
+
+Both sides share the *arithmetic* in `adas.control.evidence` and share none of
+the *state*: each constructs its own `EvidenceBook` from its own lead selection,
+so a corrupted window in one cannot reach the other. Three properties of that
+module are there because the shipped arbiter got each of them wrong:
+
+* **measurement noise is estimated from THIRD differences of the raw range.** A
+  third difference annihilates a quadratic exactly, so a lead holding a constant
+  deceleration contributes nothing to the noise estimate. Taking it from fit
+  residuals instead means a braking lead reads as a noisy stationary one, loses
+  its deceleration credit, and is driven into.
+* **the noise estimate is pooled over the whole run**, not taken from the last
+  window. A four-sample fit's residuals carry two degrees of freedom and collapse
+  to nearly nothing several times in a 300-frame run; every standard error
+  computed from them collapses with it and the confidence bound stops bounding.
+* **the range window is stamped with the CAPTURE time**, from
+  `SafetyContext.measurement_t_s`, not with the decision clock. See the note
+  under *Latency* below.
 
 **What is not diverse.** `SafetyContext.tracks` is the tracker's output and
 `EgoState` is the planner's ego state, so a detection perception never produced is
 invisible to both, and a wrong ego speed fools both identically. The arbiter is a
 second opinion on the *decision*, not a second sensor.
 
-Range fusion (`_fuse_range`) is four explicit cases, not `min(pinhole, depth)`:
-no usable second channel → pinhole, and no finding at all if the channel is simply
-off; agreement within `range_disagreement_frac` → confidence-weighted blend;
-disagreement with the second channel **nearer** → the pinhole is used until
-`range_corroboration_frames` (3) consecutive disagreeing frames on that track;
-disagreement **farther** → never adopted. A second-channel confidence below
-`min_range_confidence` (0.35) is discarded outright. Taking the minimum of two
-channels is a systematic downward bias, not a fusion, and a single-frame phantom
-close reading at highway speed used to produce a full-authority emergency stop.
+Range fusion (`_fuse_range`) is **stateless**, and its rule is two lines
+(45 executable lines with the argument written out): when a second
+channel is present, finite and above `min_range_confidence` (0.35), the fused
+range is the NEARER of it and the pinhole if the two agree within
+`range_disagreement_frac` (0.30); otherwise the pinhole is used, the
+disagreement is reported and the state is degraded. Two ranges twelve times
+apart are not two opinions about one distance — at least one channel is broken,
+and the pinhole is the one with a geometric derivation and a calibration behind
+it, so the response is to report and degrade rather than to adopt the broken
+channel.
+
+This replaced an 87-executable-line state machine carrying five per-track
+dictionaries: a
+confidence gate with hysteresis, an asymmetric adoption/dwell counter, a
+disagreement corroboration streak and a confidence-weighted blend. Two of its
+three parts were inert and the third was a latch. The blend returned a value
+strictly between the two channels and the very next expression took `min` of the
+blend and both channels, which is `min` of the two channels for any weight. The
+hysteresis and dwell existed to stop the reported *provenance* flip-flopping (26
+times in 400 frames of real footage) — a logging problem, now solved in the
+logger. And the corroboration streak delayed adopting a persistently disagreeing
+nearer channel by three frames and then adopted it anyway.
+
+The single-frame phantom close reading that motivated the original machinery is
+still rejected, and by a stronger mechanism: a 3 m reading against a 40 m pinhole
+is a 1233% disagreement, so it never reaches the hazard maths at all, and even if
+it did the evidence window would reject it as a range jump beyond
+`evidence.jump_m` (3.0 m) and report an unmeasured rate, which authorises no
+braking.
+
+`aeb_rate_corroboration_frames` went the same way. It required a measured
+emergency to hold for two consecutive frames before it latched a minimum-risk
+manoeuvre. It was a latch on evidence and it was redundant: the closure must
+already clear four standard errors of zero and the lead deceleration five before
+either reaches the hazard classifier. Removing it moved the first minimum-risk
+frame from 4 to 3 across the sweep's tightest family with no new phantom, early
+or band finding anywhere in the 120-cell gate or the 53-scenario corpus. Both
+keys, and the four range-stability keys, are retained so an existing config still
+loads, are still range-checked, and are reported inert by
+`ArbiterLimits.unused_limits()`.
+
+**Latency.** Every rate here is a slope, and a slope is only as good as its
+abscissae. `SafetyContext` carries `measurement_t_s`, the time the measurements
+were TRUE, alongside `timestamp_s`; the range window is fitted on the former.
+With a constant sense latency the two differ by a constant and a slope does not
+care, which is why using the decision clock went unnoticed at the measured 55 ms.
+Once latency exceeds a frame period the same capture is republished on
+consecutive decision frames, and deduplicating those leaves the survivors stamped
+with the decision time of first sight. Measured at 80 ms on a 36 m stationary
+approach: a reported closing rate of 9.23 m/s for a true 20 m/s, and a finish
+1.17 m from the obstacle against 2.00 m required. `adas.runtime.pipeline` passes
+`frame.timestamp_s` for both, so production behaviour was always correct; the
+scenario harness now passes `obs.measurement_t_s`, and
+`degraded_latency_stationary_20mps_at_36m` keeps it that way.
 
 Findings are split three ways and only one of them can latch the terminal state:
 
@@ -202,7 +308,16 @@ until `reset()`.
 
 **Output shaping.** The output is never more energetic than the input: throttle is
 only ever reduced and **brake is only ever increased**, enforced by a final
-`max(brake, cmd_in.brake)`. There is deliberately no brake *apply*-rate limit here —
+`max(brake, cmd_in.brake)`. The single exception is a positively EMPTY road —
+perception healthy, ego valid, no in-path object now or recently — where the
+arbiter may lower an incoming brake to `no_hazard_decel_cap_mps2`, because an
+unwarranted 8 m/s² stop on a motorway does not avoid a collision, it manufactures
+one behind. A lead merely being *measured* is not that exception and must never
+arm it: one of the three redesign candidates attenuated an incoming 1.00 to 0.12
+with a benign car 45 m ahead, and the round before it attenuated 1.00 to 0.25 and
+drove into the lead. `test_an_incoming_brake_is_passed_through_unattenuated_with_a_lead_in_view`
+and its converse pin both directions; the scenario corpus covers only the empty
+road, so neither is redundant. There is deliberately no brake *apply*-rate limit here —
 that belongs to the controller, which owns the emergency exemption. Only the throttle
 apply-rate and the brake *release*-rate floor survive.
 
@@ -229,8 +344,11 @@ implementations, each declaring `measured`.
    recovery frame associate a real measurement against an N-frame-stale prediction
    that still claimed full confidence. A detector fault and a lane fault are tracked
    separately. An empty list from a working detector still means the road is clear.
-   *Not yet done*: the arbiter's own alpha-beta range filter is still not advanced
-   through a dropout, because `_assess_lead` sits behind the `if perception.ok` gate.
+   The arbiter no longer has an alpha-beta filter to advance: its range evidence
+   is a window of RAW measurements, and a dropout simply adds no sample to it
+   while `blind_hold_frames` holds the last avoidance demand. An extrapolation is
+   not a measurement and must never be able to establish the closure that
+   authorises an emergency stop.
 3. Lane scheduling is honest. With `lane.every_n_frames > 1`, a reused model is
    republished with its confidence scaled by `1 − age/(max_age+1)` and dropped
    entirely past `lane.max_age_frames`. Old evidence is labelled as old evidence.

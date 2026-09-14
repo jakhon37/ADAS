@@ -94,7 +94,16 @@ def load_baseline(path: str = BASELINE_PATH) -> Dict[str, List[str]]:
 
 
 def build_baseline(results: Sequence[scen.ScenarioResult]) -> Dict[str, object]:
-    """The baseline document for this run."""
+    """The baseline document for this run, provenance block included.
+
+    The ``generated`` block comes from :func:`tests.scenarios.baseline_header`,
+    which fingerprints the system under test and the corpus.  It used to be
+    written by hand and dropped silently on every regeneration, which is the
+    defect the committed file's own ``staleness_check`` text described and asked
+    to have fixed here.  A baseline with no provenance is worse than none: it
+    compares a run against an unknown pair of (arbiter, corpus) and reports the
+    difference as if it meant something.
+    """
     known = {
         r.scenario.name: sorted({f.code for f in r.findings})
         for r in results
@@ -104,8 +113,11 @@ def build_baseline(results: Sequence[scen.ScenarioResult]) -> Dict[str, object]:
     for entry in known.values():
         for code in entry:
             codes[code] = codes.get(code, 0) + 1
+    from tests.scenarios import baseline_header
+
     return {
         "spec_version": SPEC_VERSION,
+        "generated": baseline_header([r.scenario.name for r in results], known),
         "purpose": (
             "Scenarios that FAIL against the arbiter as committed today. This file "
             "is the redesign's target: the work is done when 'known_failures' is "

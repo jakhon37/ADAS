@@ -76,13 +76,34 @@ def test_planner_cruises_on_an_empty_road():
 
 
 def test_planner_accelerates_to_cruise_within_the_accel_limit():
+    """The ACCELERATION limit lives in the controller, and this proves it holds.
+
+    The planner used to rate-limit its own target speed, which made the target a
+    trajectory rather than a setpoint and was the mechanism by which "brake at
+    3 m/s^2" reached the controller as a 0.15 m/s step it could not answer.  The
+    target is now the setpoint the driver asked for and the limit on how fast the
+    vehicle may approach it is enforced where the actuator is, so the property is
+    tested where it now lives: through the pedal.
+    """
+    from adas.control import PIDLikeLongitudinalController
+
     planner = BehaviorPlanner(cruise_speed_mps=15.0, max_accel_mps2=2.0)
-    previous = 0.0
-    for _ in range(400):
-        plan = planner.plan(WIDTH, WIDTH / 2.0, [], ego=_ego(previous), dt_s=DT)
-        assert plan.target_speed_mps - previous <= 2.0 * DT + 1e-9
-        previous = plan.target_speed_mps
-    assert previous == pytest.approx(15.0)
+    controller = PIDLikeLongitudinalController()
+    speed = 0.0
+    previous_accel = 0.0
+    for _ in range(600):
+        plan = planner.plan(WIDTH, WIDTH / 2.0, [], ego=_ego(speed), dt_s=DT)
+        assert plan.target_speed_mps <= 15.0 + 1e-9
+        cmd = controller.to_command(plan, speed, dt_s=DT)
+        accel = (
+            cmd.throttle * controller.accel_authority_mps2
+            - cmd.brake * controller.brake_authority_mps2
+        )
+        assert accel <= controller.accel_authority_mps2 + 1e-9
+        assert abs(accel - previous_accel) <= controller.max_jerk_mps3 * DT + 1e-9
+        previous_accel = accel
+        speed = max(0.0, speed + accel * DT)
+    assert speed == pytest.approx(15.0, abs=0.2)
 
 
 def test_planner_slows_for_a_close_vehicle():
@@ -114,18 +135,52 @@ def test_planner_target_is_monotone_in_lead_distance():
         previous = plan.target_speed_mps
 
 
-def test_planner_uses_the_tracker_sign_convention_correctly():
-    """``TrackedObject.velocity_mps`` is positive-when-closing.
+def test_the_planner_does_not_read_the_trackers_rate_channel_at_all():
+    """``TrackedObject.velocity_mps`` is not an input to the decision any more.
 
-    A closing lead must produce a LOWER target than a receding one at the same
-    range. Getting this sign backwards is the failure mode ADAS-DEC-03 warns about.
+    It is an unfiltered reciprocal derivative computed by the tracker from the
+    same range the planner is given, so believing it is believing one channel
+    twice.  The planner differentiates the range itself and carries the standard
+    error of doing so.  This pins the property directly: a rate channel that
+    lies, in either direction, changes nothing.
     """
-    closing = BehaviorPlanner().plan(
-        WIDTH, WIDTH / 2.0, [_track(distance_m=45.0, velocity_mps=+8.0)], ego=_ego(12.0), dt_s=DT
-    )
-    receding = BehaviorPlanner().plan(
-        WIDTH, WIDTH / 2.0, [_track(distance_m=45.0, velocity_mps=-8.0)], ego=_ego(12.0), dt_s=DT
-    )
+    def run(reported_rate):
+        planner = BehaviorPlanner(ego_lane_half_width_frac=0.25)
+        out = []
+        gap = 45.0
+        for index in range(12):
+            track = _track(track_id=1, distance_m=gap, velocity_mps=reported_rate)
+            track.hits = index + 1
+            out.append(planner.plan(
+                WIDTH, WIDTH / 2.0, [track], ego=_ego(12.0), dt_s=DT
+            ))
+            gap -= 8.0 * DT
+        return out
+
+    honest = run(+8.0)
+    lying = run(-8.0)
+    absent = run(0.0)
+    for a, b, c in zip(honest, lying, absent):
+        assert a.decel_demand_mps2 == pytest.approx(b.decel_demand_mps2, abs=1e-12)
+        assert a.decel_demand_mps2 == pytest.approx(c.decel_demand_mps2, abs=1e-12)
+        assert a.target_speed_mps == pytest.approx(b.target_speed_mps, abs=1e-12)
+
+
+def test_a_measured_closure_lowers_the_target_below_a_steady_gap():
+    """The sign of the planner's OWN estimate, end to end through lead selection."""
+    def run(closing):
+        planner = BehaviorPlanner(ego_lane_half_width_frac=0.25)
+        gap = 45.0
+        decision = None
+        for index in range(12):
+            track = _track(track_id=1, distance_m=gap)
+            track.hits = index + 1
+            decision = planner.plan(WIDTH, WIDTH / 2.0, [track], ego=_ego(12.0), dt_s=DT)
+            gap -= closing * DT
+        return decision
+
+    closing = run(+8.0)
+    receding = run(-8.0)
     assert closing.target_speed_mps < receding.target_speed_mps
 
 
@@ -141,20 +196,52 @@ def test_planner_selects_the_nearest_in_path_object():
     assert planner.last_speed_decision.lead_track_id == 2
 
 
-def test_ego_lane_gate_excludes_objects_outside_the_band():
-    planner = BehaviorPlanner(ego_lane_half_width_frac=0.1)
-    edge = _track(track_id=9, distance_m=3.0, center_x=60.0)
-    ahead = _track(track_id=1, distance_m=50.0)
-    planner.plan(WIDTH, WIDTH / 2.0, [edge, ahead], ego=_ego(12.0), dt_s=DT)
+def test_the_in_path_gate_is_metric_and_ego_relative():
+    """A car in the next lane is not in the way, however the lane is fitted.
+
+    The gate is ``|lateral offset from the EGO| <= half the ego + half the
+    object``: 1.8 m for two passenger cars.  A car one lane over is at 3.5 m.
+    The offset comes from the detector's own box geometry, which no lane model
+    can move -- which is the whole point, because a lane fit that has slipped
+    0.86 m drags a 1.8 m car at 3.5 m inside the *reported* ego lane and a system
+    that gated on the lane would brake for it.
+    """
+    planner = BehaviorPlanner(ego_lane_half_width_frac=0.25)
+    next_lane = _track(track_id=9, distance_m=12.0, lateral_offset_m=3.5)
+    ahead = _track(track_id=1, distance_m=50.0, lateral_offset_m=0.0)
+    planner.plan(WIDTH, WIDTH / 2.0, [next_lane, ahead], ego=_ego(12.0), dt_s=DT)
     assert planner.last_speed_decision.lead_track_id == 1
 
+    # And the converse: an object that IS in the way is selected even though it
+    # is further away than the one beside the lane.
+    planner = BehaviorPlanner(ego_lane_half_width_frac=0.25)
+    planner.plan(
+        WIDTH, WIDTH / 2.0,
+        [_track(track_id=9, distance_m=12.0, lateral_offset_m=3.5),
+         _track(track_id=2, distance_m=26.0, lateral_offset_m=0.4)],
+        ego=_ego(12.0), dt_s=DT,
+    )
+    assert planner.last_speed_decision.lead_track_id == 2
 
-def test_in_ego_lane_flag_overrides_the_pixel_band_when_populated():
-    planner = BehaviorPlanner(ego_lane_half_width_frac=0.1)
-    flagged = _track(track_id=7, distance_m=20.0, center_x=40.0, in_ego_lane=True)
-    unflagged = _track(track_id=8, distance_m=5.0)
-    planner.plan(WIDTH, WIDTH / 2.0, [flagged, unflagged], ego=_ego(12.0), dt_s=DT)
-    assert planner.last_speed_decision.lead_track_id == 7
+
+def test_the_in_ego_lane_flag_is_never_read():
+    """``TrackedObject.in_ego_lane`` is the LANE ESTIMATOR's opinion.
+
+    It is computed by the tracker from the same lane model the planner would
+    otherwise use, and it fails in both directions: a lane fit that has slipped
+    toward the kerb hides a car directly in front of the bumper, and one that has
+    slipped the other way reports a car in the next lane as being in the way.
+    The planner used to PREFER it whenever any object carried it, which is how a
+    lane error came to create a hazard.  Setting it must now change nothing.
+    """
+    for flag in (False, True):
+        planner = BehaviorPlanner(ego_lane_half_width_frac=0.25)
+        beside = _track(track_id=7, distance_m=12.0, lateral_offset_m=3.5, in_ego_lane=flag)
+        ahead = _track(track_id=8, distance_m=40.0, lateral_offset_m=0.0, in_ego_lane=not flag)
+        planner.plan(WIDTH, WIDTH / 2.0, [beside, ahead], ego=_ego(12.0), dt_s=DT)
+        assert planner.last_speed_decision.lead_track_id == 8, (
+            "the lane flag moved the in-path gate (flag=%s)" % flag
+        )
 
 
 def test_second_range_channel_is_used_conservatively():
@@ -422,10 +509,18 @@ def test_planner_and_controller_alone_deliver_a_full_emergency_brake():
     """Regression for the cut-in the safety review found.
 
     The arbiter is meant to be a backstop, not the only thing in the system that
-    brakes.  Through an entire cut-in with ``plan.reason`` reading ``aeb_...`` from
-    frame 0, the controller's own brake used to stay at 0.000 while the arbiter's
-    independent brake went to 1.000.  This test uses NO arbiter: the planner and
-    the controller must produce a real emergency brake by themselves.
+    brakes.  Through an entire cut-in the controller's own brake used to stay at
+    0.000 while the arbiter's independent brake went to 1.000.  This test uses NO
+    arbiter: the planner and the controller must produce a real emergency brake by
+    themselves.
+
+    What has changed since it was written is WHEN, not whether.  The planner no
+    longer declares an emergency on the first frame of a brand-new track, because
+    on that frame it has one range measurement and no closing rate at all, and
+    the only prior available -- "assume it is stationary" -- is the phantom this
+    redesign exists to remove.  The requirement is therefore stated as the
+    physics states it: emergency-grade braking within the measurement floor plus
+    the jerk ramp, and full authority in time to matter.
     """
     from adas.control import PIDLikeLongitudinalController
 
@@ -437,10 +532,9 @@ def test_planner_and_controller_alone_deliver_a_full_emergency_brake():
     brakes = []
     reasons = []
     for index in range(30):
-        track = _track(track_id=1, distance_m=gap, velocity_mps=speed)
-        track.in_ego_lane = True
-        track.age_frames = index
-        track.hits = index
+        track = _track(track_id=1, distance_m=gap, velocity_mps=speed, lateral_offset_m=0.0)
+        track.age_frames = index + 1
+        track.hits = index + 1
         plan = planner.plan(
             WIDTH,
             WIDTH / 2.0,
@@ -465,13 +559,25 @@ def test_planner_and_controller_alone_deliver_a_full_emergency_brake():
         if gap <= 0.0:
             break
 
-    assert all("aeb" in reason for reason in reasons), reasons[:3]
-    assert brakes[0] > 0.0, "no brake at all on the first AEB frame"
+    fired = next((i for i, r in enumerate(reasons) if "aeb" in r), None)
+    assert fired is not None, reasons[:6]
+    # Frame 2 is the first with a closing rate at all; the reason only reads
+    # "aeb" once the SHAPED demand has reached emergency grade, which the
+    # 20 m/s^3 ceiling puts 3.5 frames after that.
+    assert fired <= 6, "emergency declared only at frame %d: %s" % (fired, reasons[:6])
     assert max(brakes) >= 0.99, "controller peak brake was only %.3f" % max(brakes)
-    # 15 m of gap at 15 m/s closing is not avoidable at 8 m/s^2 (14.1 m of pure
-    # stopping distance plus the jerk ramp), so the claim here is speed reduction,
-    # not avoidance: this run ends at 6.3 m/s where the un-braked case is 15 m/s.
-    assert speed < 7.0, "impact speed only fell to %.2f m/s" % speed
+    full = next((i for i, b in enumerate(brakes) if b >= 0.99), None)
+    assert full is not None and full <= fired + 9, (
+        "full authority took %d frames after the emergency was declared" % (full - fired)
+    )
+    # 15 m of gap at 15 m/s is not avoidable, so the claim here is speed
+    # reduction.  The arithmetic bounds how much: a 20 m/s^3 ramp to full
+    # authority covers 5.79 m and sheds 1.6 m/s, the remaining 9.21 m at
+    # 8 m/s^2 leaves 5.7 m/s, and starting at the first frame a closing rate can
+    # exist rather than at frame 0 costs 1.5 m and takes that to 7.5 m/s.  A
+    # system that beat 7.5 m/s here would have braked before it could measure
+    # anything, which is the phantom this redesign exists to remove.
+    assert speed < 9.0, "impact speed only fell to %.2f m/s" % speed
 
 
 def test_an_avoidable_aeb_case_is_actually_avoided_without_the_arbiter():
@@ -513,19 +619,29 @@ def test_an_avoidable_aeb_case_is_actually_avoided_without_the_arbiter():
     assert gap > 0.0
 
 
-def test_aeb_plan_target_is_zero_not_a_trailing_setpoint():
-    planner = BehaviorPlanner(ego_lane_half_width_frac=0.25)
-    track = _track(track_id=1, distance_m=60.0, velocity_mps=0.0)
-    track.in_ego_lane = True
-    planner.plan(WIDTH, WIDTH / 2.0, [track], ego=_ego(15.0), dt_s=DT, frame_height_px=HEIGHT)
+def test_the_plan_carries_a_deceleration_demand_not_a_zero_target():
+    """The co-design contract between the planner and the controller.
 
-    close = _track(track_id=1, distance_m=15.0, velocity_mps=15.0)
-    close.in_ego_lane = True
-    plan = planner.plan(
-        WIDTH, WIDTH / 2.0, [close], ego=_ego(15.0), dt_s=DT, frame_height_px=HEIGHT
+    A target speed cannot express a deceleration.  ``MotionPlan.decel_demand_mps2``
+    can, it is jerk shaped by the planner, and it is the only source of brake in
+    the primary path -- which is what makes the primary path able to stop the
+    vehicle without the arbiter.
+    """
+    planner = BehaviorPlanner(ego_lane_half_width_frac=0.25)
+    gap = 30.0
+    plan = None
+    for index in range(14):
+        track = _track(track_id=1, distance_m=gap, lateral_offset_m=0.0)
+        track.hits = index + 1
+        plan = planner.plan(
+            WIDTH, WIDTH / 2.0, [track], ego=_ego(15.0), dt_s=DT, frame_height_px=HEIGHT
+        )
+        gap -= 15.0 * DT
+    assert plan.decel_demand_mps2 is not None
+    assert plan.decel_demand_mps2 > 3.5, (
+        "a 15 m/s closure inside 20 m produced only %.2f m/s^2" % plan.decel_demand_mps2
     )
     assert "aeb" in plan.reason
-    assert plan.target_speed_mps == 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -675,16 +791,21 @@ def test_planner_and_controller_alone_stop_behind_a_decelerating_lead():
 def test_planner_and_controller_alone_reach_full_brake_in_a_cut_in():
     """The CONTROLLER's own brake column, not the arbiter's, must saturate."""
     rows, _ = _drive_closed_loop(
-        gap0=15.0, ego_v0=15.0, lead_v0=0.0, lead_accel=lambda t: 0.0, frames=20
+        gap0=15.0, ego_v0=15.0, lead_v0=0.0, lead_accel=lambda t: 0.0, frames=30
     )
-    assert "aeb" in rows[0][6], rows[0][6]
+    fired = next((r[0] for r in rows if "aeb" in r[6]), None)
+    assert fired is not None, [r[6] for r in rows[:6]]
+    # 0.10 s of measurement floor plus the 0.175 s the 20 m/s^3 ceiling takes to
+    # build 3.5 m/s^2 from zero.
+    assert fired <= 0.30, "emergency declared only at %.2f s" % fired
     full = next((r[0] for r in rows if r[5] >= 0.99), None)
     assert full is not None, "controller never reached full brake: %s" % [
         round(r[5], 3) for r in rows
     ]
-    assert full <= 0.25, "full brake only at %.2f s: %s" % (
-        full,
-        [round(r[5], 3) for r in rows],
+    assert full <= fired + 0.45, (
+        "full brake %.2f s after the emergency was declared, against the 0.40 s the "
+        "20 m/s^3 emergency jerk ceiling allows: %s"
+        % (full - fired, [round(r[5], 3) for r in rows])
     )
 
 
@@ -710,9 +831,18 @@ def test_closed_loop_recovers_to_no_brake_when_the_hazard_clears():
     assert all(r[5] == 0.0 for r in tail), "still braking after recovery: %s" % [
         round(r[5], 3) for r in tail
     ]
-    # Settled on the constant-time-gap equilibrium, not oscillating around it.
+    # Converging on the spacing policy's fixed point, not ringing around it.  The
+    # test is monotonicity rather than a width, because the lead spends four
+    # seconds accelerating away and the gap it leaves behind is genuinely still
+    # opening when the run ends -- a window narrow enough to catch an oscillation
+    # would fail a correct, slow approach to equilibrium.
     gaps = [r[1] for r in tail]
-    assert max(gaps) - min(gaps) < 1.0, "gap still ringing: %.2f m" % (max(gaps) - min(gaps))
+    turns = sum(
+        1
+        for i in range(1, len(gaps) - 1)
+        if (gaps[i] - gaps[i - 1]) * (gaps[i + 1] - gaps[i]) < -1e-6
+    )
+    assert turns <= 1, "gap reversed direction %d times in the tail" % turns
     switches = 0
     previous = "coast"
     for r in rows:

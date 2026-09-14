@@ -42,9 +42,10 @@ Stateful and NOT thread-safe; one instance per pipeline.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from adas.control.arbiter import ArbiterLimits, SafetyArbiter, SafetyContext
+from adas.control.evidence import EvidenceLimits
 from adas.core.exceptions import SafetyViolation
 from adas.core.logger import setup_logger
 from adas.core.models import (
@@ -56,6 +57,25 @@ from adas.core.models import (
 )
 
 logger = setup_logger(__name__)
+
+
+_ARBITER_DEFAULTS = ArbiterLimits()
+"""The single source of truth for every limit both classes name.
+
+:class:`SafetyLimits` is the CONFIGURATION face of
+:class:`~adas.control.arbiter.ArbiterLimits`: same quantity, same units, one
+extra hop so that a deployment can set it from a file.  It used to restate all
+69 shared defaults as independent literals, which is a silent-divergence machine
+of exactly the kind that has already bitten this repository twice -- and it had
+already diverged once here in the direction that MATTERS: the configuration copy
+won, so tuning the arbiter's own default changed nothing that ran through
+``SafetyMonitor``.  Every shared default is now a reference, and
+``tests/test_safety.py::test_safety_limits_defaults_match_the_arbiters`` fails if
+a field is added to one class and not the other.
+"""
+
+_EVIDENCE_DEFAULTS = _ARBITER_DEFAULTS.evidence
+"""Likewise for the measurement-evidence limits."""
 
 
 @dataclass
@@ -78,99 +98,170 @@ class SafetyLimits:
     ``lane_offset_unavailable`` instead of silently passing.
     """
 
-    max_speed_mps: float = 33.0
-    max_acceleration_mps2: float = 3.0
-    max_deceleration_mps2: float = 8.0
-    max_steering_rate_rad_s: float = 0.5
-    max_steering_angle_rad: float = 0.52
-    min_following_distance_m: float = 2.0
+    max_speed_mps: float = _ARBITER_DEFAULTS.max_speed_mps
+    max_acceleration_mps2: float = _ARBITER_DEFAULTS.max_acceleration_mps2
+    max_deceleration_mps2: float = _ARBITER_DEFAULTS.max_deceleration_mps2
+    max_steering_rate_rad_s: float = _ARBITER_DEFAULTS.max_steering_rate_rad_s
+    max_steering_angle_rad: float = _ARBITER_DEFAULTS.max_steering_angle_rad
+    min_following_distance_m: float = _ARBITER_DEFAULTS.absolute_min_gap_m
     """ABSOLUTE floor on the gap, metres. This is not a following policy -- at
     33 m/s it is a 0.06 s gap. The real headway rule is the RSS test inside the
     arbiter, parameterised by ``reaction_time_s`` and the two braking
     capabilities."""
-    max_lateral_offset_m: float = 1.5
+    max_lateral_offset_m: float = _ARBITER_DEFAULTS.max_lateral_offset_m
     """Lane-departure limit in metres. See the class docstring: enforced only when
     a metric lateral offset is available."""
-    plan_horizon_s: float = 1.0
+    plan_horizon_s: float = _ARBITER_DEFAULTS.plan_horizon_s
     """Horizon used to judge a plan's requested ACCELERATION only."""
 
     # --- new; see the handoff note for SafetyConfig --------------------------
-    max_jerk_mps3: float = 4.0
-    max_jerk_emergency_mps3: float = 15.0
-    max_lateral_accel_mps2: float = 4.5
-    wheelbase_m: float = 2.8
-    max_road_wheel_rad: float = 0.436
+    max_jerk_mps3: float = _ARBITER_DEFAULTS.max_jerk_mps3
+    max_jerk_emergency_mps3: float = _ARBITER_DEFAULTS.max_jerk_emergency_mps3
+    max_lateral_accel_mps2: float = _ARBITER_DEFAULTS.max_lateral_accel_mps2
+    wheelbase_m: float = _ARBITER_DEFAULTS.wheelbase_m
+    max_road_wheel_rad: float = _ARBITER_DEFAULTS.max_road_wheel_rad
     """Road-wheel angle at ``steering = 1.0``. Must equal
     ``radians(ControllerConfig.max_steering_angle_deg)``."""
-    brake_authority_mps2: float = 8.0
-    accel_authority_mps2: float = 2.5
-    standstill_gap_m: float = 4.0
-    reaction_time_s: float = 0.6
-    ego_brake_capability_mps2: float = 6.0
-    lead_brake_capability_mps2: float = 8.0
-    ttc_brake_s: float = 0.9
-    ttc_warn_s: float = 1.6
-    comfort_decel_mps2: float = 3.0
-    mrm_decel_mps2: float = 3.5
-    limited_after_dropouts: int = 1
-    mrm_after_dropouts: int = 3
-    disengage_after_frames: int = 40
-    recovery_frames: int = 10
+    brake_authority_mps2: float = _ARBITER_DEFAULTS.brake_authority_mps2
+    accel_authority_mps2: float = _ARBITER_DEFAULTS.accel_authority_mps2
+    standstill_gap_m: float = _ARBITER_DEFAULTS.standstill_gap_m
+    reaction_time_s: float = _ARBITER_DEFAULTS.reaction_time_s
+    ego_brake_capability_mps2: float = _ARBITER_DEFAULTS.ego_brake_capability_mps2
+    lead_brake_capability_mps2: float = _ARBITER_DEFAULTS.lead_brake_capability_mps2
+    ttc_brake_s: float = _ARBITER_DEFAULTS.ttc_brake_s
+    ttc_warn_s: float = _ARBITER_DEFAULTS.ttc_warn_s
+    ttc_min_closing_mps: float = _ARBITER_DEFAULTS.ttc_min_closing_mps
+    """Closure below which no time to contact is computed at all, m/s."""
+    comfort_decel_mps2: float = _ARBITER_DEFAULTS.comfort_decel_mps2
+    mrm_decel_mps2: float = _ARBITER_DEFAULTS.mrm_decel_mps2
+    """Deceleration of a minimum-risk stop. The COMFORT limit, deliberately
+    below the 3.5 m/s^2 emergency grade: an MRM stops because the vehicle
+    cannot see, not because something was detected, and the traffic behind has
+    no reason to expect an AEB."""
+    limited_after_dropouts: int = _ARBITER_DEFAULTS.limited_after_dropouts
+    mrm_after_dropouts: int = _ARBITER_DEFAULTS.mrm_after_dropouts
+    """Consecutive dropouts before a minimum-risk manoeuvre begins. 0.4 s: a
+    dropped frame is a dropped frame, half a second of nothing is a vehicle
+    driving blind."""
+    disengage_after_frames: int = _ARBITER_DEFAULTS.disengage_after_frames
+    recovery_frames: int = _ARBITER_DEFAULTS.recovery_frames
 
     # --- previously unreachable from configuration ---------------------------
     # Every one of these existed only as an ArbiterLimits default, so a threshold
     # that can latch the TERMINAL state (range_disagreement_frac, min_dt_s) could
     # not be changed for a deployment without editing source. They are defaulted
     # to the ArbiterLimits values, so projecting them changes no behaviour.
-    range_disagreement_frac: float = 0.30
-    min_range_confidence: float = 0.35
-    range_corroboration_frames: int = 3
-    min_dt_s: float = 0.005
-    max_dt_s: float = 0.5
-    max_frame_gap_s: float = 0.5
-    aeb_required_decel_mps2: float = 5.0
-    aeb_decel_margin: float = 1.15
-    aeb_min_decel_mps2: float = 4.0
-    aeb_headway_frac: float = 0.5
-    kinematics_min_speed_mps: float = 0.5
-    limited_throttle_cap: float = 0.0
-    throttle_rate_per_s: float = 5.0
-    brake_release_rate_per_s: float = 8.0
-    min_in_path_half_width_frac: float = 0.30
+    range_disagreement_frac: float = _ARBITER_DEFAULTS.range_disagreement_frac
+    min_range_confidence: float = _ARBITER_DEFAULTS.min_range_confidence
+    range_corroboration_frames: int = _ARBITER_DEFAULTS.range_corroboration_frames
+    min_dt_s: float = _ARBITER_DEFAULTS.min_dt_s
+    max_dt_s: float = _ARBITER_DEFAULTS.max_dt_s
+    max_frame_gap_s: float = _ARBITER_DEFAULTS.max_frame_gap_s
+    aeb_required_decel_mps2: float = _ARBITER_DEFAULTS.aeb_required_decel_mps2
+    aeb_decel_margin: float = _ARBITER_DEFAULTS.aeb_decel_margin
+    aeb_min_decel_mps2: float = _ARBITER_DEFAULTS.aeb_min_decel_mps2
+    """Floor on the emergency demand. ZERO: a floor stops the response being
+    proportional at exactly the point where proportionality matters, and
+    4.0 m/s^2 applied 40 m from a stopped car that needed 2.7 is over-braking,
+    which transfers the collision to the vehicle behind."""
+    aeb_headway_frac: float = _ARBITER_DEFAULTS.aeb_headway_frac
+    kinematics_min_speed_mps: float = _ARBITER_DEFAULTS.kinematics_min_speed_mps
+    limited_throttle_cap: float = _ARBITER_DEFAULTS.limited_throttle_cap
+    throttle_rate_per_s: float = _ARBITER_DEFAULTS.throttle_rate_per_s
+    brake_release_rate_per_s: float = _ARBITER_DEFAULTS.brake_release_rate_per_s
+    min_in_path_half_width_frac: float = _ARBITER_DEFAULTS.min_in_path_half_width_frac
     """Floor on the arbiter's in-path corridor half width, as a fraction of the
     frame width. Keep it >= the planner's ``ego_lane_half_width_frac``: the
     backstop must never look at a narrower slice of the road than the planner."""
-    lane_trust_confidence: float = 0.50
-    mrm_straighten_speed_mps: float = 1.0
-    allow_uncalibrated_range: bool = False
+    lane_trust_confidence: float = _ARBITER_DEFAULTS.lane_trust_confidence
+    mrm_straighten_speed_mps: float = _ARBITER_DEFAULTS.mrm_straighten_speed_mps
+    allow_uncalibrated_range: bool = _ARBITER_DEFAULTS.allow_uncalibrated_range
     """Opt-in switch. Leave False and an uncalibrated camera reports
     ``camera_uncalibrated`` and floors the state at LIMITED."""
 
     # --- evidence required before a closing RATE may authorise full braking ---
-    deferred_aeb_decel_mps2: float = 5.0
+    deferred_aeb_decel_mps2: float = _ARBITER_DEFAULTS.deferred_aeb_decel_mps2
     """Deceleration ceiling while an ACUTE emergency test has tripped on the safe
     prior but the closing rate is not yet measured. Must sit between
     ``comfort_decel_mps2`` and ``max_deceleration_mps2``."""
-    aeb_rate_corroboration_frames: int = 2
+    aeb_rate_corroboration_frames: int = _ARBITER_DEFAULTS.aeb_rate_corroboration_frames
     """Consecutive frames a rate-dependent emergency test must hold before it
     authorises full-authority braking."""
-    aeb_min_rate_samples: int = 4
+    aeb_min_rate_samples: int = _ARBITER_DEFAULTS.aeb_min_rate_samples
     """Raw range measurements the arbiter needs before it calls its closing rate
     MEASURED. Below this the rate is still the ``-ego_speed`` safe prior, and the
     rate-dependent emergency tests are held to the graded response."""
-    aeb_min_rate_span_s: float = 0.15
+    aeb_min_rate_span_s: float = _ARBITER_DEFAULTS.aeb_min_rate_span_s
     """Elapsed time the same window must span."""
-    range_rate_window_s: float = 0.60
+    range_rate_window_s: float = _ARBITER_DEFAULTS.range_rate_window_s
     """Window the measured range slope is fitted over."""
 
     # --- range-source stability ------------------------------------------------
-    range_source_dwell_frames: int = 5
-    range_confidence_hysteresis: float = 0.10
-    range_disagreement_hysteresis: float = 0.25
+    range_source_dwell_frames: int = _ARBITER_DEFAULTS.range_source_dwell_frames
+    range_confidence_hysteresis: float = _ARBITER_DEFAULTS.range_confidence_hysteresis
+    range_disagreement_hysteresis: float = _ARBITER_DEFAULTS.range_disagreement_hysteresis
 
-    max_coast_frames: int = 5
+    log_repeat_period_s: float = _ARBITER_DEFAULTS.log_repeat_period_s
+    """Seconds between repeats of the SAME sustained non-nominal arbiter log line.
+    Transitions -- entry, exit, and any change in the set of violations -- are never
+    throttled. 0.0 logs every frame. See ArbiterLimits.log_repeat_period_s."""
+    max_coast_frames: int = _ARBITER_DEFAULTS.max_coast_frames
     """Frames of tracker coasting the arbiter will keep assessing a lead for during
     a perception dropout, instead of forgetting the hazard it was braking for."""
+
+    # --- evidence-gated authority -------------------------------------------
+    target_clearance_m: float = _ARBITER_DEFAULTS.target_clearance_m
+    """Room a completed avoidance stop aims at, metres: the 2.0 m a driver leaves
+    at standstill plus a quarter of a metre of aim-off for a measurement that is
+    one frame old."""
+    warrant_clearance_m: float = _ARBITER_DEFAULTS.warrant_clearance_m
+    """Clearance the WARRANT test is written against. The room a correct
+    intervention preserves, and therefore the room against which the question
+    "has an emergency arisen?" is asked."""
+    demand_margin_frac: float = _ARBITER_DEFAULTS.demand_margin_frac
+    demand_margin_mps2: float = _ARBITER_DEFAULTS.demand_margin_mps2
+    """Prudence added to the computed requirement. Small on purpose: the
+    requirement is recomputed every frame from a fresh measurement, so a standing
+    margin buys nothing the next frame does not buy anyway."""
+    band_guard_margin_mps2: float = _ARBITER_DEFAULTS.band_guard_margin_mps2
+    """How far below the comfort limit an UNWARRANTED demand is held, so that the
+    unpoliced 3.0-3.5 m/s^2 band is never lived in."""
+    emergency_grade_mps2: float = _ARBITER_DEFAULTS.emergency_grade_mps2
+    """At or above this a command is an emergency intervention."""
+    comfort_jerk_mps3: float = _ARBITER_DEFAULTS.comfort_jerk_mps3
+    emergency_jerk_mps3: float = _ARBITER_DEFAULTS.emergency_jerk_mps3
+    release_jerk_mps3: float = _ARBITER_DEFAULTS.release_jerk_mps3
+    """Ceilings on the rate at which the arbiter builds and releases its own
+    demand. Only the RISE is a comfort hazard."""
+    blind_hold_frames: int = _ARBITER_DEFAULTS.blind_hold_frames
+    miss_hold_frames: int = _ARBITER_DEFAULTS.miss_hold_frames
+    """How long a hazard demand survives a perception dropout and a detection miss
+    respectively. Neither is evidence of an empty road."""
+    no_hazard_decel_cap_mps2: float = _ARBITER_DEFAULTS.no_hazard_decel_cap_mps2
+    """What the arbiter passes through on a demonstrably EMPTY road: the veto."""
+    ego_half_width_m: float = _ARBITER_DEFAULTS.ego_half_width_m
+    lateral_gate_margin_m: float = _ARBITER_DEFAULTS.lateral_gate_margin_m
+    """The metric in-path gate is half the ego, plus half the object, plus this
+    margin, so the backstop's corridor is strictly wider than the planner's."""
+    kinematics_streak_frames: int = _ARBITER_DEFAULTS.kinematics_streak_frames
+    """Consecutive frames an achieved-kinematics exceedance must persist before it
+    is reported. A vehicle bus with noise on it produces single-frame excursions
+    that say nothing about the control."""
+    evidence: EvidenceLimits | None = None
+    """The measurement-evidence limits, projected wholesale onto the arbiter.
+
+    The three scalars below are the configuration-visible face of the fields a
+    deployment is most likely to retune, and ``to_arbiter_limits`` rebuilds this
+    object from them so that a YAML file and a programmatic override cannot
+    disagree about which one won.
+    """
+    closure_confidence_sigmas: float = _EVIDENCE_DEFAULTS.closure_sigmas
+    lead_accel_confidence_sigmas: float = _EVIDENCE_DEFAULTS.accel_sigmas
+    range_jump_m: float = _EVIDENCE_DEFAULTS.jump_m
+    """The evidence gate: how many standard errors a closure must be clear of zero
+    before it may authorise braking, how many a lead deceleration must be clear of
+    zero before it is credited, and the range discontinuity that is treated as a
+    re-anchor rather than as motion."""
 
     def to_arbiter_limits(self) -> ArbiterLimits:
         """Project these limits onto the arbiter's own limit object.
@@ -244,6 +335,35 @@ class SafetyLimits:
             range_confidence_hysteresis=self.range_confidence_hysteresis,
             range_disagreement_hysteresis=self.range_disagreement_hysteresis,
             max_coast_frames=self.max_coast_frames,
+            log_repeat_period_s=self.log_repeat_period_s,
+            target_clearance_m=self.target_clearance_m,
+            warrant_clearance_m=self.warrant_clearance_m,
+            demand_margin_frac=self.demand_margin_frac,
+            demand_margin_mps2=self.demand_margin_mps2,
+            band_guard_margin_mps2=self.band_guard_margin_mps2,
+            emergency_grade_mps2=self.emergency_grade_mps2,
+            comfort_jerk_mps3=self.comfort_jerk_mps3,
+            emergency_jerk_mps3=self.emergency_jerk_mps3,
+            release_jerk_mps3=self.release_jerk_mps3,
+            blind_hold_frames=self.blind_hold_frames,
+            miss_hold_frames=self.miss_hold_frames,
+            no_hazard_decel_cap_mps2=self.no_hazard_decel_cap_mps2,
+            ego_half_width_m=self.ego_half_width_m,
+            lateral_gate_margin_m=self.lateral_gate_margin_m,
+            kinematics_streak_frames=self.kinematics_streak_frames,
+            ttc_min_closing_mps=self.ttc_min_closing_mps,
+            evidence=self.evidence or EvidenceLimits(
+                window_samples=max(
+                    2 * self.aeb_min_rate_samples,
+                    int(round(self.range_rate_window_s / 0.05)) + 1,
+                ),
+                min_samples=self.aeb_min_rate_samples,
+                min_span_s=self.aeb_min_rate_span_s,
+                closure_sigmas=self.closure_confidence_sigmas,
+                accel_sigmas=self.lead_accel_confidence_sigmas,
+                jump_m=self.range_jump_m,
+                max_lead_decel_mps2=self.max_deceleration_mps2,
+            ),
         )
 
 

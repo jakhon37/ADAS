@@ -160,7 +160,19 @@ class PIDLikeLongitudinalController:
 
     # --- steering ------------------------------------------------------------
     max_steering_angle_deg: float = 25.0
-    steering_deadband_deg: float = 0.5
+    steering_deadband_deg: float = 0.05
+    """Road-wheel angle below which no steering is commanded, degrees.
+
+    It exists so that a lane estimate dithering by a pixel does not dither the
+    actuator.  It was 0.5 deg, which is a hundredth of the full-scale angle but
+    is NOT small in the quantity that matters: a proportional lane-keeping law
+    at 20 m/s reaches 0.5 deg only at about 0.85 m of lane error, so the
+    deadband was an 0.85 m dead zone around the lane centre.  Add a lane
+    estimate that is itself 0.86 m wrong and the vehicle settles 1.7 m from the
+    true centre -- half a lane, over the specification's 1.75 m departure
+    limit, and far enough that a car in the NEXT lane comes inside the ego's
+    own in-path corridor and is braked for.  0.05 deg is the resolution of an
+    electric power-steering position loop and leaves a 0.09 m dead zone."""
 
     # --- shaping -------------------------------------------------------------
     speed_deadband_mps: float = 0.3
@@ -168,6 +180,11 @@ class PIDLikeLongitudinalController:
     speed_hysteresis_mps: float = 0.15
     """Extra error required to LEAVE the deadband once inside it, and to switch
     between the throttle and brake actuators. Prevents actuator chatter."""
+    emergency_grade_mps2: float = 3.5
+    """A plan deceleration demand at or above this is an emergency, so the
+    emergency jerk band applies and the comfort deadband does not.  It matches
+    the safety specification's own boundary between a firm comfort brake and a
+    collision-avoidance action."""
     emergency_stop_time_s: float = 1.0
     """Emergency feed-forward horizon, seconds.
 
@@ -177,18 +194,33 @@ class PIDLikeLongitudinalController:
     of 8 m/s or more commands full brake, subject only to the emergency jerk
     limit.  The comfort PI law still applies and the MORE severe of the two wins.
     """
-    max_jerk_mps3: float = 4.0
-    """Comfort jerk limit, m/s^3."""
-    max_jerk_emergency_mps3: float = 40.0
+    max_jerk_mps3: float = 2.5
+    """Comfort jerk limit, m/s^3.
+
+    The top of the band a seated occupant does not register.  It is a SAFETY NET
+    here rather than the primary shaper: when the plan carries an explicit
+    ``decel_demand_mps2`` the planner has already shaped the demand at this same
+    ceiling, and this limit then does nothing.  It still has to be right, because
+    a hand-built plan with no demand on it is shaped only here.
+    """
+    max_jerk_emergency_mps3: float = 20.0
     """Emergency jerk limit, m/s^3.
 
-    Sized from the brake actuator, not from comfort: a hydraulic service brake
-    develops full deceleration in roughly 0.2 s, so 8 m/s^2 / 0.2 s = 40 m/s^3.
-    At the previous 15 m/s^3 the controller took 0.53 s to reach full authority
-    from coast, during which an ego at 15 m/s travels a further 6 m; the AEB
-    stage was declared and actuated too slowly to matter and only the arbiter
-    (which is not rate limited at all) avoided the collision.
+    Full 8 m/s^2 authority in the 0.4 s a human panic brake takes.  It was 40 --
+    sized from the brake actuator alone -- which is twice what the safety
+    specification permits: braking faster than 20 m/s^3 buys no stopping
+    distance, because the brake's own 0.15 s rise time filters it out, and costs
+    the occupant a head-toss they cannot brace for.
     """
+    release_jerk_mps3: float = 25.0
+    """Rate at which the commanded DECELERATION may fall, m/s^3.
+
+    Separate from the two rise limits, and larger than either, because a
+    release is not a comfort hazard and every requirement in the safety
+    specification demands that an unwarranted deceleration be removed
+    promptly.  25 m/s^3 clears full authority in 0.32 s, which is faster than
+    the brake's own hydraulic decay, so the release the road sees is set by
+    the plumbing rather than by this number."""
     target_ff_window: int = 21
     """Samples of target history the feed-forward slope is fitted over.
 
@@ -264,6 +296,10 @@ class PIDLikeLongitudinalController:
             raise ValidationError("Actuator authorities must be positive m/s^2 values")
         if self.max_jerk_mps3 <= 0 or self.max_jerk_emergency_mps3 < self.max_jerk_mps3:
             raise ValidationError("require 0 < max_jerk_mps3 <= max_jerk_emergency_mps3")
+        if not (math.isfinite(self.release_jerk_mps3) and self.release_jerk_mps3 > 0):
+            raise ValidationError(
+                f"release_jerk_mps3 must be positive, got {self.release_jerk_mps3}"
+            )
         if not (math.isfinite(self.target_ff_deadband_mps2) and self.target_ff_deadband_mps2 >= 0):
             raise ValidationError(
                 "target_ff_deadband_mps2 must be finite and non-negative, got "
@@ -356,8 +392,17 @@ class PIDLikeLongitudinalController:
             # Steering first: it is stateless and it can raise, and no controller
             # state may advance on a frame whose command never reaches an actuator.
             steering = self._steering(plan.steering_angle_deg)
+            demand = getattr(plan, "decel_demand_mps2", None)
+            if demand is not None and (
+                not isinstance(demand, (int, float)) or not math.isfinite(demand)
+            ):
+                raise ValidationError("plan deceleration demand is not finite: %r" % (demand,))
             state = self._longitudinal(
-                plan.target_speed_mps, current_speed_mps, dt, emergency
+                plan.target_speed_mps,
+                current_speed_mps,
+                dt,
+                emergency or (demand is not None and demand >= self.emergency_grade_mps2),
+                None if demand is None else max(0.0, float(demand)),
             )
 
             cmd = ControlCommand(throttle=state.throttle, brake=state.brake, steering=steering)
@@ -397,12 +442,34 @@ class PIDLikeLongitudinalController:
     # --------------------------------------------------------------- internals
 
     def _longitudinal(
-        self, target_speed_mps: float, current_speed_mps: float, dt_s: float, emergency: bool
+        self,
+        target_speed_mps: float,
+        current_speed_mps: float,
+        dt_s: float,
+        emergency: bool,
+        decel_demand_mps2: float | None = None,
     ) -> "_LongitudinalState":
         """PI -> target-rate FF -> emergency FF -> jerk limit -> pedal map -> rate limit.
 
         PURE with respect to ``self``: the new controller state is returned and the
         caller commits it only once the resulting command has validated.
+
+        **The deceleration split.**  When ``decel_demand_mps2`` is supplied the
+        planner has stated, in m/s^2, how hard the vehicle is to decelerate, and
+        that number is the ONLY source of braking in this controller: the PI law
+        and the target-rate feed-forward are then restricted to the positive
+        (throttle) half.  This is the co-design that makes the primary path able
+        to stop the vehicle on its own.  A target SPEED cannot express a
+        deceleration -- the planner's rate-limited target falls 0.15 m/s per
+        frame for a 3 m/s^2 request, a proportional law with ``kp = 0.15 1/s``
+        needs a 20 m/s error to answer it, and the demand this controller
+        actually produced while trailing a comfort ramp was 0.4 m/s^2 while the
+        planner was asking for 3.0.  The safety arbiter was then the only thing
+        in the vehicle that really braked, which is exactly the single point of
+        failure this redesign exists to remove.
+
+        With no demand on the plan the controller behaves as it always did, so a
+        hand-built plan and every existing caller are unaffected.
         """
         error = target_speed_mps - current_speed_mps
 
@@ -469,11 +536,42 @@ class PIDLikeLongitudinalController:
             feed_forward = max(lower, error / self.emergency_stop_time_s)
             accel_cmd = min(accel_cmd, feed_forward)
 
-        # 5. Jerk limit on the commanded acceleration.
+        # 4b. The planner's explicit deceleration demand, when there is one, is
+        #     authoritative for the braking half.  Deceleration then comes from
+        #     exactly one place in the whole primary path, so the two laws cannot
+        #     add up into something neither of them asked for.
+        if decel_demand_mps2 is not None:
+            if decel_demand_mps2 > 0.0:
+                accel_cmd = -min(decel_demand_mps2, self.brake_authority_mps2)
+            else:
+                accel_cmd = max(0.0, accel_cmd)
+
+        # 5. Jerk limit on the commanded acceleration -- ONE-SIDED.
+        #
+        #    Only a RISING deceleration is a comfort hazard: it throws an unbraced
+        #    occupant forward, which is the thing a jerk limit exists to bound.
+        #    Coming OFF the brake returns the occupant toward zero g against the
+        #    seat back, and the brake's own hydraulic decay turns a step release
+        #    into a ramp on the road whatever the demand does.
+        #
+        #    The symmetric version of this clamp was a real defect, not a
+        #    conservatism: below the emergency threshold the limit reverts to the
+        #    comfort band, so a 6.4 m/s^2 demand that had become unnecessary was
+        #    released at 2.5 m/s^3 -- two and a half seconds of braking a
+        #    situation that no longer existed, measured by the specification as
+        #    over-braking and paid for by the vehicle behind.
         jerk_limit = self.max_jerk_emergency_mps3 if emergency else self.max_jerk_mps3
-        max_step = jerk_limit * dt_s
+        rise_step = jerk_limit * dt_s
+        releasing_a_brake = self._prev_accel_mps2 < 0.0
+        release_step = (
+            max(jerk_limit, self.release_jerk_mps3) * dt_s
+            if releasing_a_brake
+            else jerk_limit * dt_s
+        )
         accel_cmd = _clamp(
-            accel_cmd, self._prev_accel_mps2 - max_step, self._prev_accel_mps2 + max_step
+            accel_cmd,
+            self._prev_accel_mps2 - rise_step,
+            self._prev_accel_mps2 + release_step,
         )
 
         # 6. Pedal map with an actuator-switch hysteresis band.
@@ -487,7 +585,17 @@ class PIDLikeLongitudinalController:
         #    and the ego CREPT into the obstacle at 4 cm/s -- observed over the
         #    last 0.11 m of the 25 m stationary-lead scenario. An AEB stop must
         #    be held to standstill.
-        accel_deadband = 0.0 if emergency else self.kp_speed * self.speed_deadband_mps
+        #    The deadband is also suppressed whenever the planner has stated a
+        #    deceleration demand: the demand is already a decision, jerk shaped by
+        #    the planner, and truncating its first 0.045 m/s^2 turns a smooth ramp
+        #    into a step of that size the moment it clears the band -- 3.3 m/s^3
+        #    over one frame, above the 2.5 m/s^3 comfort ceiling, out of a demand
+        #    that was perfectly compliant when it arrived.
+        accel_deadband = (
+            0.0
+            if (emergency or decel_demand_mps2 is not None)
+            else self.kp_speed * self.speed_deadband_mps
+        )
         if accel_cmd > accel_deadband and not emergency:
             raw_throttle = _clamp(accel_cmd / self.accel_authority_mps2, 0.0, self.max_throttle)
             raw_brake = 0.0

@@ -170,6 +170,20 @@ class HealthState:
         self.plan_reason = ""
         self.safety_violations = 0
         self.safety_warnings = 0
+        # -- what the ARBITER itself decided on the last frame.  The state label
+        # alone answers "is it degraded?" and nothing else; these answer "why,
+        # how hard, and did it actually change the command?", which is what an
+        # operator looking at a vehicle that is braking needs.  All are plain
+        # snapshots of the last ArbitrationResult -- reporting only, never read
+        # back by the decision path.
+        self.safety_reason = ""
+        self.safety_demand_mps2 = 0.0
+        self.safety_overrode_command = False
+        self.safety_last_violations: list = []
+        self.safety_transitions = 0
+        self.safety_last_transition_frame: Optional[int] = None
+        self.safety_lead_track_id: Optional[int] = None
+        self.safety_rate_is_measured = False
         self.ego_speed_mps: Optional[float] = None
         self.ego_speed_valid = False
         self.lead_distance_m: Optional[float] = None
@@ -381,6 +395,17 @@ class HealthState:
                 "frames_dropped": int(self.frames_dropped),
                 "safety_violations": int(self.safety_violations),
                 "safety_warnings": int(self.safety_warnings),
+                "safety": {
+                    "state": self.safety_state,
+                    "reason": self.safety_reason,
+                    "demand_mps2": round(float(self.safety_demand_mps2), 3),
+                    "overrode_command": bool(self.safety_overrode_command),
+                    "violations": list(self.safety_last_violations),
+                    "transitions": int(self.safety_transitions),
+                    "last_transition_frame": self.safety_last_transition_frame,
+                    "lead_track_id": self.safety_lead_track_id,
+                    "lead_rate_is_measured": bool(self.safety_rate_is_measured),
+                },
                 "ego_speed_mps": self.ego_speed_mps,
                 "ego_speed_valid": bool(self.ego_speed_valid),
                 "lead_distance_m": self.lead_distance_m,

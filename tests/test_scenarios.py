@@ -771,6 +771,68 @@ def test_harness_sub_emergency_band_is_policed():
     )
 
 
+def test_harness_shared_constants_have_exactly_one_definition():
+    """``library`` must not re-state a margin the ``oracle`` already owns.
+
+    Certification finding 1: ``REQUIRED_CLEARANCE_M`` was defined twice as
+    independent literals -- ``oracle.py:123`` and ``library.py:185`` -- and the
+    library's docstring merely POINTED at the oracle's, which reads like a
+    re-export and was not one. Measured consequence: mutating the ORACLE copy
+    from 2.0 m to 0.5 m changed only the report header and left the whole corpus
+    and ``tests/test_backtest.py`` green, because every ``Expectation`` was built
+    from the library's copy. ``backtest.py`` claimed in a comment that weakening
+    that constant was a mutation it could see; for the oracle copy, it could not.
+
+    The library now imports all three. This test is the belt to that braces: if
+    someone re-states one, the objects stop being identical and this fails.
+    """
+    assert lib.REQUIRED_CLEARANCE_M is truth.REQUIRED_CLEARANCE_M
+    assert lib.COMFORT_DECEL_MPS2 is truth.COMFORT_DECEL_MPS2
+    assert lib.JUSTIFICATION_WINDOW_FRAMES is truth.JUSTIFICATION_WINDOW_FRAMES
+
+
+def test_harness_late_intervention_fires_for_a_brake_that_arrives_after_the_deadline():
+    """A full-authority brake, applied one frame too late, must be caught.
+
+    This probe closes a self-contradiction in the test below it. ``COLLISION_HALF``
+    lists ``late_intervention``, ``reachable_by_probe`` did not, and nothing else
+    in this file could emit it -- so the only way the reachability assertion could
+    pass was for the CORPUS to emit it, i.e. for the production system to still be
+    late somewhere. A correct implementation made the test red, which is a test
+    that requires the system under test to be defective.
+
+    Lateness is a property of WHEN the command arrived, not of what the stack is,
+    so it is probed the way ``missed_intervention`` is: take a real run and
+    re-judge it with a synthetic command series. The car is stopped 40 m ahead at
+    20 m/s; the oracle's ``last_avoidance_frame`` is the last frame from which
+    full braking still avoided contact, and the brake here is withheld until two
+    frames after it.
+
+    The probe also pins the guard that must NOT fire: ``unactionable_scenario``
+    takes precedence when the deadline precedes the first frame the hazard could
+    be acted on, and at 40 m it does not -- so a ``late_intervention`` reported
+    here is genuine lateness and not a mis-specified case.
+    """
+    scenario = _stationary_case("late_probe", NULL_STACK)
+    base = scen.run(scenario)
+    deadline = base.verdict.last_avoidance_frame
+    actionable = base.verdict.earliest_actionable_frame
+    assert deadline is not None, base.metrics
+    assert actionable is not None and actionable <= deadline, (
+        "the probe's own scenario is unactionable, so it would report "
+        "unactionable_scenario instead: actionable=%s deadline=%s"
+        % (actionable, deadline)
+    )
+    for index, record in enumerate(base.records):
+        record.command = ControlCommand(0.0, 1.0 if index > deadline + 1 else 0.0, 0.0)
+    codes = {f.code for f in scen.evaluate(scenario, base.records, base.verdict, [])}
+    assert "late_intervention" in codes, codes
+    assert "unactionable_scenario" not in codes, codes
+    assert "missed_intervention" not in codes, (
+        "a brake that arrived at all is late, not missed: %s" % sorted(codes)
+    )
+
+
 def test_harness_every_finding_code_is_reachable_or_named():
     """No diagnosis may exist without something in this file able to produce it.
 
@@ -779,6 +841,15 @@ def test_harness_every_finding_code_is_reachable_or_named():
     vocabulary.  It exists so that adding a ``Finding`` with no way to trigger
     it is a test failure at the moment it is added, rather than a discovery two
     rounds of fixes later.
+
+    ``late_intervention`` is listed in ``reachable_by_probe`` because
+    :func:`test_harness_late_intervention_fires_for_a_brake_that_arrives_after_the_deadline`
+    produces it.  It was previously in neither list, which made this assertion
+    satisfiable only while the production system was still braking late
+    somewhere in the corpus: a correct implementation emptied ``emitted`` of that
+    code and turned this test red.  A harness must not require the system under
+    test to be defective, and the fix is a probe, not an exemption -- an
+    exemption would have removed the coverage the check exists to enforce.
     """
     emitted = set()
     for r in rep.run_all():
@@ -793,6 +864,7 @@ def test_harness_every_finding_code_is_reachable_or_named():
         "pedal_conflict",
         "excess_jerk",
         "unwarranted_brake",
+        "late_intervention",
     }
     unreached = COLLISION_HALF - (emitted | reachable_by_probe)
     assert not unreached, (

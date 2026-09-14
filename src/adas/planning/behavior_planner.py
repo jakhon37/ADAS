@@ -82,9 +82,14 @@ class BehaviorPlanner:
     max_decel_mps2: float = 3.0
     lane_center_gain: float = 1.0
     ego_lane_half_width_frac: float = 0.0
-    """Fraction of the frame width, either side of the lane centre, that counts as
-    the ego lane.  0 disables gating -- which means braking for oncoming and parked
-    traffic, so a non-zero value should be configured for any real deployment."""
+    """Fraction of the frame width, either side of the IMAGE CENTRE, that counts as
+    the ego corridor.  Used only as the FALLBACK gate, when the perception stack
+    supplies no metric lateral offset for an object.  0 disables that fallback --
+    which means considering oncoming and parked traffic -- so a non-zero value
+    should be configured for any real deployment."""
+    ego_half_width_m: float = 0.9
+    """Half the ego's own width, metres.  Half of a 1.8 m passenger car, and the
+    first term of the metric in-path gate."""
 
     # --- new, not yet in PlannerConfig (see handoff) -------------------------
     max_accel_mps2: float = 2.0
@@ -94,12 +99,28 @@ class BehaviorPlanner:
     aeb_ttc_s: float = 0.9
     warn_ttc_s: float = 1.6
     emergency_decel_mps2: float = 8.0
-    mrm_decel_mps2: float = 3.5
+    mrm_decel_mps2: float = 3.0
+    """Deceleration of a minimum-risk stop, m/s^2.  The COMFORT limit: nothing
+    has been DETECTED in front of the vehicle, the reason to stop is that it
+    cannot see, and the traffic behind has no reason to expect an AEB.  It was
+    3.5, which is exactly the emergency grade, so every perception blink built
+    its brake at the emergency jerk rate and read as an AEB downstream."""
     wheelbase_m: float = 2.8
     max_lateral_accel_mps2: float = 3.0
     steering_speed_ref_mps: float = 12.0
     camera: CameraGeometry | None = None
     """Camera extrinsics. None (the default) forces the non-metric steering law."""
+
+    headway_decel_mps2: float = 1.5
+    """Ceiling on the authority the TIME-GAP law may use, m/s^2.  Half the comfort
+    limit; headway keeping is not collision avoidance."""
+    target_clearance_m: float = 2.25
+    """Room a completed avoidance stop aims to leave, metres."""
+    blind_hold_frames: int = 8
+    """Frames of perception loss tolerated before a minimum-risk stop begins."""
+    miss_hold_frames: int = 24
+    """Frames an avoidance demand survives a detection miss with healthy
+    perception."""
 
     degraded_log_period_s: float = 60.0
     """Seconds between repeats of a WARNING that describes a latched condition."""
@@ -136,6 +157,10 @@ class BehaviorPlanner:
                 mrm_decel_mps2=self.mrm_decel_mps2,
                 aeb_ttc_s=self.aeb_ttc_s,
                 warn_ttc_s=max(self.warn_ttc_s, self.aeb_ttc_s),
+                headway_decel_mps2=min(self.headway_decel_mps2, self.max_decel_mps2),
+                target_clearance_m=self.target_clearance_m,
+                blind_hold_frames=self.blind_hold_frames,
+                miss_hold_frames=self.miss_hold_frames,
             ),
             ego_speed_log_period_s=self.degraded_log_period_s,
         )
@@ -246,6 +271,7 @@ class BehaviorPlanner:
                 ego_speed_mps=speed,
                 lane=lane,
                 frame_height_px=frame_height_px,
+                dt_s=dt_s,
             )
 
             self.last_speed_decision = speed_decision
@@ -258,10 +284,13 @@ class BehaviorPlanner:
                 prefix = "follow_degraded" if lead is not None else "degraded"
                 speed_reason = "%s_%s" % (prefix, speed_decision.reason)
 
+            if speed_decision.aeb_active:
+                speed_reason = "aeb_" + speed_reason
             plan = MotionPlan(
                 target_speed_mps=speed_decision.target_speed_mps,
                 steering_angle_deg=steering_decision.steering_angle_deg,
                 reason="%s|%s" % (speed_reason, steering_decision.reason),
+                decel_demand_mps2=speed_decision.decel_demand_mps2,
             )
             validate_motion_plan(plan)
 
@@ -324,24 +353,80 @@ class BehaviorPlanner:
         lane_center_px: float | None,
         objects: list[TrackedObject],
     ) -> list[TrackedObject]:
-        """Keep only the objects the ego is going to drive into.
+        """Keep only the objects the ego could actually drive into.
 
-        Uses ``TrackedObject.in_ego_lane`` when the perception stack populates it,
-        otherwise falls back to an image-x band of half width
-        ``ego_lane_half_width_frac * frame_width_px`` around the lane centre.
+        EGO-RELATIVE GEOMETRY, not the lane.  This method used to prefer
+        ``TrackedObject.in_ego_lane`` whenever any object carried it, and to fall
+        back to an image band around the LANE CENTRE.  Both put the lane
+        estimator inside the hazard gate, where it fails in two directions at
+        once: a lane fit that has slipped toward the kerb hides a car that is
+        directly in front of the bumper, and one that has slipped the other way
+        reports a car in the next lane as being in the way.  A lane error of
+        0.86 m is enough to drag a 1.8 m car at 3.5 m inside the *reported* ego
+        lane, and braking for it is a hazard the lane error CREATED.
+
+        What decides whether a collision is geometrically possible is the
+        object's lateral offset from the EGO, which the detector measures from
+        the box position and which no lane model can move.  Half the ego plus
+        half the object is 1.8 m for two passenger cars; a car one lane over is
+        at 3.5 m and is not in the way however confident the lane fit is.
+
+        The image band survives only as the FALLBACK for an object with no metric
+        lateral offset, and it is anchored on the IMAGE CENTRE -- where the ego is
+        going -- rather than on the lane centre, with the lane centre added as a
+        SECOND anchor that can only ever widen the corridor.  More lane means more
+        places a threat can be; it never means fewer.
         """
-        if any(obj.in_ego_lane for obj in objects):
-            return [obj for obj in objects if obj.in_ego_lane]
-        frac = self.ego_lane_half_width_frac
-        if frac <= 0.0 or frame_width_px <= 0:
-            return list(objects)
-        cx_ref = lane_center_px if lane_center_px is not None else frame_width_px / 2.0
-        half = frame_width_px * frac
-        return [
-            obj
-            for obj in objects
-            if abs((obj.box.x1 + obj.box.x2) / 2.0 - cx_ref) <= half
-        ]
+        metric: list[TrackedObject] = []
+        fallback: list[TrackedObject] = []
+        for obj in objects:
+            lateral = getattr(obj, "lateral_offset_m", None)
+            if (
+                lateral is not None
+                and math.isfinite(lateral)
+                and math.isfinite(obj.distance_m)
+                and obj.distance_m > 0.0
+            ):
+                if abs(float(lateral)) <= self.ego_half_width_m + self._object_half_width_m(obj):
+                    metric.append(obj)
+            else:
+                fallback.append(obj)
+
+        if fallback:
+            frac = self.ego_lane_half_width_frac
+            if frac <= 0.0 or frame_width_px <= 0:
+                metric.extend(fallback)
+            else:
+                half = frame_width_px * frac
+                anchors = [frame_width_px / 2.0]
+                if lane_center_px is not None and math.isfinite(lane_center_px):
+                    anchors.append(float(lane_center_px))
+                for obj in fallback:
+                    left = min(obj.box.x1, obj.box.x2)
+                    right = max(obj.box.x1, obj.box.x2)
+                    if any(
+                        right >= a - half and left <= a + half for a in anchors
+                    ):
+                        metric.append(obj)
+        return metric
+
+    def _object_half_width_m(self, obj: TrackedObject) -> float:
+        """Half the object's width in metres, floored at half a passenger car.
+
+        Derived from the box width and the range through the camera geometry when
+        one is configured, so a truck widens the corridor and a motorcycle does
+        not narrow it below the floor.  Widening is the safe direction.
+        """
+        floor = self.ego_half_width_m
+        camera = self.camera
+        focal = getattr(camera, "focal_length_px", None) if camera is not None else None
+        if not (focal and math.isfinite(focal) and focal > 0.0):
+            return floor
+        try:
+            width_px = abs(float(obj.box.x2) - float(obj.box.x1))
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return floor
+        return max(floor, 0.5 * width_px * float(obj.distance_m) / float(focal))
 
     def _select_lead(
         self,
@@ -402,4 +487,5 @@ class BehaviorPlanner:
             confidence=confidence,
             frames_since_measurement=max(0, best.time_since_update),
             source=source,
+            capture_token=int(getattr(best, "hits", 0) or 0),
         )

@@ -105,6 +105,11 @@ from tests.scenarios.plant import (
     noisy_perception,
 )
 from tests.scenarios.plant import constant_bend
+from tests.scenarios.oracle import (
+    COMFORT_DECEL_MPS2,
+    JUSTIFICATION_WINDOW_FRAMES,
+    REQUIRED_CLEARANCE_M,
+)
 from tests.scenarios.scenario import DEFAULT_STACK, Expectation, Scenario
 
 # --------------------------------------------------------------------------- #
@@ -171,28 +176,33 @@ constant-range scenario at 52 m or 70 m must produce a command of exactly zero.
 Inside it, opening the gap is correct behaviour and is bounded by comfort.
 """
 
-COMFORT_DECEL_MPS2 = 3.0
+COMFORT_DECEL_MPS2 = COMFORT_DECEL_MPS2
 """Deceleration above which braking stops being headway keeping.
 
-Re-stated from :data:`tests.scenarios.oracle.COMFORT_DECEL_MPS2` so the ceilings
-below can be read without opening the oracle.  It is 0.5 m/s^2 BELOW the
+IMPORTED from :data:`tests.scenarios.oracle.COMFORT_DECEL_MPS2`, not re-stated.  It is 0.5 m/s^2 BELOW the
 emergency threshold the phantom test uses, and that half-metre band is the one
 the backtest found unpoliced: a system can sit at 3.4 m/s^2 for a whole run
 against a lead that never moved and no assertion in this harness notices.  The
 constant-range family closes it with an explicit ceiling at comfort.
 """
 
-REQUIRED_CLEARANCE_M = 2.0
+REQUIRED_CLEARANCE_M = REQUIRED_CLEARANCE_M
 """Clearance a correct intervention preserves, metres.
 
-:data:`tests.scenarios.oracle.REQUIRED_CLEARANCE_M`.  It is only ever demanded
+IMPORTED from :data:`tests.scenarios.oracle.REQUIRED_CLEARANCE_M`, not re-stated.
+The two used to be independent literals and the docstring merely POINTED at the
+oracle, which reads like a re-export and was not one: certification measured it
+and found that weakening the ORACLE copy from 2.0 to 0.5 changed only the report
+header and left ``tests/test_backtest.py`` at 13 passed, because the number every
+expectation is built from came from this copy.  A mutation the backtest was
+documented as catching, it could not see.  It is only ever demanded
 where the plant can actually deliver it -- ``d0 - STOP_DISTANCE_M >= 2.0`` for a
 stationary obstacle -- so no scenario asks for a margin the vehicle does not
 have.
 """
 
-JUSTIFICATION_WINDOW_FRAMES = 10
-"""The oracle's justification look-back, frames (0.5 s at 20 Hz).
+JUSTIFICATION_WINDOW_FRAMES = JUSTIFICATION_WINDOW_FRAMES
+"""The oracle's justification look-back, frames (0.5 s at 20 Hz).  IMPORTED.
 
 Used here as the allowance for over-strong braking at the ONSET of a lead's
 deceleration.  When a matched-speed lead starts braking at 6 m/s^2 the true
@@ -1185,6 +1195,88 @@ def _hostile_sensor_constant_range() -> Scenario:
             min_speed_floor_mps=round(floor, 2),
             min_final_speed_mps=18.0,
             recover_within_frames=120,
+        ),
+    )
+
+
+DEGRADED_SENSE_LATENCY_S = 0.080
+"""A sense latency ABOVE the measured nominal, seconds.
+
+Certification finding 2: all 52 committed scenarios used ``sense_latency_s =
+0.055`` and the corpus therefore contained exactly ONE value of the number every
+budget in the specification is a function of.  Latency was charged everywhere and
+varied nowhere, so a redesign could be tuned to 55 ms and fail silently at 80 ms.
+
+80 ms is not arbitrary.  The measured per-stage table behind
+:data:`tests.scenarios.plant.SENSE_LATENCY_S` gives 55.55 ms at the mean and
+**66.54 ms at the p95 sum**, so a frame in the tail of the real distribution
+already costs two thirds of the way here; 80 ms is the p95 sum plus a 20% margin
+for a board that is thermally throttled or sharing its GPU.  It is the number a
+deployment should be robust to, not a hypothetical.
+
+What it changes, measured with :func:`tests.scenarios.scenario.feasibility`:
+the first actionable decision frame moves from 2 to 3, and the reachable
+clearance at 20 m/s from a 36 m stationary obstacle falls from 4.70 m to 3.70 m.
+"""
+
+
+def _degraded_latency_stationary() -> Scenario:
+    """The 36 m stationary approach, seen through 80 ms of sense latency.
+
+    Deliberately the SAME kinematics as ``stationary_20mps_at_36m`` so that the
+    pair isolates one variable.  Its sibling has +0.100 s of affordable decision
+    latency; this one has +0.050 s -- one frame, the tightest budget in the
+    corpus -- because the extra 25 ms of latency costs a whole frame on the 50 ms
+    grid: at 80 ms, decision frames 0, 1 and 2 all read capture 0, so the second
+    distinct range does not exist until frame 3.
+    """
+    gap_m = 36.0
+    latency = DEGRADED_SENSE_LATENCY_S
+    needed = 400.0 / (2.0 * (gap_m - REQUIRED_CLEARANCE_M))
+    return Scenario(
+        name="degraded_latency_stationary_20mps_at_36m",
+        summary="parked car 36 m ahead at 20 m/s through 80 ms of sense latency",
+        guards="a design tuned to the nominal 55 ms sense latency",
+        physics=(
+            "Kinematically identical to stationary_20mps_at_36m -- a parked car dead ahead at "
+            "36 m, ego 20 m/s, requirement 400 / (2 x %.0f) = %.2f m/s^2 -- and it exists to "
+            "vary the ONE quantity that scenario holds fixed. Every budget in this "
+            "specification is a function of the sense latency, and every one of the other "
+            "scenarios uses 55 ms, so the corpus could certify a design that is correct at "
+            "55 ms and late at 80. The real distribution already reaches most of the way: the "
+            "measured per-stage table gives 55.55 ms at the mean and 66.54 ms at the p95 sum. "
+            "MEASURED, through feasibility(): at 80 ms the first actionable decision frame "
+            "moves from 2 to 3 -- frames 0, 1 and 2 all read capture 0 on the 50 ms grid -- "
+            "and the reachable clearance falls from 4.70 m to 3.70 m against the 2.0 m "
+            "demanded, leaving +0.050 s of affordable decision latency. That is ONE frame, the "
+            "tightest budget in the corpus, and it is a budget rather than a deficit: the case "
+            "is satisfiable and the reference controller holds it. "
+            "TOO PASSIVE: contact, or a true gap below %.1f m -- which is what a design whose "
+            "evidence window was counted in DECISION frames rather than in DISTINCT CAPTURES "
+            "produces, because at 80 ms it waits one extra frame for every sample. "
+            "TOO AGGRESSIVE: braking beyond the oracle's justified ceiling of "
+            "%.2f x 1.5 + 0.5 = %.2f m/s^2 for more than the %d-frame window. Extra latency is "
+            "not a licence to brake earlier on less evidence; the requirement is unchanged and "
+            "so is the ceiling."
+            % (
+                gap_m - REQUIRED_CLEARANCE_M, needed, REQUIRED_CLEARANCE_M,
+                needed, needed * 1.5 + 0.5, JUSTIFICATION_WINDOW_FRAMES,
+            )
+        ),
+        frames=200,
+        ego_speed_mps=20.0,
+        lead=LeadSpec(
+            initial_gap_m=gap_m,
+            initial_speed_mps=0.0,
+            accel_fn=lead_stationary(),
+            label="parked car at 36 m",
+        ),
+        perception=PerceptionSpec(sense_latency_s=latency),
+        expect=Expectation(
+            no_collision=True,
+            min_clearance_m=REQUIRED_CLEARANCE_M,
+            must_intervene=True,
+            unjustified_brake_frames_allowed=JUSTIFICATION_WINDOW_FRAMES,
         ),
     )
 
@@ -2296,6 +2388,7 @@ def build() -> List[Scenario]:
         _real_tracker_constant_range(),
         _hostile_sensor_constant_range(),
         _uncalibrated_camera_stationary(),
+        _degraded_latency_stationary(),
     ]
 
     # -------------------------------------------------------- laterality ----

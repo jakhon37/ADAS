@@ -248,6 +248,11 @@ class ADASPipeline:
                     perception=status,
                     dt_s=dt_s,
                     timestamp_s=timestamp_s,
+                    # `timestamp_s` here is `frame.timestamp_s`, i.e. the time
+                    # the image was captured, which is exactly what the range
+                    # fits must be placed on.  Passed explicitly so that the
+                    # arbiter does not have to assume it.
+                    measurement_t_s=timestamp_s,
                     frame_width_px=frame.width,
                     frame_height_px=frame.height,
                     lane=frame.lane,

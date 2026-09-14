@@ -1,5 +1,272 @@
 # Changelog
 
+## [Unreleased] — 2026-09-14 longitudinal redesign
+
+The longitudinal decision path — planner, controller and arbiter — was rebuilt as
+one co-designed unit against the executable specification in `tests/scenarios/`.
+### What this is not
+
+It is not a release and it is not a safety case. `pyproject.toml` is still
+`0.3.0`. Specifically, and in the same words as `README.md`'s *What is not
+production ready*, which is the list to read before quoting any number here:
+
+- **No camera has ever been attached to this board.** `/dev/video*` is absent.
+  Every claim below comes from replaying local mp4 clips or from a simulated
+  plant. The CSI GStreamer path is written and unexecuted.
+- **`deploy/adas.service` has never been started.** Installing it needs `sudo`
+  and `sudo` needs a password nobody here has. It has been checked by
+  `systemd-analyze verify` and by review, and by nothing else.
+- **There has been no soak test.** The longest run in this repository's history
+  is 400 frames, about 20 seconds of clip. There is no 8 h result, no RSS curve
+  over time, no file-descriptor audit, and no evidence about what the evidence
+  windows, the event-log rotation or the tracker's id space do after an hour.
+- **No certification claim is made.** No ISO 26262 work, no HIL or SIL
+  validation, no hazard analysis, no redundancy analysis. "No collision" in this
+  entry means no collision in `tests/scenarios/plant.py`, which is a point mass
+  with first-order actuators, no grade, no drag and no tyre limit.
+- **The safety sweep still exits 1.** See *Not fixed, deliberately* at the end.
+
+
+**Why a rebuild rather than another patch.** The path went through three rounds
+of agent patching and oscillated rather than converged: advisory monitor →
+phantom full-authority braking on real video → missed braking with real
+collisions. Each round also removed one self-sustaining feedback loop and grew
+another. Part of the cause was structural: the planner, the controller and the
+arbiter were each tuned by a different person against a different scenario, so
+every fix in one shifted the others.
+
+Every number below was measured on the Xavier NX on 2026-09-14 in this working
+tree.
+
+### Scores
+
+| gate | before (`1ce4886`'s arbiter, = HEAD) | after |
+|---|---|---|
+| `scripts/run_safety_sweep.py --gate` | `BAND_UNWARRANTED=19, COLLISION=21, EARLY=17, LATE=14, PHANTOM=7` | **`LATE=2`** (`CORRECT=113/120`, `COLLISION_UNAVOIDABLE=5`) |
+| `tests.scenarios.report` | 4 passed, 48 failed | **53 passed, 0 failed** |
+| `pytest tests/` | 48 failed, 1015 passed | **1059 passed, 2 skipped, 0 failed** |
+| `pytest tests/test_backtest.py` | 13 passed | 13 passed |
+| real footage, 400 frames | — | 355 nominal / 45 limited, **0 brake frames**, 0 unjustified, 0 missed |
+
+`PHANTOM`, `EARLY`, `MISSED`, `BAND_UNWARRANTED` and `COLLISION` are all zero.
+The gate still exits 1; see *Not fixed* below, and do not read exit 0 as a target.
+
+### Two layers, each able to stop the vehicle
+
+- **The primary path can now stop the car by itself.** `MotionPlan` carries a
+  `decel_demand_mps2` the controller turns into brake directly under a jerk
+  limit, instead of a brake derived from a speed error whose magnitude is a
+  property of the PI gains — which is how the primary path came to produce
+  0.06 m/s² during an AEB. Measured with the arbiter's command discarded
+  (`primary_alone_stops_for_stationary`): stops **2.53 m** short of a parked car
+  from 40 m at 20 m/s.
+- **The arbiter is still a complete standalone AEB.** With the planner blinded it
+  stops **2.13 m** short of the same car, and **1.88 m** short against a
+  stuck-open throttle. Four `*_alone_*` scenarios hold each half to the whole
+  requirement so the redundancy cannot quietly go away.
+- `LongitudinalPlanner` runs a constant time gap capped at `headway_decel_mps2`
+  and an evidence-gated avoidance law and takes the larger. Headway keeping is
+  not collision avoidance and can no longer produce an emergency.
+
+### One estimator, shared arithmetic, disjoint state
+
+`src/adas/control/evidence.py` is new. Planner and arbiter each construct their
+own `EvidenceBook`; they share the maths and none of the state. Three properties
+exist because the shipped arbiter got each of them wrong:
+
+- **noise from THIRD differences of the raw range.** A third difference
+  annihilates a quadratic exactly, so a lead at a constant deceleration
+  contributes nothing to the noise estimate. Taken from fit residuals instead, a
+  braking lead reads as a noisy stationary one, loses its deceleration credit,
+  and is driven into.
+- **the noise estimate is pooled over the whole run.** A four-sample fit's
+  residuals carry two degrees of freedom and collapse to nearly nothing several
+  times in a 300-frame run; every standard error computed from them collapses
+  with it and the lower confidence bound stops bounding anything.
+- **no seeded prior.** A track with fewer than three distinct captures reports
+  `rate_is_measured = False` and authorises no braking at all. The previous
+  revision seeded a new track at `-ego_speed` and let the emergency tests read
+  the seed, which is how a lead at a constant 32.5 m brought a 20 m/s ego to a
+  standstill.
+
+Braking is gated on the four-sigma lower confidence bound of the closure and
+sized on the unbiased estimate: the gate is on the bound, the magnitude is the
+estimate.
+
+### Latches removed
+
+Every self-sustaining loop in this module's history was a latch holding on
+evidence the system was itself producing, so the hazard path now carries none.
+
+- **`_fuse_range`: 87 executable lines and five per-track dictionaries → 45
+  stateless ones.** Two of its three parts were inert and the third was a latch. The
+  confidence-weighted blend returned a value strictly between the two channels
+  and the next expression took `min` of the blend and both channels, which is
+  `min` of the two channels for any weight — a subsystem whose central arithmetic
+  was a no-op. The hysteresis and dwell counter existed to stop the reported
+  *provenance* flip-flopping (26 times in 400 real frames), which is a logging
+  problem and is now solved in the logger. The corroboration streak delayed
+  adopting a persistently disagreeing nearer channel by three frames and then
+  adopted it anyway. The rule is now: the nearer of two channels that agree
+  within `range_disagreement_frac`, else the pinhole plus a reported degradation.
+- **`aeb_rate_corroboration_frames` removed.** It required a measured emergency
+  to hold two frames before latching a minimum-risk manoeuvre; it was redundant
+  with the two statistical gates underneath it. Measured: the first minimum-risk
+  frame moved from 4 to 3 across the sweep's tightest family with no new phantom,
+  early or band finding anywhere in the gate or the corpus.
+- Both keys, plus `range_corroboration_frames`, `range_source_dwell_frames`,
+  `range_confidence_hysteresis` and `range_disagreement_hysteresis`, are retained
+  so an existing config still loads, are still range-checked, and are reported
+  inert by `ArbiterLimits.unused_limits()`.
+- **`unused_limits()` is now checked in both directions**, by inspecting the
+  module's source rather than against a hand-maintained list, and it found five
+  more inert keys on its first run: `accel_authority_mps2`, `max_jerk_mps3`,
+  `max_jerk_emergency_mps3`, `plan_horizon_s` and `standstill_gap_m`. All five
+  were settable and none did anything; two still carried a docstring describing
+  an ACHIEVED-jerk ceiling that the redesign had replaced with a command-jerk
+  check, i.e. a safety config key documenting behaviour that no longer existed.
+  Eleven are now named. Fields that reach the decision by PROJECTION rather than
+  by being read (`aeb_min_rate_samples`, `aeb_min_rate_span_s`,
+  `range_rate_window_s`, folded into `evidence`) are live and are excluded
+  explicitly, each with the expression that consumes it.
+
+Executable lines in `src/adas/control/arbiter.py`: **1163**, from 1287.
+
+### Defects found and fixed while landing
+
+- **The arbiter fitted its range window on the DECISION clock, not the capture
+  time.** With a constant 55 ms sense latency the two differ by a constant and a
+  slope does not care, which is why this survived. At 80 ms the same capture is
+  republished on consecutive decision frames and deduplicating them leaves the
+  survivors stamped with the decision time of first sight: three captures 50 ms
+  apart fitted as though they were 0, 150 and 200 ms apart. Measured on the new
+  degraded-latency scenario: a reported closing rate of **9.23 m/s for a true
+  20 m/s**, the misplaced fit's residuals holding the four-sigma gate shut for two
+  further frames, first emergency-grade command at frame 9 instead of 7, and a
+  finish **1.17 m** from the obstacle against the 2.00 m required.
+  `SafetyContext.measurement_t_s` now carries the capture time explicitly. The
+  80 ms case then passes at **2.87 m**, and the nominal 55 ms sibling improved
+  too: `stationary_20mps_at_36m` went from 2.97 m to **3.53 m** of clearance.
+- **`SafetyLimits` restated all 69 of `ArbiterLimits`' defaults as independent
+  literals**, and the configuration copy won. Found the way such things are always
+  found: changing `ArbiterLimits.target_clearance_m` changed nothing that ran
+  through `SafetyMonitor`. Every shared default is now a reference to
+  `_ARBITER_DEFAULTS`.
+- **`LongitudinalPlanner` published an unbounded target speed.** It stepped
+  2.0 → 15.0 m/s in one frame on a lead flickering in and out on alternate frames,
+  and fell 0.98 m/s in one frame against a 0.15 m/s comfort bound. Restored as one
+  choke point, `_rate_limited_target_mps`, with the AEB frame exempt so an
+  emergency still publishes 0 m/s at once.
+- **The arbiter logged one WARNING per frame in a steady degraded state** —
+  1200 lines in a 1200-frame run, 72,000 an hour at 20 Hz. It now logs every
+  transition at full severity and throttles only the unchanged repeat, carrying
+  the suppressed count. The change key normalises numbers out of the violation
+  strings first, because `perception_dropout_1184` differs every frame and a
+  throttle keyed on the raw strings throttles nothing — which is the same defect
+  reconstructed inside the fix for it, and the test catches it.
+
+### Observability
+
+- `/healthz` gained a `safety` block: the arbiter's own `reason`,
+  `demand_mps2`, whether it actually changed the command, its last violations,
+  the number of state transitions so far, the frame of the last one, and whether
+  the selected lead's closing rate is a MEASUREMENT — because a backstop that has
+  not measured a rate is a backstop that will not brake. The state label alone
+  answers "is it degraded?" and nothing else.
+- One event per safety-state transition, edge triggered, and the health
+  transition counter is now incremented independently of the event log so a
+  deployment without one still reports whether the system degraded once or is
+  oscillating.
+- `ArbiterLimits.log_repeat_period_s` (default 30 s) is the new tunable.
+
+### Harness (all authorised; no scenario expectation was changed)
+
+- `sweep.Verdict.COLLISION_UNAVOIDABLE`, with the exemption keyed on the oracle's
+  own `lost_frame == 0`. Five of 120 gate cells are in that state — an omniscient
+  controller committing full authority on frame 0, under this specification's own
+  20 m/s³ jerk ceiling, still contacts. The sweep previously returned `COLLISION`
+  unconditionally, so its floor was non-zero for every possible design.
+- `library.py` now imports `REQUIRED_CLEARANCE_M`, `COMFORT_DECEL_MPS2` and
+  `JUSTIFICATION_WINDOW_FRAMES` from `oracle.py` instead of re-stating them.
+  Certification finding 1: weakening the *oracle* copy 2.0 → 0.5 m changed only
+  the report header and left `test_backtest.py` at 13 passed.
+- `report.build_baseline()` calls `tests.scenarios.baseline_header()`, so a
+  regeneration keeps its provenance block. `baseline.json` regenerated: **53
+  scenarios, 0 known failures**.
+- `test_harness_every_finding_code_is_reachable_or_named` no longer requires the
+  production system to be defective. It listed `late_intervention` in
+  `COLLISION_HALF` and in no probe, so it could only pass while the corpus was
+  still emitting that code. Fixed with a probe, not an exemption.
+- New scenario `degraded_latency_stationary_20mps_at_36m` (certification finding
+  2): the corpus had exactly one sense-latency value, 55 ms, and every budget in
+  the specification is a function of it. 80 ms is the measured p95 stage sum plus
+  20%. It caught the capture-clock defect above on its first run.
+
+### Tests
+
+- Restored the four property-level longitudinal tests the redesign had dropped:
+  no chatter across the avoidance boundary, a bounded target-speed step under
+  4000 adversarial frames, no acceleration when a lead flickers, and dropout
+  recovery from the ramped value. Three of the four failed on the incoming code
+  and are the reason the rate limiter came back.
+- New: an incoming `brake = 1.00` must pass through unattenuated with a lead in
+  view, and its converse on an empty road. One of the three redesign candidates
+  turned 1.00 into 0.12 with a benign car 45 m ahead and the harness could not see
+  it, because its only stuck-brake scenario uses an empty road and the sweep never
+  hands the arbiter a brake.
+- New: the ego-acceleration term in `evidence.closure(a_ego)` is the one place the
+  arbiter's own command feeds an input to the arbiter's own command. The physics is
+  a decorrelation (`range'' = a_lead − a_ego`, so adding the ego term back cancels
+  it exactly) but it is the shape of every loop in this module's history, so it now
+  has a test rather than a docstring: a rigidly constant gap while the ego brakes
+  at −4 m/s² must credit the lead with −4, and a gap opening at exactly the rate the
+  ego's own braking opens it must credit the lead with 0.
+- New: 1200 frames of one unchanging fault must produce at most six log lines, and
+  every state transition must still be logged.
+
+### Not fixed, deliberately
+
+- **The sweep gate exits 1 and currently cannot exit 0.** Two cells remain `LATE`.
+  Both are judged against a deadline computed from the lead's TRUE FUTURE script,
+  and at that deadline the strongest causally available requirement is 2.53 and
+  1.60 m/s² — below the 3.5 m/s² that makes a command an emergency at all. Section
+  3 of the safety specification says the true-future assumption is to be used
+  "never to require an earlier one"; here it does. The fix belongs in
+  `sweep.classify_cell`. Sizing a lateness exemption to this estimator's own
+  sample count would be tuning the harness to the code, which is the failure this
+  programme exists to prevent.
+- **45 of 400 real-footage frames cut the throttle**, all downstream of ten frames
+  where the LATERAL planner exceeded the 0.5 rad/s steering-rate ceiling on a
+  bend. No brake, nothing unjustified — a nuisance, measured and named as item 18
+  of README's *What is not production ready*, not tuned away.
+- **The sub-emergency margin was not re-blended.** The proposal was to fold the
+  engineering margin in only ABOVE the comfort line, so the law is exactly the
+  physics where the physics is gentle. Assessed and found already achieved by a
+  different mechanism: `evidence.sub_emergency_guard` holds an UNWARRANTED demand
+  below `comfort_decel_mps2 - band_guard_margin_mps2`, and the margins it would
+  have re-shaped are 5% plus 0.05 m/s², so a 2.0 m/s² requirement becomes 2.15 —
+  a metre per second squared clear of the band either way. Measured rather than
+  argued: `BAND_UNWARRANTED = 0` across all 120 gate cells, and every corpus
+  scenario carrying `max_commanded_decel_mps2 = 3.0` passes. A change with no
+  measurable effect on a safety path is a change not worth making.
+
+- **The stopping kinematics were left in `control/evidence.py`** rather than
+  moved to a `control/kinematics.py` of their own. `evidence.py` is more than
+  kinematics — it is the estimator, its noise model and its confidence bounds,
+  and `required_decel_mps2` is the one consumer of all three — so splitting it
+  would separate the arithmetic from the uncertainty it is only ever valid
+  under. Named because it was a suggestion that was considered and not taken.
+
+- **The backstop's clearance was not thickened.** One of the losing candidates
+  held 2.51 m where this holds 2.13 m on `arbiter_alone_stops_for_stationary`, and
+  recovering that was on the landing list. It was measured and declined: raising
+  `target_clearance_m` from 2.25 m to 2.50 m changed the result by 0.00 m, because
+  the arbiter is already at brake = 1.00 for the whole stop. The clearance is
+  authority-limited, not aim-limited, so the only way to buy it is an earlier
+  warrant — i.e. weakening the evidence gate that keeps `PHANTOM` at zero. Both
+  numbers clear the 2.00 m the specification asks for.
+
+
 ## [Unreleased] — 2026-09-13 safety-hardening pass
 
 Four adversarial reviewers re-verified the 0.3.0 claims on the target Jetson from

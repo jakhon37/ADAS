@@ -410,7 +410,7 @@ class PlannerConfig:
     aeb_ttc_s: float = 0.9
     warn_ttc_s: float = 1.6
     emergency_decel_mps2: float = 8.0
-    mrm_decel_mps2: float = 3.5
+    mrm_decel_mps2: float = 3.0  # a controlled stop, not an emergency one
     wheelbase_m: float = 2.8
     max_lateral_accel_mps2: float = 3.0
     steering_speed_ref_mps: float = 12.0
@@ -467,13 +467,17 @@ class ControllerConfig:
     max_throttle: float = 1.0
     max_brake: float = 1.0
     max_steering_angle_deg: float = 25.0  # road-wheel angle at steering = 1.0
-    steering_deadband_deg: float = 0.5
+    steering_deadband_deg: float = 0.05
+    # 0.5 deg is a hundredth of full scale but is NOT small in the quantity
+    # that matters: a proportional lane-keeping law reaches it only at about
+    # 0.85 m of lane error at 20 m/s, so it was an 0.85 m dead zone around
+    # the lane centre. 0.05 deg is an EPS position loop's resolution.
     accel_authority_mps2: float = 2.5
     brake_authority_mps2: float = 8.0
     speed_deadband_mps: float = 0.3
     speed_hysteresis_mps: float = 0.15
-    max_jerk_mps3: float = 4.0
-    max_jerk_emergency_mps3: float = 15.0
+    max_jerk_mps3: float = 2.5  # comfort band the occupant does not register
+    max_jerk_emergency_mps3: float = 20.0  # full authority in 0.4 s
     throttle_rate_per_s: float = 2.0
     brake_apply_rate_per_s: float = 5.0
     brake_release_rate_per_s: float = 8.0
@@ -537,7 +541,11 @@ class SafetyConfig:
     max_lateral_offset_m: float = 1.5  # enforced only with a metric lane geometry
     plan_horizon_s: float = 1.0
     max_jerk_mps3: float = 4.0
-    max_jerk_emergency_mps3: float = 15.0
+    max_jerk_emergency_mps3: float = 25.0
+    # 25, not 15: the vehicle answering a legal 20 m/s^3 demand through a
+    # 0.15 s brake rise, measured by differentiating a filtered wheel speed,
+    # lands just under 20 with estimator ripple on top. Reporting the vehicle
+    # for obeying is the arbiter indicting itself.
     max_lateral_accel_mps2: float = 4.5
     wheelbase_m: float = 2.8
     max_road_wheel_rad: float = 0.0  # 0 = derive from controller.max_steering_angle_deg
@@ -550,13 +558,59 @@ class SafetyConfig:
     ttc_brake_s: float = 0.9
     ttc_warn_s: float = 1.6
     comfort_decel_mps2: float = 3.0
-    mrm_decel_mps2: float = 3.5
+    mrm_decel_mps2: float = 3.0
+    # The COMFORT limit, and below the 3.5 m/s^2 emergency grade: a
+    # minimum-risk stop happens because the vehicle cannot see, not because
+    # something was detected, and the traffic behind has no reason to expect
+    # an AEB.
     limited_after_dropouts: int = 1
-    mrm_after_dropouts: int = 3
+    mrm_after_dropouts: int = 8
+    # 0.4 s. A dropped frame is a dropped frame and the vehicle holds what it
+    # was doing; half a second of nothing is a vehicle driving blind. At 3 it
+    # declared a manoeuvre, with its throttle lock and ten-frame recovery, for
+    # a 0.15 s blink.
     disengage_after_frames: int = 40
     recovery_frames: int = 10
 
+    arbiter: Dict[str, Any] = field(default_factory=dict)
+    """Overrides for the arbiter tunables that have no named key above.
+
+    ``adas.control.safety.SafetyLimits`` carries about seventy-five fields and
+    the twenty-seven named above are the ones a vehicle profile normally sets.
+    The rest -- the evidence gate's confidence bounds, the clearance targets, the
+    jerk ceilings, the hold windows, the log throttle -- used to be reachable
+    only by editing source, which for a threshold that can latch a terminal state
+    is not a defensible place to put it.  This block reaches all of them::
+
+        "safety": {"arbiter": {"closure_confidence_sigmas": 4.5,
+                               "log_repeat_period_s": 10.0}}
+
+    **Units and defaults are NOT restated here, on purpose.**  They live on
+    ``SafetyLimits`` and ``ArbiterLimits``, each field with its own docstring
+    giving the unit, the value and the argument for it, and ``SafetyLimits``
+    already derives every shared default from ``ArbiterLimits`` so there are two
+    copies of a number rather than three.  A fourth set of literals in this file
+    is how a configuration copy comes to silently win over the one the docstring
+    describes -- which had already happened once between the other two.
+
+    Validation is in two layers and neither is skippable:
+
+    * **here**, the key must name a real ``SafetyLimits`` field and the value
+      must be a finite number or a bool.  An unknown key RAISES rather than being
+      ignored, matching ``load_config``'s treatment of unknown sections -- a typo
+      in a safety limit used to be dropped in silence;
+    * **in** ``ArbiterLimits.__post_init__``, which range-checks every field and
+      cross-checks the ones that must be ordered (comfort <= emergency grade <=
+      max deceleration, warrant clearance <= target clearance, and so on).  That
+      runs when ``SafetyLimits.to_arbiter_limits()`` is called during pipeline
+      construction, so a bad value fails the build and not the first hazard.
+
+    A key that names a field the decision no longer reads is accepted and
+    validated, and reported by ``ArbiterLimits.unused_limits()``.
+    """
+
     def __post_init__(self) -> None:
+        self._validate_arbiter_overrides()
         validate_config_value("safety.max_speed_mps", self.max_speed_mps, 0.1, 100.0)
         validate_config_value("safety.max_acceleration_mps2", self.max_acceleration_mps2, 0.1, 10.0)
         validate_config_value("safety.max_deceleration_mps2", self.max_deceleration_mps2, 0.1, 15.0)
@@ -602,6 +656,40 @@ class SafetyConfig:
             raise ConfigurationError(
                 "safety.mrm_after_dropouts must be >= safety.limited_after_dropouts"
             )
+
+
+    def _validate_arbiter_overrides(self) -> None:
+        """Reject an override that names no field, or carries a bad value.
+
+        Raises:
+            ConfigurationError: the key is not a ``SafetyLimits`` field name, or
+                names one this block may not set (``evidence``, which is rebuilt
+                from the three scalar sigma keys, so setting it here and setting
+                them too would be two sources for one object).
+            ValidationError: the value is not a finite number or a bool.
+        """
+        if not self.arbiter:
+            return
+        from dataclasses import fields as _fields
+
+        from adas.control.safety import SafetyLimits
+
+        allowed = {f.name for f in _fields(SafetyLimits)} - {"arbiter", "evidence"}
+        for key, value in sorted(self.arbiter.items()):
+            if key not in allowed:
+                near = sorted(n for n in allowed if n.startswith(key[:6]))
+                raise ConfigurationError(
+                    "safety.arbiter.%s is not a SafetyLimits field%s. Nothing reads "
+                    "it, so it is rejected rather than silently ignored."
+                    % (key, (" (did you mean: %s?)" % ", ".join(near[:4])) if near else "")
+                )
+            if isinstance(value, bool):
+                continue
+            if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                raise ValidationError(
+                    "safety.arbiter.%s must be a finite number or a bool, got %r"
+                    % (key, value)
+                )
 
 
 @dataclass

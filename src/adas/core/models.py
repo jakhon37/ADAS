@@ -59,9 +59,31 @@ class PerceptionFrame:
 
 @dataclass
 class MotionPlan:
+    """What the behaviour planner decided this frame.
+
+    Two longitudinal outputs, and they are not interchangeable.
+    ``target_speed_mps`` is a COMFORT REQUEST the controller may use throttle to
+    reach.  ``decel_demand_mps2`` is the AUTHORITATIVE braking figure in m/s^2,
+    already jerk shaped by the planner, and it is the only source of brake in the
+    primary path when it is present.
+
+    The split exists because a target speed cannot express a deceleration: a
+    rate-limited target falls 0.15 m/s per frame for a 3 m/s^2 request, a
+    proportional speed law needs a 20 m/s error to answer that, and the brake the
+    primary path actually produced while trailing a comfort ramp was an eighth of
+    what the planner asked for.  The safety arbiter was then the only component
+    in the vehicle that really braked -- a backstop carrying the primary duty,
+    which is the single point of failure this field removes.
+
+    ``None`` means the planner is not stating a deceleration, and the controller
+    falls back to its own speed-error law.  Every pre-existing caller therefore
+    behaves exactly as before.
+    """
+
     target_speed_mps: float
     steering_angle_deg: float
     reason: str
+    decel_demand_mps2: float | None = None
 
 
 @dataclass

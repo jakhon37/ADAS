@@ -42,7 +42,7 @@ document was re-taken on that date; nothing is carried over.
 | Tracking | Kalman range filter + Hungarian association | **Real.** M-of-N confirmation, class-keyed height priors, truncation flags, per-track TTC |
 | Longitudinal | Constant time-gap ACC + separate AEB stage | **Real.** An AEB decision now publishes a 0 m/s target on the frame it fires, with no downward rate limit, and the controller has an emergency feed-forward — previously the planner's AEB decision could not be executed by the control path at all |
 | Lateral | Speed-scheduled pixel law; Stanley law behind a calibrated camera | **Real (non-metric path active)**. The metric law refuses to engage on an uncalibrated camera |
-| Safety arbitration | Independent arbiter with its own lead selection, range filter and kinematics | **Real, and authoritative.** Its in-path corridor is anchored on the image centre and never reads the tracker's `in_ego_lane` or the lane model's centre (see [Safety architecture](#safety-architecture)). It is a second opinion on the *decision*, not a second sensor |
+| Safety arbitration | Independent arbiter with its own lead selection, range evidence and kinematics | **Real, and authoritative.** Its in-path corridor is METRIC, from each object's own lateral offset, and it never reads the tracker's `in_ego_lane` or the lane model's centre (see [Safety architecture](#safety-architecture)). It is a second opinion on the *decision*, not a second sensor |
 | Operations | Prometheus `/metrics`, `/healthz`, `/readyz`, JSONL event log, systemd notify + watchdog | **Real and wired** |
 | ROS 2 bridge | `adas.ros2` | **Written, NEVER EXECUTED.** `rclpy` is not installed on this board |
 | Mock detector / mock lane | — | **Honest stubs.** `is_mock=True`, loud banners, refused unless `--allow-mock` |
@@ -198,23 +198,57 @@ capture → detect → lane → track → depth cross-check → plan → control
                                         the arbiter's command is the only one that leaves
 ```
 
+### Two layers that can each stop the vehicle
+
+The longitudinal path was rebuilt in September 2026 against the executable
+specification in `tests/scenarios/`, after three rounds of patching oscillated
+between phantom braking and missed braking. The structural change is that there
+are now **two independent layers and each one can stop the car by itself**:
+
+| layer | what it does | measured, alone, against a parked car 40 m ahead at 20 m/s |
+|---|---|---|
+| planner + controller | constant time gap capped at `headway_decel_mps2`, plus an evidence-gated avoidance law | stops with **2.53 m** of clearance (`primary_alone_stops_for_stationary`, arbiter's command discarded) |
+| arbiter | one traffic rule: its own required deceleration, at emergency grade | stops with **2.13 m** (`arbiter_alone_stops_for_stationary`, planner blinded) and **1.88 m** against a stuck-open throttle |
+
+When the only brake in a system is its safety monitor, every tuning change has to
+trade phantom braking against missed braking because nothing else carries the
+ordinary case. That was the oscillation. The redundancy is what removes it, and
+the four `*_alone_*` scenarios above hold each half to the whole requirement so it
+cannot quietly go away again.
+
 The arbiter (`adas.control.arbiter.SafetyArbiter`) is deliberately independent of
 the planner. What that independence actually consists of, as the code stands today:
 
-* **Its own lead selection**, over the raw track list, ordered by TTC then range.
-  Its in-path corridor is anchored on the **image centre** with a half width of at
-  least `ArbiterLimits.min_in_path_half_width_frac` (0.30 of the frame width), and
-  membership is by box overlap. It does **not** read `TrackedObject.in_ego_lane`
-  (the tracker computes that from the same lane model the planner reads) and a lane
-  model may only *widen* the corridor, never move or narrow it, and only when the
-  lane is not mock, its centre is finite and inside the frame, and its confidence is
-  at least `lane_trust_confidence` (0.50). A bad lane centre can therefore no longer
-  hide a real lead from the arbiter.
-* **Its own alpha-beta range filter**, seeded on a new or re-initialised track from
-  `-max(0, ego_speed)` — the safe prior that an unknown object is stationary in the
-  world. It does not read `TrackedObject.velocity_mps`.
+* **Its own lead selection**, over the raw track list, ordered by the deceleration
+  each object actually REQUIRES and then by range. Range alone is the wrong key
+  and it is the one the old pipeline used: a distractor 18 m away in the next lane
+  is nearer than the car at 26 m in this lane that is braking at 6 m/s². Its
+  in-path corridor is METRIC — half the ego, plus half the object, plus
+  `lateral_gate_margin_m` — computed from the object's own `lateral_offset_m`. It
+  does **not** read `TrackedObject.in_ego_lane` (the tracker computes that from the
+  same lane model the planner reads) and a lane model may only *widen* the
+  corridor, never move or narrow it, and only when the lane is not mock, its centre
+  is finite and inside the frame, and its confidence is at least
+  `lane_trust_confidence` (0.50). A bad lane centre can therefore no longer hide a
+  real lead from the arbiter.
+* **Its own range evidence** (`adas.control.evidence.EvidenceBook`): a window of
+  RAW range measurements, timestamped with the CAPTURE time, fitted by least
+  squares. It does not read `TrackedObject.velocity_mps` and it carries no seeded
+  prior — a track it has not seen three distinct captures of reports
+  `rate_is_measured = False` and authorises **no** braking at all. The previous
+  revision seeded such a track at `-ego_speed` and let the emergency tests read the
+  seed, which is how a lead at a constant 32.5 m brought a 20 m/s ego to a
+  standstill. Braking is gated on the four-sigma lower confidence bound of the
+  closure and sized on the unbiased estimate: *the gate is on the bound, the
+  magnitude is the estimate*.
 * **Its own kinematics** differenced from measured ego speed, and its own RSS
   minimum-gap test.
+* **No latches in the hazard path.** The manoeuvre is requested on the frame the
+  requirement is there and dropped on the frame it is not; there is no
+  corroboration counter, no deferred-AEB band and no range-source dwell. Every
+  self-sustaining feedback loop in this module's history was a latch holding on
+  evidence the system was itself producing, and the protection a counter offered is
+  carried better by the two statistical gates underneath it.
 * **Its own output invariant**: the returned command is never more energetic than the
   input. Throttle is only ever reduced; **brake is only ever increased**, enforced
   structurally by a final `max(brake, cmd_in.brake)`. There is deliberately no brake
@@ -222,11 +256,65 @@ the planner. What that independence actually consists of, as the code stands tod
   controller, which owns the emergency exemption. Only the throttle apply-rate and
   the brake *release*-rate floor survive as output shaping.
 
+  The one exception is a road the arbiter positively SEES is empty — perception
+  healthy, ego valid, no in-path object now or recently — where it may lower an
+  incoming brake, because an unwarranted 8 m/s² stop on a motorway does not avoid a
+  collision, it manufactures one behind. **A lead merely being measured is not that
+  exception.** One of the three redesign candidates armed its veto whenever any
+  lead was in view and turned an incoming `brake = 1.00` into `0.12` with a benign
+  car 45 m ahead; the round before that turned 1.00 into 0.25 and drove into the
+  lead. Both directions are now pinned by unit test, because the scenario corpus
+  only ever hands the arbiter a stuck brake on an empty road.
+
 **What is NOT independent, and matters.** `SafetyContext.tracks` is the tracker's
 output, so a detection perception never produced is invisible to the arbiter too, and
 `EgoState` is the same object the planner reads, so a wrong ego speed fools both
 channels identically. The arbiter is a second opinion on the **decision**, not a
 second sensor.
+
+### What the longitudinal path scores today
+
+Measured on this board, 2026-09-14, this working tree. Nothing below is quoted
+from an earlier run.
+
+| gate | command | result |
+|---|---|---|
+| scenario corpus | `PYTHONPATH=src:. python3 -m tests.scenarios.report` | **53 passed, 0 failed**; 0 known / 0 NEW / 0 WORSENED against `baseline.json` |
+| envelope sweep (120 cells) | `python3 scripts/run_safety_sweep.py --gate` | **exit 1** — `LATE=2`. `CORRECT=113`, `COLLISION_UNAVOIDABLE=5`, and `PHANTOM = EARLY = MISSED = BAND_UNWARRANTED = COLLISION = 0` |
+| harness backtest | `pytest tests/test_backtest.py` | **13 passed** |
+| full suite | `PYTHONPATH=src pytest tests/ -p no:warnings` | **1059 passed, 2 skipped, 0 failed** |
+| real footage, 400 frames | `tests.scenarios.footage` under the GPU mutex | 355 nominal / 45 limited, **0 brake frames**, **0 unjustified interventions**, **0 missed reactions** |
+
+Reproduce the footage run (this is the only one that needs the GPU, so hold the
+board's mutex):
+
+```bash
+flock /tmp/jetson-gpu.lock -c 'PYTHONPATH=src:. python3 -c "
+from tests.scenarios.footage import record_run, analyse, format_report
+print(format_report(analyse(record_run(frames=400))))"'
+```
+
+The arbiter this replaces scored
+`BAND_UNWARRANTED=19, COLLISION=21, EARLY=17, LATE=14, PHANTOM=7` on the same
+gate.
+
+**The gate does not return 0, and it currently cannot.** Two cells remain `LATE`
+and both are unreachable rather than unfixed: the sweep computes its deadline
+from the lead's true future script, and in both cells the requirement derivable
+from the measurements available at that deadline is 2.53 and 1.60 m/s², below the
+3.5 m/s² that makes a command an emergency at all. The full arithmetic, and the
+five cells now graded `COLLISION_UNAVOIDABLE`, are in
+[docs/SAFETY_SPEC.md §7a](docs/SAFETY_SPEC.md). Judging a future round against
+exit 0 would reward gaming.
+
+The 45 non-nominal footage frames are two runs (frames 168–198 and 270–283) and
+every one is attributed: ten frames where the LATERAL planner asked for a
+steering change faster than the 0.5 rad/s road-wheel ceiling on a bend, plus the
+recovery latch decaying after each. The arbiter clamps the steering, reports
+`steering_rate_…_above_0.50`, and degrades to LIMITED — which cuts the throttle
+to zero for all 45. No brake is applied on any frame of the clip. That is a
+lateral tuning nuisance surfacing on the longitudinal channel; it is measured,
+it is not fixed, and it is item 18 below.
 
 Three properties are enforced by tests in `tests/test_pipeline.py` and
 `tests/test_arbiter.py`:
@@ -272,6 +360,61 @@ may not cruise faster than the safety ceiling, may not steer further than the
 arbiter allows, may not follow closer than the absolute minimum gap, and
 `safety.max_road_wheel_rad` must equal `radians(controller.max_steering_angle_deg)`
 — leave it at `0.0` and it is derived.
+
+### Every arbiter tunable is settable
+
+`SafetyConfig` names the twenty-seven limits a vehicle profile normally sets.
+`adas.control.safety.SafetyLimits` has about seventy-five, and the rest — the
+evidence gate's confidence bounds, the clearance targets, the jerk ceilings, the
+dropout hold windows, the log throttle period — used to be reachable only by
+editing source, which for a threshold that can latch a terminal state is not a
+defensible place to put it. `safety.arbiter` reaches all of them:
+
+```json
+"safety": {
+  "arbiter": {
+    "closure_confidence_sigmas": 4.0,
+    "lead_accel_confidence_sigmas": 5.0,
+    "target_clearance_m": 2.25,
+    "log_repeat_period_s": 30.0
+  }
+}
+```
+
+Validated in two layers, neither skippable. At config load the key must name a
+real `SafetyLimits` field and the value must be a finite number or a bool; an
+unknown key raises and suggests the nearest match, rather than being silently
+dropped. At pipeline build `ArbiterLimits.__post_init__` range-checks the value
+and cross-checks the fields that must be ordered, so a bad limit fails the build
+and not the first hazard.
+
+**Units and defaults are documented on the fields themselves**, in
+`adas/control/arbiter.py` and `adas/control/evidence.py`, each with the argument
+for its value — and `SafetyLimits` now derives every shared default from
+`ArbiterLimits` rather than restating it. That is deliberate: the two copies had
+already diverged once, in the direction that matters (the configuration copy won,
+so changing the arbiter's own default changed nothing that ran through
+`SafetyMonitor`), and a third set of literals in `config.py` would be a third
+chance to do it again.
+
+A key naming a limit the decision no longer reads is still accepted and still
+range-checked, and `ArbiterLimits.unused_limits()` reports it. **Eleven are
+currently inert**: `accel_authority_mps2`, `aeb_rate_corroboration_frames`,
+`deferred_aeb_decel_mps2`, `max_jerk_emergency_mps3`, `max_jerk_mps3`,
+`plan_horizon_s`, `range_confidence_hysteresis`, `range_corroboration_frames`,
+`range_disagreement_hysteresis`, `range_source_dwell_frames` and
+`standstill_gap_m`. A limit a deployment can set and that nothing reads is worse
+than an absent one — it reads as control and delivers none — so each is named
+rather than deleted, because deleting it would stop an existing config file
+loading, and each carries a docstring saying what replaced it.
+
+`unused_limits()` is itself checked in both directions, by source inspection
+rather than against a hand-maintained list: a name in it that the decision does
+read is a lie, and a field the decision does not read that is missing from it is
+a config key that silently does nothing. Five of the eleven were found by that
+test on its first run rather than by anyone remembering, and two of the five
+still carried a docstring describing an achieved-jerk check the redesign had
+replaced with a command-jerk one.
 
 ### The vehicle profile
 
@@ -496,24 +639,52 @@ This is the list to read before quoting anything above.
     analysis, no hazard analysis, no certification.
 16. **No soak test exists.** The longest run in this repository's history is a few
     hundred frames — about 25 seconds of clip. There is no 8 h result, no RSS curve
-    over time, no file-descriptor audit and no evidence about what the alpha-beta
-    filters, the event log rotation or the tracker's id space do after an hour.
-17. **One test fails and is left failing.**
-    `tests/test_integration.py::test_record_and_replay_round_trip` asserts a recorded
-    arbitration brake of 1.0 against a replayed 0.0. The cause is in
-    `src/adas/tools/replayer.py`: `RecordedDetector.infer` looks up
-    `getattr(frame, "frame_id")`, but `ADASPipeline.step` hands it `frame.rgb` — a raw
-    image, which has no `frame_id` — so **every replayed frame returns zero
-    detections** and the replay re-runs planning, control and arbitration on an empty
-    road. The test only passed before because the recorded side also happened to
-    command brake 0. The replay tooling is therefore not a usable regression harness
-    until that is fixed.
-18. **The arbiter logs one WARNING per frame** in a steady degraded state (no ego
-    speed, or a persistent hazard). A 200-frame bench run produces ~200 arbiter
-    WARNING lines. The planner and lateral/behaviour layers were fixed with a
-    `LogGate` (entry, one repeat per period with a suppressed count, one exit line);
-    `src/adas/control/arbiter.py` has not been converted and `grep -c LogGate` on it
-    returns 0. At 20 Hz that is 72,000 lines an hour into the journal.
+    over time, no file-descriptor audit and no evidence about what the evidence
+    windows, the event log rotation or the tracker's id space do after an hour.
+17. **The replay tooling is fixed but is still not a regression harness.**
+    `tests/test_integration.py::test_record_and_replay_round_trip` passes (the whole
+    suite is green: 1059 passed, 2 skipped, 0 failed on 2026-09-14). What has not
+    been done is using replay for what it exists for: there is no recorded corpus,
+    no stored expected-output set and nothing in CI that replays one. A round trip
+    that agrees on one clip is not a regression harness.
+18. **A lateral tuning nuisance cuts the throttle on real footage.** Over 400
+    frames of `example.mp4` the arbiter spends 45 frames (11%) in LIMITED, which
+    means `limited_throttle_cap = 0.0` and therefore a full throttle cut for 2.25 s
+    across two runs (frames 168–198 and 270–283). No brake is applied on any frame
+    and no intervention is unjustified, so this is a nuisance and not a hazard —
+    but it is a real one and it would be felt. Every one of the 45 is downstream of
+    ten frames where the LATERAL planner asked for a steering change faster than
+    the 0.5 rad/s road-wheel ceiling on a bend (peak `steering_rate_1.44`); the
+    arbiter clamps the steering, reports it, and degrades. The remaining 35 are the
+    `recovery_frames = 10` latch decaying and re-tripping. Two fixes are available
+    and neither was taken here: retune `lane_center_damping_s` (1.3 s multiplies a
+    jumpy UFLD lane centre by 26x at 20 Hz, and one of the losing redesign
+    candidates reached 0 non-nominal frames on this clip with 0.9 s), or stop a
+    LATERAL clamp that WORKED from cutting the LONGITUDINAL throttle. The second is
+    the more interesting one and it is also the more dangerous to do blind: the
+    steering ceiling is speed-scheduled, so "degrade → slow down → larger permitted
+    angle" has the shape of the cross-channel loop this module has already hit
+    three times. Neither should be changed without re-running the bend scenarios
+    and the footage.
+
+19. **The safety sweep cannot return 0, and two cells are still graded LATE.**
+    After the unavoidability exemption the gate reports `LATE=2` and exits 1. Both
+    cells demand emergency authority at a frame where the strongest causally
+    available requirement is 2.53 and 1.60 m/s², below the 3.5 m/s² threshold that
+    makes a command an emergency; the deadline they are judged against is computed
+    from the lead's true future script, which section 3 of the safety
+    specification says is to be used "never to require an earlier one". The fix
+    belongs in `sweep.classify_cell`, which should charge observability the way
+    `scenario.evaluate` already does with `earliest_actionable_frame`. It was NOT
+    done here on purpose: sizing a lateness exemption to this estimator's own
+    sample count would be tuning the harness to the code. Full arithmetic in
+    [docs/SAFETY_SPEC.md §7a](docs/SAFETY_SPEC.md).
+
+20. **The 53-scenario corpus covers two sense latencies, not a distribution.**
+    `degraded_latency_stationary_20mps_at_36m` added a second value (80 ms) and it
+    immediately caught a real defect, which suggests the axis is worth more than
+    two points. There is still no scenario at a latency that VARIES within a run,
+    and jitter is what a thermally throttled board actually produces.
 
 ---
 
@@ -561,12 +732,36 @@ asked for and why it was changed, read `pipeline.last_arbitration`.
 flock /tmp/jetson-gpu.lock -c "PYTHONPATH=src python3 -m pytest tests/ -q"
 ```
 
-**860 tests collected: 859 passed, 1 failed**, measured on this board on 2026-09-13
-in 50.75 s. The single failure is
-`tests/test_integration.py::test_record_and_replay_round_trip` (`assert 1.0 == 0.0 ±
-1e-06`), and it is a real defect in `src/adas/tools/replayer.py`, not a flake — see
-item 17 of [What is not production ready](#what-is-not-production-ready). It is left
-failing deliberately rather than deleted or skipped.
+**1061 tests collected: 1059 passed, 2 skipped, 0 failed**, measured on this board
+on 2026-09-14 in 196 s. The two skips are environment guards, not suppressed
+failures.
+
+That figure includes the four gates of the longitudinal safety path, which are
+also runnable on their own and are the ones to run after touching
+`src/adas/control/` or `src/adas/planning/`:
+
+```bash
+PYTHONPATH=src:. python3 -m tests.scenarios.report      # 53 scenarios, the readable specification
+PYTHONPATH=src:. python3 -m tests.scenarios.report --reference   # is the corpus still satisfiable?
+python3 scripts/run_safety_sweep.py --gate              # 120 cells, the primary gate
+PYTHONPATH=src python3 -m pytest tests/test_backtest.py # does the harness still catch the old defects?
+```
+
+The sweep gate exits 1 with `LATE=2` and that is the current known floor, not a
+regression — see item 19 below and
+[docs/SAFETY_SPEC.md §7a](docs/SAFETY_SPEC.md).
+
+One operational note, learned the hard way. `tests/test_backtest.py` builds
+throwaway git worktrees under `/tmp/adas-backtest-*` and removes them in a
+`finally`; killing the run (`Ctrl-C`, `pkill`, an OOM) skips that, and the next
+full-suite run then fails
+`test_backtest_leaves_no_worktrees_behind` — correctly, because a leaked
+worktree is a lock the next `git worktree add` trips over. The test is doing its
+job; the fix is not to touch it:
+
+```bash
+rm -rf /tmp/adas-backtest-* && git worktree prune
+```
 
 `pyproject.toml` no longer sets `addopts = "-q"`. It used to, and because the
 documented command *also* passes `-q`, pytest read `-q -q` as `-qq` and suppressed the
@@ -589,7 +784,10 @@ src/adas/core        configuration, models, validation, logging, metrics
 src/adas/perception  detection, lane, camera geometry, depth, the factory
 src/adas/tracking    Kalman filters, Hungarian association, the tracker
 src/adas/planning    longitudinal (ACC/AEB) and lateral (LKA) laws
-src/adas/control     the controller and the authoritative safety arbiter
+src/adas/control     the controller, the authoritative safety arbiter, and
+                     evidence.py -- the range-estimation and stopping arithmetic
+                     the planner and the arbiter SHARE, while each keeps its own
+                     instance of the state
 src/adas/runtime     frame sources, ego sources, the frame loop, the pipeline
 src/adas/io          Prometheus registry, health HTTP, event log, sd_notify
 src/adas/ros2        OPTIONAL ROS 2 bridge (never executed on this board)

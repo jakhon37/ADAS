@@ -451,7 +451,7 @@ class PipelineRunner:
 
         Leaving the loop is not a command.  Whatever was last written stays
         latched until something else is written, so a mid-stream sensor loss that
-        merely ``break``\ s leaves the previous frame's throttle applied -- the
+        merely ``break``\\ s leaves the previous frame's throttle applied -- the
         ADAS-DEC-21 failure this module claims to have fixed for the *exception*
         path.
 
@@ -749,6 +749,7 @@ class PipelineRunner:
                 with health.lock:
                     if arbitration is not None:
                         health.safety_state = arbitration.state.value
+                        self._publish_arbitration(health, arbitration)
                 health.mark_update()
             except Exception as exc:  # noqa: BLE001
                 logger.debug("health refresh failed: %s", exc)
@@ -806,6 +807,7 @@ class PipelineRunner:
                     arbitration = self.pipeline.last_arbitration
                     if arbitration is not None:
                         health.safety_state = arbitration.state.value
+                        self._publish_arbitration(health, arbitration)
                 health.update_from_metrics(self.pipeline.metrics)
                 health.mark_update()
             except Exception as exc:  # noqa: BLE001 - reporting must not stop the loop
@@ -826,16 +828,65 @@ class PipelineRunner:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("on_frame hook failed: %s", exc)
 
+    def _publish_arbitration(self, health, arbitration) -> None:
+        """Copy the arbiter's own decision into the health snapshot.
+
+        The caller already holds ``health.lock``.  Reporting only: nothing here
+        is read back by the decision path, and every field is a plain snapshot of
+        the last :class:`~adas.core.models.ArbitrationResult`, so a stale or
+        missing value degrades the endpoint and never the vehicle.
+
+        ``state`` alone answers "is it degraded?" and nothing else.  An operator
+        looking at a vehicle that is braking needs the rest: how hard the arbiter
+        is demanding, whether it actually CHANGED the command it was handed (an
+        arbiter that agrees with the planner is invisible in the state label),
+        which lead it selected, and whether that lead's closing rate is a
+        measurement or is still unknown -- because a backstop that has not
+        measured a rate is a backstop that will not brake.
+        """
+        arbiter = getattr(self.pipeline.safety_monitor, "arbiter", None)
+        lead = getattr(arbiter, "last_lead", None) if arbiter is not None else None
+        health.safety_reason = arbitration.reason or ""
+        health.safety_demand_mps2 = float(getattr(arbiter, "demand_mps2", 0.0) or 0.0)
+        health.safety_overrode_command = bool(arbitration.violations)
+        health.safety_last_violations = list(arbitration.violations)[:8]
+        health.safety_lead_track_id = getattr(lead, "track_id", None)
+        health.safety_rate_is_measured = bool(getattr(lead, "rate_is_measured", False))
+
     def _note_safety_state(self, frame_id: int) -> None:
-        events = self.hooks.events
+        """Record a change of safety state: one event, one health counter.
+
+        Deliberately edge triggered.  A safety state is a steady condition and a
+        run can hold one for thousands of frames; what an operator and a fleet
+        rule act on is the ENTRY and the EXIT, so exactly one event is written
+        per transition and none per frame.
+
+        The health counter is incremented independently of the event log, so that
+        a deployment with no event log still reports how many times the state has
+        moved -- which is the number that distinguishes a system that degraded
+        once from one that is oscillating.
+        """
         arbitration = self.pipeline.last_arbitration
-        if events is None or arbitration is None:
+        if arbitration is None:
             return
         current = arbitration.state.value
         previous = getattr(self, "_last_safety_state", "nominal")
         if current == previous:
             return
         self._last_safety_state = current
+
+        health = self.hooks.health
+        if health is not None:
+            try:
+                with health.lock:
+                    health.safety_transitions += 1
+                    health.safety_last_transition_frame = frame_id
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("health transition counter failed: %s", exc)
+
+        events = self.hooks.events
+        if events is None:
+            return
         try:
             events.safety_state(
                 previous,

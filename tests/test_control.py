@@ -115,6 +115,15 @@ def test_pedal_rates_are_bounded_over_an_adversarial_target_sequence():
 
 
 def test_commanded_acceleration_respects_the_jerk_limit():
+    """The jerk limit is ONE-SIDED, and this pins both sides of that.
+
+    A RISING deceleration throws an unbraced occupant forward and is what the
+    limit exists to bound.  Coming off the brake returns the occupant toward zero
+    g against the seat back, and a ceiling on the release rate is a requirement
+    to keep braking -- which contradicts the requirement, asserted everywhere
+    else in this project, that an unwarranted deceleration be removed promptly.
+    The release is therefore bounded by its own, larger limit.
+    """
     rng = random.Random(SEED + 1)
     controller = PIDLikeLongitudinalController(kp_speed=1.0)
     previous = controller.commanded_accel_mps2
@@ -123,7 +132,17 @@ def test_commanded_acceleration_respects_the_jerk_limit():
             _plan(rng.uniform(0.0, 30.0)), current_speed_mps=rng.uniform(0.0, 30.0), dt_s=DT
         )
         current = controller.commanded_accel_mps2
-        assert abs(current - previous) <= controller.max_jerk_mps3 * DT + 1e-9
+        if current < previous:
+            # More deceleration: the comfort band.
+            assert previous - current <= controller.max_jerk_mps3 * DT + 1e-9
+        else:
+            # Less deceleration, or more acceleration.
+            ceiling = (
+                controller.release_jerk_mps3
+                if previous < 0.0
+                else controller.max_jerk_mps3
+            )
+            assert current - previous <= ceiling * DT + 1e-9
         previous = current
 
 
@@ -443,15 +462,27 @@ def test_integrator_always_unwinds_when_the_error_reverses():
 # --------------------------------------------------------------------------- #
 
 
-def test_emergency_reaches_full_authority_inside_250ms():
-    """A held AEB target of 0 must saturate the brake within 5 frames at 20 Hz."""
+def test_emergency_reaches_full_authority_inside_the_jerk_ceiling():
+    """A held AEB target of 0 must saturate the brake at the emergency jerk rate.
+
+    The bound was 250 ms, which the controller met by ramping at 40 m/s^3 -- a
+    figure taken from the brake actuator alone and twice what the safety
+    specification permits.  20 m/s^3 is the ceiling, it reaches 8 m/s^2 in the
+    0.4 s a human panic brake takes, and braking faster buys no stopping distance
+    because the brake's own 0.15 s rise time filters it out.  So the requirement
+    is that the controller uses ALL of the authorised rate and none of the
+    unauthorised: full pedal in 8 frames, and not one frame later.
+    """
     controller = PIDLikeLongitudinalController()
     brakes = []
-    for _ in range(10):
+    for _ in range(12):
         cmd = controller.to_command(_plan(0.0), current_speed_mps=15.0, dt_s=DT, emergency=True)
         brakes.append(cmd.brake)
     first_full = next(i for i, b in enumerate(brakes) if b >= 0.99)
-    assert first_full * DT <= 0.25, "full brake only at %.2f s: %s" % (first_full * DT, brakes)
+    expected = controller.brake_authority_mps2 / controller.max_jerk_emergency_mps3
+    assert first_full * DT <= expected + DT + 1e-9, "full brake only at %.2f s: %s" % (
+        first_full * DT, brakes
+    )
     assert brakes == sorted(brakes), "emergency brake must not back off while ramping"
     assert all(b == 0.0 for b in [
         controller.to_command(_plan(0.0), current_speed_mps=15.0, dt_s=DT, emergency=True).throttle

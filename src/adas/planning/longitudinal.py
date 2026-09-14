@@ -1,4 +1,4 @@
-"""Longitudinal (speed) planning: constant-time-gap ACC plus an AEB stage.
+"""Longitudinal (speed) planning: an evidence-gated following and braking law.
 
 Units
 -----
@@ -13,111 +13,92 @@ accelerations         metres per second squared (m/s^2), always POSITIVE magnitu
                       for the deceleration limits.
 times                 seconds (s).
 
-Control law
------------
-One continuous law covers the whole domain -- there is no branch, no threshold and
-therefore no discontinuity to chatter across::
+What this module decides, and what it refuses to
+------------------------------------------------
+The planner publishes two things per frame: a **target speed**, which is a
+comfort request the controller may use throttle to reach, and a
+**deceleration demand**, which is the authoritative braking figure.  Splitting
+them is the fix for a measured defect: while the only output was a
+rate-limited target speed, "brake at 3 m/s^2" reached the controller as a target
+falling 0.15 m/s per frame, a proportional law produced 0.4 m/s^2 against it,
+and the safety arbiter was the only thing in the vehicle that actually braked.
+A planner whose braking is decorative is a planner that has made the backstop
+load-bearing.
 
-    d_desired = d0 + T * v_ego                              (constant time gap)
-    v_raw     = v_ego + k_d * (d - d_desired) + k_v * v_rel
-    v_target  = clamp(v_raw, 0, v_cruise)
+The deceleration demand is the larger of two laws, and the *authority* each may
+use is fixed by the *evidence* behind it:
 
-``d0`` is :attr:`LongitudinalLimits.min_follow_distance_m` and ``T`` is
-:attr:`LongitudinalLimits.time_gap_s`.  The law is provably monotone: ``v_target``
-is non-decreasing in ``d`` (``dv/dd = k_d > 0``) and non-increasing in the closing
-rate (``dv/dv_rel = k_v > 0`` and closing rate is ``-v_rel``).  ``tests/
-test_longitudinal.py`` sweeps the whole domain and asserts exactly that.
+**A constant-time-gap follow.**  The policy spacing is ``d0 + T * v_ego`` and
+inside it the ego settles at a speed deficit proportional to the shortfall,
+capped at :attr:`LongitudinalLimits.headway_dv_max_mps`.  This law rests on the
+measured RANGE alone, which is the best-supported quantity the system has, and
+its authority is capped at :attr:`LongitudinalLimits.headway_decel_mps2` --
+1.5 m/s^2, half the comfort limit.  Headway keeping is not collision avoidance
+and must never be mistaken for it: braking at 3.4 m/s^2 for a whole run behind a
+lead that never moved satisfies every AEB test ever written and is still wrong.
 
-On top of the comfort law sits a separate autonomous-emergency-braking (AEB) stage
-that keys on time-to-collision and on the deceleration the geometry actually
-requires.  Both AEB predicates are monotone in the same directions as the comfort
-law, so adding them cannot break monotonicity.  The AEB stage is the only path
-allowed to demand :attr:`LongitudinalLimits.emergency_decel_mps2`.
+**A collision-avoidance law derived from required deceleration.**  Textbook,
+computed from the measured range, the planner's OWN least-squares closing rate
+and a split-half estimate of the lead's acceleration -- see
+:mod:`adas.control.evidence`.  It may use the vehicle's full authority, and it
+is gated: the law does not engage until the measured closure is
+:attr:`~adas.control.evidence.EvidenceLimits.closure_sigmas` standard errors
+clear of zero.  **The gate is on the bound; the magnitude is the estimate.**
+Once the gate is open the demand is sized on the unbiased closure, because the
+requirement goes as the square of it and braking for a deliberately pessimistic
+closure is its own kind of over-response.
 
-The planner is STATEFUL: the COMFORT target speed is rate-limited against the
-previous target so that ``max_accel_mps2`` and ``max_decel_mps2`` are honoured by
-construction.  Call :meth:`LongitudinalPlanner.reset` whenever the vehicle or the
-replay is restarted, or the first frame of the new run will be rate-limited
-against the last frame of the old one.
+**No rate is ever fabricated.**  A camera measures range; a closing rate is a
+difference of ranges over time.  Until four distinct captures exist there is no
+rate, and the only prior available -- "assume the object is stationary in the
+world", i.e. ``rate = -v_ego`` -- is precisely what produced this codebase's
+phantom full-authority brake.  While the rate is unmeasured the planner falls
+back on the time-gap law, which is bounded at 1.5 m/s^2 and cannot hurt anyone.
 
-The AEB stage is DELIBERATELY EXEMPT from the downward rate limit.  An emergency
-stop target must lead the vehicle, not trail it: while the AEB target was also
-rate-limited at ``emergency_decel_mps2 * dt`` (0.4 m/s per 50 ms frame) the
-published target tracked the measured speed down, the residual speed error stayed
-near 0.4 m/s, and a proportional speed controller downstream therefore commanded
-essentially no brake -- the whole AEB stage was decorative in the actuation path.
-When AEB fires the target is 0 m/s on that same frame; shaping the deceleration is
-the job of the controller's jerk limit and of the actuator, not of the planner.
-Recovery out of AEB is still rate-limited upward at ``max_accel_mps2``.
-
-Range-rate cross-check
-----------------------
-The AEB predicates are functions of the CLOSING RATE, which the planner does not
-measure: it arrives on :attr:`LeadVehicle.range_rate_mps` from the tracker's
-range filter.  If that one channel reports zero while the range is visibly
-collapsing, every AEB predicate reads "not closing" and the planner plans a
-comfort follow all the way into the back of the obstacle -- observed with a
-stationary lead 25 m ahead at 15 m/s, where the planner said ``follow_gap`` on
-all 40 frames and the controller commanded brake 0.000 on all 40.
-
-So the planner keeps its own, independent estimate of the range rate: a
-LEAST-SQUARES FIT of range against time over the last
-``range_rate_cross_check_window`` frames of one continuously measured track.
-This is a measurement of the same signal the gap maths already trusts, not an
-assumption about the world.
-
-Three independent gates stand between that estimate and the law, because this is
-precisely the shape of bug that has to be got right -- an internally computed
-quantity that can command a brake:
-
-1. STATISTICAL SIGNIFICANCE. The fit reports its own standard error from the
-   residual scatter of the range about the fitted line, and the estimate is only
-   believed when it beats the reported rate by ``range_rate_significance_sigma``
-   standard errors. This self-calibrates to however noisy the range channel
-   happens to be, which the planner does not control and cannot know in advance.
-   The first version of this cross-check used the median of the per-frame range
-   DIFFERENCES instead; differencing multiplies the range noise by ``1/dt`` (20x
-   at 20 Hz) and a median only divides it by 3, so with an HONEST rate channel
-   and 0.25 m of gaussian range noise it fired on 180 frames in 3000, and with
-   5 m of noise it manufactured AEB frames out of a lead that was not closing at
-   all. The regression plus its own error bar fires on none of those.
-2. AN ABSOLUTE FLOOR. The disagreement must also exceed
-   ``range_rate_disagreement_mps`` outright, so ordinary filter lag on a
-   low-noise channel cannot perturb the law however tight the error bar gets.
-3. A PHYSICAL CLAMP. The correction is clamped so it can never imply anything
-   worse than driving at a STATIONARY object (``rate >= -v_ego``).
-
-Fabricating a closing rate out of the ego speed alone is exactly how a phantom
-full-authority brake gets built; this path fabricates nothing, has to clear its
-own measured error bar, and is bounded by the ego speed even when it does.
+The demand is shaped by a jerk limiter at the ceilings the safety specification
+derives: 2.5 m/s^3 while the demand stays inside the comfort band, 20 m/s^3 once
+it is heading past emergency grade.  Shaping here rather than in the controller
+means the planner owns the whole deceleration profile and the controller can be
+a pure actuator map; it also means the demand the arbiter is handed is already
+occupant-safe, so the arbiter never has to reduce one for comfort.
 
 Failure behaviour
 -----------------
 * ``perception_valid=False`` -- the planner NEVER interprets a missing perception
-  result as an empty scene.  It holds the last valid target and ramps it down at
-  ``max_decel_mps2``; after ``mrm_after_dropouts`` consecutive dropouts it ramps at
-  ``mrm_decel_mps2`` instead, i.e. a controlled stop.  ``SpeedDecision.degraded``
-  is set on every such frame.
-* Ego speed unknown / non-finite / negative -- the constant-time-gap law is
-  undefined without it, so the planner degrades exactly as for a perception
-  dropout (hold and ramp down) and reports ``ego_speed_unavailable``.  It never
-  guesses a speed.
+  result as an empty scene.  The avoidance demand is HELD for
+  ``blind_hold_frames`` and the vehicle then makes a minimum-risk stop at
+  ``mrm_decel_mps2``.  ``SpeedDecision.degraded`` is set on every such frame.
+* A detection MISS with healthy perception -- the same hold, for
+  ``miss_hold_frames``: a detector that reported nothing has not reported that
+  the road is clear.
+* Ego speed unknown / non-finite / negative -- the time-gap law is undefined
+  without it, so the planner degrades exactly as for a dropout and reports
+  ``ego_speed_unavailable``.  It never guesses a speed.
 * Non-finite lead range -- the lead is discarded and the planner reports
-  ``invalid_range``, holding and ramping down rather than cruising.
-* Coasting lead (the tracker is extrapolating, not measuring) -- the target speed
-  is not allowed to increase, so the eventual deletion of the track cannot produce
-  an acceleration step.
+  ``invalid_range``.
+* A range discontinuity larger than
+  :attr:`~adas.control.evidence.EvidenceLimits.jump_m` re-anchors the estimate
+  and returns the rate to unknown, rather than being differentiated into a
+  200 m/s closure.
 
-This module owns no I/O and no logging of driver data; it is pure decision logic
-and is safe to unit-test at any rate.
+This module owns no I/O beyond gated WARNING lines and is pure decision logic;
+it is safe to unit-test at any rate.  It is STATEFUL (the evidence window, the
+jerk shaper, the dropout counters); call :meth:`LongitudinalPlanner.reset` on
+replay restart, and use one instance per pipeline.
 """
 
 from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from adas.control.evidence import (
+    EvidenceBook,
+    EvidenceLimits,
+    JerkShaper,
+    required_decel_mps2,
+)
 from adas.core.exceptions import ValidationError
 from adas.core.logger import setup_logger
 from adas.core.models import RangeSource
@@ -222,14 +203,26 @@ class LeadVehicle:
 
     Attributes:
         distance_m: Range to the lead, metres. Must be finite and non-negative.
-        range_rate_mps: ``v_lead - v_ego`` in m/s. Negative means closing.
-        track_id: Originating track id, for logging only.
+        range_rate_mps: ``v_lead - v_ego`` in m/s as REPORTED by the tracker.
+            Negative means closing.  Carried for diagnostics and for the legacy
+            pure laws; the evidence-gated path does not read it, because it
+            differentiates the range itself.
+        track_id: Originating track id.  Identity, not motion: a change of it
+            discards the evidence, it never implies a closure.
         confidence: [0, 1] quality of the range estimate. Not used to soften the
             law -- a low-confidence lead is still braked for -- but it is carried
             through into the decision so the arbiter can cross-check it.
         frames_since_measurement: 0 when this frame carried a real measurement,
             >0 when the tracker is coasting the object.
         source: Which range channel produced ``distance_m``.
+        capture_token: A counter that advances only when perception produced a
+            NEW result for this track (``TrackedObject.hits``).  When it is
+            unchanged the range is a repeat of a capture already held, and
+            storing it twice would put two points at the same abscissa and
+            flatten the fitted slope toward zero -- a fabricated "it stopped
+            closing".  At 55 ms of sense latency on a 50 ms grid that happens on
+            the first two frames of every run, which is exactly where the
+            tightest scenarios are decided.
     """
 
     distance_m: float
@@ -238,6 +231,7 @@ class LeadVehicle:
     confidence: float = 1.0
     frames_since_measurement: int = 0
     source: RangeSource = RangeSource.PINHOLE
+    capture_token: int = 0
 
     @property
     def is_coasting(self) -> bool:
@@ -258,57 +252,100 @@ class LongitudinalLimits:
     time_gap_s: float = 2.0
     """``T`` in the spacing policy: seconds of headway added per m/s of ego speed."""
     standstill_gap_m: float = 4.0
-    """Bumper-to-bumper gap the AEB stage protects. Must be <= min_follow_distance_m."""
+    """Bumper-to-bumper gap the legacy AEB predicates protect.
+    Must be <= min_follow_distance_m."""
     k_distance: float = 0.4
-    """Spacing-error gain, units 1/s. Larger = firmer gap regulation."""
+    """Spacing-error gain of the LEGACY pure law, units 1/s."""
     k_speed: float = 0.6
-    """Relative-speed gain, dimensionless."""
+    """Relative-speed gain of the LEGACY pure law, dimensionless."""
     max_accel_mps2: float = 2.0
     max_decel_mps2: float = 3.0
-    """Comfort deceleration. Bounds how fast the target speed may fall."""
+    """Comfort deceleration. Bounds how fast the target SPEED may fall."""
     emergency_decel_mps2: float = 8.0
-    """Only the AEB stage may demand this."""
-    mrm_decel_mps2: float = 3.5
-    """Controlled-stop rate used once a perception dropout becomes persistent."""
+    """The vehicle's full braking authority; only the avoidance law may reach it."""
+    mrm_decel_mps2: float = 3.0
+    """Controlled-stop rate used once the vehicle has been blind for
+    ``blind_hold_frames``.
+
+    The comfort limit, not an emergency rate: the vehicle has to stop, nothing
+    has been detected in front of it, and the traffic behind has no reason to
+    expect more.
+    """
     aeb_ttc_s: float = 0.9
     warn_ttc_s: float = 1.6
     aeb_required_decel_mps2: float = 5.0
-    """If closing geometry needs more than this, the comfort law is abandoned."""
+    """Legacy predicate threshold, retained for :meth:`raw_target_speed_mps`."""
     limited_after_dropouts: int = 1
     mrm_after_dropouts: int = 3
-    range_rate_cross_check_window: int = 19
-    """Frames of range history the independent rate estimate is fitted over.
 
-    Must be >= 5 (the standard error needs residual degrees of freedom).  19
-    frames is 0.95 s at 20 Hz.  The slope's standard error falls as
-    ``sqrt(12 / (n (n^2 - 1)))``, so a longer window buys accuracy directly; what
-    it costs is detection latency.  The pair (19 frames, 5 sigma) was picked off
-    a measured grid -- window 9..19 x sigma 3..5, scored on corrections
-    MANUFACTURED from an honest rate channel with 0.25 / 0.5 / 1 / 3 / 8 m of
-    gaussian range noise over 4,800 frames each, and on how long a stuck channel
-    gets to run before it is caught.  Every shorter or looser cell leaked between
-    1 and 55 fabricated corrections; (19, 5) leaked none in any noise or
-    range-jump case measured and still catches a rate channel stuck at 0 within
-    0.95 s.  The latency is the price of not being a phantom-brake generator, and
-    it is the number to revisit first if this check ever has to be faster.
-    """
-    range_rate_disagreement_mps: float = 3.0
-    """Absolute floor on the disagreement before the measured rate is believed.
+    # --- the evidence-gated law ----------------------------------------------
+    headway_decel_mps2: float = 1.5
+    """Ceiling on the authority the TIME-GAP law may use, m/s^2.
 
-    Below this the reported rate is used unchanged, so ordinary filter lag never
-    perturbs the law however small the fit's error bar happens to be.  3 m/s at a
-    30 m range is 0.15 m/s^2 of required deceleration -- far below
-    ``aeb_required_decel_mps2`` -- so a disagreement this size only ever matters
-    close in, which is where it should.
+    Half the comfort limit.  A gap only opens while the ego is slower than the
+    lead, and a deficit of a few m/s opens forty metres in a comfortable dozen
+    seconds; there is nothing a headway law needs full authority for.  This
+    number is also what keeps the system out of the 3.0-3.5 m/s^2 band that no
+    emergency test can see and that a "fixed" phantom brake retreats into.
     """
-    range_rate_significance_sigma: float = 5.0
-    """Standard errors of the fitted slope the disagreement must also clear.
+    headway_gain_per_m: float = 0.30
+    """Speed deficit held per metre of gap shortfall, 1/s."""
+    headway_dv_max_mps: float = 3.0
+    """Largest speed deficit the time-gap law will hold, m/s.
 
-    This is what makes the cross-check safe on a noisy range channel: the
-    threshold rises automatically with the scatter of the range about the fitted
-    line, so the check neither goes deaf on a clean channel nor fires on a dirty
-    one.  The absolute floor above has to be cleared as well.
+    A gap opens at the deficit, so 3 m/s opens 40 m in about thirteen seconds.
+    Larger deficits open the gap faster and cost speed the journey needs.
     """
+    speed_error_gain: float = 0.8
+    """Deceleration demanded per m/s of speed error by the time-gap law, 1/s."""
+    target_clearance_m: float = 2.25
+    """Room a completed avoidance stop aims to leave, metres.
+
+    The 2.0 m a driver leaves at standstill, plus a quarter of a metre of
+    aim-off, which is the range the planner cannot see: it is acting on a
+    measurement one frame old, so a law that aims at exactly the required
+    clearance stops a fraction inside it every time.
+    """
+    demand_margin_frac: float = 0.05
+    demand_margin_mps2: float = 0.05
+    """Prudence added to the computed avoidance requirement.
+
+    Deliberately small: the requirement is recomputed every frame from a fresh
+    measurement, so a standing margin buys nothing the next frame does not buy
+    anyway, and an over-sized one is measured as over-braking -- which transfers
+    the collision to the vehicle behind rather than removing it.
+    """
+    comfort_jerk_mps3: float = 2.5
+    """Rate the demand may be built at inside the comfort band, m/s^3."""
+    emergency_jerk_mps3: float = 20.0
+    """Rate the demand may be built at once it is heading past emergency grade.
+
+    Full 8 m/s^2 authority in the 0.4 s a human panic brake takes.  Faster buys
+    no stopping distance -- the brake actuator's own 0.15 s rise filters it out
+    -- and costs the occupant a head-toss they cannot brace for.
+    """
+    release_jerk_mps3: float = 25.0
+    """Rate the demand is allowed to fall at, m/s^3.
+
+    Only the RISE is a comfort hazard; a release is arrested by the seat back,
+    and every other requirement here demands that an unwarranted deceleration be
+    removed PROMPTLY.
+    """
+    emergency_grade_mps2: float = 3.5
+    """The deceleration at or above which a demand counts as an emergency."""
+    blind_hold_frames: int = 8
+    """Frames of perception loss tolerated before a minimum-risk stop begins.
+
+    0.4 s, which at 20 m/s is 8 m travelled without a picture.
+    """
+    miss_hold_frames: int = 24
+    """Frames an avoidance demand survives a DETECTION miss, 1.2 s.
+
+    Perception is healthy and reported no object; that is not evidence of an
+    empty road, so the demand is held rather than dropped.
+    """
+    evidence: EvidenceLimits = field(default_factory=EvidenceLimits)
+    """How much measurement the avoidance law demands before it engages."""
 
     def __post_init__(self) -> None:
         if self.cruise_speed_mps <= 0:
@@ -342,35 +379,40 @@ class LongitudinalLimits:
             raise ValidationError("require 0 < aeb_ttc_s <= warn_ttc_s")
         if self.mrm_after_dropouts < self.limited_after_dropouts:
             raise ValidationError("mrm_after_dropouts must be >= limited_after_dropouts")
-        if self.range_rate_cross_check_window < 5:
+        if not 0.0 < self.headway_decel_mps2 <= self.max_decel_mps2:
             raise ValidationError(
-                "range_rate_cross_check_window must be an integer >= 5, got %r"
-                % (self.range_rate_cross_check_window,)
+                "headway_decel_mps2 (%.2f) must be positive and no larger than the comfort "
+                "limit (%.2f): a following law that may use collision-avoidance authority is "
+                "how a phantom brake hides below the emergency threshold"
+                % (self.headway_decel_mps2, self.max_decel_mps2)
             )
-        if not (
-            math.isfinite(self.range_rate_significance_sigma)
-            and self.range_rate_significance_sigma > 0.0
-        ):
+        if self.headway_gain_per_m <= 0 or self.headway_dv_max_mps <= 0:
+            raise ValidationError("headway gains must be positive")
+        if self.speed_error_gain <= 0:
+            raise ValidationError("speed_error_gain must be positive")
+        if self.target_clearance_m < 0:
+            raise ValidationError("target_clearance_m must be non-negative")
+        if self.comfort_jerk_mps3 <= 0 or self.emergency_jerk_mps3 < self.comfort_jerk_mps3:
+            raise ValidationError("require 0 < comfort_jerk_mps3 <= emergency_jerk_mps3")
+        if self.release_jerk_mps3 <= 0:
+            raise ValidationError("release_jerk_mps3 must be positive")
+        if not self.max_decel_mps2 <= self.emergency_grade_mps2 <= self.emergency_decel_mps2:
             raise ValidationError(
-                "range_rate_significance_sigma must be positive, got %r"
-                % (self.range_rate_significance_sigma,)
+                "emergency_grade_mps2 must lie between the comfort limit and full authority"
             )
-        if not (
-            math.isfinite(self.range_rate_disagreement_mps)
-            and self.range_rate_disagreement_mps > 0.0
-        ):
-            raise ValidationError(
-                "range_rate_disagreement_mps must be positive, got %r"
-                % (self.range_rate_disagreement_mps,)
-            )
+        if self.blind_hold_frames < 0 or self.miss_hold_frames < 0:
+            raise ValidationError("hold windows must be non-negative")
 
 
 @dataclass
 class SpeedDecision:
     """Result of one longitudinal planning step.
 
-    ``target_speed_mps`` is the only field the controller needs; everything else is
-    diagnostic and is consumed by the safety arbiter and by the logs.
+    Two outputs matter to the controller and they are not interchangeable:
+    ``target_speed_mps`` is a comfort request the throttle may serve, and
+    ``decel_demand_mps2`` is the authoritative braking figure, already jerk
+    shaped.  Everything else is diagnostic and is consumed by the safety
+    arbiter, the logs and the health endpoint.
     """
 
     target_speed_mps: float
@@ -379,19 +421,34 @@ class SpeedDecision:
     gap_m: float = float("inf")
     ttc_s: float = float("inf")
     required_decel_mps2: float = 0.0
+    """The AVOIDANCE law's raw requirement this frame, before jerk shaping."""
+    decel_demand_mps2: float = 0.0
+    """The deceleration the controller must produce, m/s^2, jerk shaped."""
     aeb_active: bool = False
     degraded: bool = False
     dropout_frames: int = 0
     lead_track_id: int = -1
     range_rate_mps: float = 0.0
-    """The closing rate the law was actually evaluated with (``v_lead - v_ego``)."""
+    """The closing rate the law was evaluated with (``v_lead - v_ego``)."""
     range_rate_corrected: bool = False
-    """True when the reported rate was overridden by the planner's own median
-    range derivative; see the module note on the range-rate cross-check."""
+    """True when the planner's own measurement replaced the reported rate."""
+    rate_is_measured: bool = False
+    """True once the closing rate comes from the planner's own window of RAW
+    range measurements.  While False no collision-avoidance authority is used at
+    all: the fallback is the time-gap law, bounded at ``headway_decel_mps2``."""
+    closing_lcb_mps: float = 0.0
+    """Lower confidence bound on the closure, m/s, positive when closing.  This
+    is the number the avoidance law is GATED on; ``range_rate_mps`` is the number
+    it is SIZED on."""
+    closing_stderr_mps: float = 0.0
+    lead_accel_mps2: float = 0.0
+    """Confident lead acceleration, <= 0."""
+    headway_decel_mps2: float = 0.0
+    """The time-gap law's contribution to the demand this frame."""
 
 
 class LongitudinalPlanner:
-    """Constant-time-gap ACC with an independent AEB stage and target rate limiting."""
+    """Constant-time-gap following plus an evidence-gated avoidance law."""
 
     def __init__(
         self,
@@ -401,31 +458,38 @@ class LongitudinalPlanner:
         self.limits = limits or LongitudinalLimits()
         self._prev_target_mps: float | None = None
         self._dropout_frames = 0
+        self._blind_frames = 0
+        self._miss_frames = 0
+        self._held_avoid_mps2 = 0.0
         self._ego_speed_gate = LogGate(ego_speed_log_period_s)
         self._rate_gate = LogGate(ego_speed_log_period_s)
-        self._range_track_id = -1
-        self._range_clock_s = 0.0
-        self._range_hist: list = []
+        self._clock_s = 0.0
+        self._evidence = EvidenceBook(self.limits.evidence)
+        self._shaper = JerkShaper(
+            comfort_jerk_mps3=self.limits.comfort_jerk_mps3,
+            emergency_jerk_mps3=self.limits.emergency_jerk_mps3,
+            emergency_decel_mps2=self.limits.emergency_grade_mps2,
+            release_rate_mps3=self.limits.release_jerk_mps3,
+        )
 
     # ------------------------------------------------------------------ state
 
     def reset(self) -> None:
-        """Forget the previous target, the dropout counter and the log latches."""
+        """Forget every window, counter and latch.  Call on replay restart."""
         self._prev_target_mps = None
         self._dropout_frames = 0
+        self._blind_frames = 0
+        self._miss_frames = 0
+        self._held_avoid_mps2 = 0.0
         self._ego_speed_gate.reset()
         self._rate_gate.reset()
-        self._forget_range_history()
+        self._clock_s = 0.0
+        self._evidence.reset()
+        self._shaper.reset(0.0)
 
     @property
     def ego_speed_available(self) -> bool:
-        """False while the planner is latched in ``ego_speed_unavailable``.
-
-        This is the machine-readable form of the condition that used to be a
-        per-frame WARNING.  It is also visible on every
-        :class:`SpeedDecision` as ``degraded`` plus ``reason`` and is what a
-        health endpoint should report.
-        """
+        """False while the planner is latched in ``ego_speed_unavailable``."""
         return not self._ego_speed_gate.active
 
     @property
@@ -438,6 +502,11 @@ class LongitudinalPlanner:
         """Consecutive frames the planner has been told perception is invalid."""
         return self._dropout_frames
 
+    @property
+    def demand_mps2(self) -> float:
+        """The jerk-shaped deceleration demand as it currently stands."""
+        return self._shaper.decel_mps2
+
     # ------------------------------------------------------------- pure maths
 
     def desired_gap_m(self, ego_speed_mps: float) -> float:
@@ -447,10 +516,12 @@ class LongitudinalPlanner:
     def equilibrium_speed_mps(
         self, distance_m: float, range_rate_mps: float, ego_speed_mps: float
     ) -> float:
-        """The comfort law, before AEB and before rate limiting. Pure.
+        """The legacy comfort law, before AEB and before rate limiting. Pure.
 
         Non-decreasing in ``distance_m``; non-increasing in the closing rate
-        (``-range_rate_mps``).
+        (``-range_rate_mps``).  Retained because ``tests/test_longitudinal.py``
+        sweeps it for monotonicity and because it is the clearest statement of
+        the spacing policy; :meth:`plan` uses the evidence-gated form below.
         """
         lim = self.limits
         gap_error = distance_m - self.desired_gap_m(ego_speed_mps)
@@ -479,17 +550,12 @@ class LongitudinalPlanner:
         ego_speed_mps: float,
         range_rate_mps: float | None = None,
     ) -> tuple[float, str, bool, float, float]:
-        """Comfort law + AEB, before rate limiting. Pure.
+        """Legacy comfort law + AEB predicates, before rate limiting. Pure.
 
-        Args:
-            lead: The lead object, or None for an empty scene.
-            ego_speed_mps: Measured ego speed, m/s.
-            range_rate_mps: Overrides ``lead.range_rate_mps`` when not None. Used
-                by :meth:`plan` to substitute the planner's own median range
-                derivative when the reported rate is contradicted by the range
-                history; see the module note. Everything else about the law is
-                unchanged, so the monotonicity properties still hold in this
-                argument exactly as they do in ``lead.range_rate_mps``.
+        Kept as a pure, sweepable statement of the spacing policy and of the
+        emergency predicates.  :meth:`plan` no longer routes its braking through
+        it, because a target speed cannot express a deceleration: see the module
+        docstring.
 
         Returns ``(target_mps, reason, aeb_active, ttc_s, required_decel_mps2)``.
         """
@@ -499,7 +565,6 @@ class LongitudinalPlanner:
 
         distance_m = lead.distance_m
         if not math.isfinite(distance_m) or distance_m < 0.0:
-            # An implausible range is a fault, not an empty road.
             return 0.0, "invalid_range", True, 0.0, float("inf")
 
         rate = lead.range_rate_mps if range_rate_mps is None else range_rate_mps
@@ -529,7 +594,7 @@ class LongitudinalPlanner:
         perception_valid: bool = True,
         dt_s: float = NOMINAL_DT_S,
     ) -> SpeedDecision:
-        """Produce one rate-limited target speed.
+        """Produce one target speed and one deceleration demand.
 
         Args:
             lead: The selected lead object, or None for a genuinely empty scene.
@@ -540,32 +605,23 @@ class LongitudinalPlanner:
             dt_s: Elapsed time since the previous call, seconds.
 
         Returns:
-            A :class:`SpeedDecision`. ``target_speed_mps`` is always finite, in
-            ``[0, cruise_speed_mps]``, and never RISES faster than
-            ``max_accel_mps2``.  Downward it is limited to ``max_decel_mps2`` on
-            comfort frames and to ``mrm_decel_mps2`` / ``max_decel_mps2`` on
-            degraded frames, but it is NOT limited downward while
-            ``aeb_active`` is set: an AEB decision publishes 0 m/s on the frame
-            it fires.  The deceleration the vehicle actually experiences is
-            bounded downstream, by the controller's jerk limit and the actuator.
+            A :class:`SpeedDecision`.  ``target_speed_mps`` is always finite and
+            in ``[0, cruise_speed_mps]``.  ``decel_demand_mps2`` is in
+            ``[0, emergency_decel_mps2]`` and never RISES faster than
+            ``comfort_jerk_mps3`` unless it is heading past
+            ``emergency_grade_mps2``, in which case it may rise at
+            ``emergency_jerk_mps3``.
         """
         lim = self.limits
         dt = dt_s if (math.isfinite(dt_s) and dt_s > 1e-4) else NOMINAL_DT_S
+        self._clock_s += dt
 
         if not perception_valid:
             self._dropout_frames += 1
-            decel = (
-                lim.mrm_decel_mps2
-                if self._dropout_frames >= lim.mrm_after_dropouts
-                else lim.max_decel_mps2
-            )
-            self._forget_range_history()
+            self._blind_frames += 1
             self._rate_gate.clear()
-            return self._ramp_down(
-                decel,
-                dt,
-                "perception_dropout_%d" % self._dropout_frames,
-                ego_speed_mps,
+            return self._blind_step(
+                dt, "perception_dropout_%d" % self._dropout_frames, True
             )
 
         self._dropout_frames = 0
@@ -575,9 +631,7 @@ class LongitudinalPlanner:
             #
             # ego.source='none' is a PERMANENT steady state on a vehicle with no
             # CAN bus, so this line is gated: once on entry, once every
-            # LogGate.period_s while latched, once on recovery. Every frame still
-            # carries the condition in SpeedDecision.degraded / .reason and in
-            # LongitudinalPlanner.ego_speed_available.
+            # LogGate.period_s while latched, once on recovery.
             emit, dropped = self._ego_speed_gate.mark()
             if emit:
                 logger.warning(
@@ -589,9 +643,9 @@ class LongitudinalPlanner:
                     self._ego_speed_gate.period_s,
                     dropped,
                 )
-            self._forget_range_history()
+            self._blind_frames += 1
             self._rate_gate.clear()
-            return self._ramp_down(lim.max_decel_mps2, dt, "ego_speed_unavailable", None)
+            return self._blind_step(dt, "ego_speed_unavailable", True)
 
         recovered, dropped = self._ego_speed_gate.clear()
         if recovered:
@@ -601,198 +655,207 @@ class LongitudinalPlanner:
                 ego_speed_mps,
                 dropped,
             )
+        self._blind_frames = 0
+        v_ego = float(ego_speed_mps)
+        a_ego = self._evidence.ego_accel_mps2(self._clock_s, v_ego)
 
-        if self._prev_target_mps is None:
-            self._prev_target_mps = _clamp(ego_speed_mps, 0.0, lim.cruise_speed_mps)
+        usable_lead = lead is not None and math.isfinite(lead.distance_m) and lead.distance_m >= 0.0
+        if lead is not None and not usable_lead:
+            # An implausible range is a fault, not an empty road: hold.
+            self._miss_frames += 1
+            decision = self._no_lead_step(dt, v_ego, "invalid_range")
+            return decision
+        if lead is None:
+            self._miss_frames += 1
+            return self._no_lead_step(dt, v_ego, "cruise")
 
-        rate_override = self._cross_checked_range_rate(lead, ego_speed_mps, dt)
-        raw, reason, aeb, ttc_s, required = self.raw_target_speed_mps(
-            lead, ego_speed_mps, range_rate_mps=rate_override
+        self._miss_frames = 0
+        self._evidence.forget_all_but([lead.track_id])
+        rng = max(0.01, float(lead.distance_m))
+        evidence = self._evidence.track(lead.track_id)
+        evidence.update(
+            self._clock_s,
+            rng,
+            measured=not lead.is_coasting,
+            capture_token=lead.capture_token or None,
         )
-        if rate_override is not None:
-            reason = reason + "_xrate%.1f" % rate_override
+        closure = evidence.closure(a_ego)
 
-        if lead is not None and lead.is_coasting:
-            reason = reason + "_coast%d" % lead.frames_since_measurement
+        a_avoid = 0.0
+        required = 0.0
+        if closure.measured:
+            # THE GATE IS ON THE BOUND, THE MAGNITUDE IS THE ESTIMATE.
+            gated_closing = closure.closing_mps if closure.confident_closing else 0.0
+            required = required_decel_mps2(
+                range_m=rng,
+                closing_mps=gated_closing,
+                ego_speed_mps=v_ego,
+                lead_accel_mps2=closure.lead_accel_mps2,
+                target_clearance_m=lim.target_clearance_m,
+                current_decel_mps2=self._shaper.decel_mps2,
+                max_decel_mps2=lim.emergency_decel_mps2,
+                jerk_mps3=lim.emergency_jerk_mps3,
+            )
+            if required > 0.05:
+                a_avoid = min(
+                    lim.emergency_decel_mps2,
+                    required * (1.0 + lim.demand_margin_frac) + lim.demand_margin_mps2,
+                )
+        self._held_avoid_mps2 = a_avoid
 
-        if aeb:
-            # NO downward rate limit on an emergency stop. `raw` is 0.0 on every
-            # AEB branch of raw_target_speed_mps and is published as-is, so the
-            # target LEADS the vehicle and the controller sees the full speed
-            # error. Rate-limiting here at emergency_decel_mps2 * dt left a
-            # residual error of 0.4 m/s per frame and no brake was commanded.
-            target = _clamp(raw, 0.0, lim.cruise_speed_mps)
+        v_lead_est = max(0.0, v_ego - closure.closing_mps) if closure.measured else v_ego
+        desired = self.desired_gap_m(v_ego)
+        deficit = _clamp(lim.headway_gain_per_m * (desired - rng), 0.0, lim.headway_dv_max_mps)
+        v_target = _clamp(v_lead_est - deficit, 0.0, lim.cruise_speed_mps)
+        a_headway = _clamp(
+            lim.speed_error_gain * (v_ego - v_target), 0.0, lim.headway_decel_mps2
+        )
+
+        target_decel = max(a_avoid, a_headway)
+        demand = self._shaper.step(target_decel, dt)
+        aeb_active = demand >= lim.emergency_grade_mps2
+        if aeb_active:
+            # An emergency publishes a target of zero, at once.  The comfort
+            # setpoint is not the instrument of an emergency stop and must not
+            # be allowed to argue with one.
+            v_target = 0.0
+        v_target = self._rate_limited_target_mps(v_target, dt, aeb_active)
+        self._prev_target_mps = v_target
+
+        ttc_s, _legacy_required = self.hazard(rng, -closure.closing_mps)
+        if a_avoid > 0.0:
+            reason = "avoid_%.1fm/s^2" % a_avoid
+        elif a_headway > 0.0:
+            reason = "follow_gap_%.1fm" % rng
+        elif not closure.measured:
+            reason = "follow_no_rate_%.1fm" % rng
         else:
-            low = max(0.0, self._prev_target_mps - lim.max_decel_mps2 * dt)
-            high = self._prev_target_mps + lim.max_accel_mps2 * dt
-            if lead is not None and lead.is_coasting:
-                # The tracker is extrapolating this object. Do not release
-                # throttle on a range nobody measured this frame.
-                high = min(high, self._prev_target_mps)
-            target = _clamp(_clamp(raw, low, high), 0.0, lim.cruise_speed_mps)
-        self._prev_target_mps = target
+            reason = "cruise_clear_%.1fm" % rng
+        if lead.is_coasting:
+            reason += "_coast%d" % lead.frames_since_measurement
+        if closure.reanchored:
+            reason += "_reanchored"
 
         return SpeedDecision(
-            target_speed_mps=target,
+            target_speed_mps=v_target,
             reason=reason,
-            desired_gap_m=self.desired_gap_m(ego_speed_mps),
-            gap_m=lead.distance_m if lead is not None else float("inf"),
+            desired_gap_m=desired,
+            gap_m=rng,
             ttc_s=ttc_s,
             required_decel_mps2=required,
-            aeb_active=aeb,
+            decel_demand_mps2=demand,
+            aeb_active=aeb_active,
             degraded=False,
             dropout_frames=0,
-            lead_track_id=lead.track_id if lead is not None else -1,
-            range_rate_mps=(
-                rate_override
-                if rate_override is not None
-                else (
-                    lead.range_rate_mps
-                    if lead is not None and math.isfinite(lead.range_rate_mps)
-                    else 0.0
-                )
-            ),
-            range_rate_corrected=rate_override is not None,
+            lead_track_id=lead.track_id,
+            range_rate_mps=-closure.closing_mps,
+            range_rate_corrected=closure.measured,
+            rate_is_measured=closure.measured,
+            closing_lcb_mps=closure.closing_lcb_mps,
+            closing_stderr_mps=closure.stderr_mps,
+            lead_accel_mps2=closure.lead_accel_mps2,
+            headway_decel_mps2=a_headway,
         )
 
     # --------------------------------------------------------------- helpers
 
-    def _forget_range_history(self) -> None:
-        """Drop the independent range-rate estimator's window."""
-        self._range_track_id = -1
-        self._range_clock_s = 0.0
-        self._range_hist = []
+    def _rate_limited_target_mps(
+        self, raw_target_mps: float, dt_s: float, aeb_active: bool
+    ) -> float:
+        """Bound the step in the PUBLISHED target speed, m/s.
 
-    def _measured_range_rate(
-        self, lead: LeadVehicle | None, dt_s: float
-    ) -> tuple[float, float] | None:
-        """Fitted range rate and its standard error, or None.
+        The single choke point through which every ``target_speed_mps`` this
+        planner emits must pass, so that the bound is a property of the class and
+        not of whichever branch happened to compute the number.
 
-        Returns ``(v_rel, stderr)`` in the planner's convention (negative =
-        closing), from a least-squares fit of the ranges the planner was actually
-        handed against their timestamps. Returns None until a full window of
-        consecutive, MEASURED samples of ONE track exists, so a track change, a
-        coasting frame or a dropout restarts the evidence.
+        The limit is one-sided with respect to an emergency, deliberately:
 
-        The standard error is the point of this method as much as the slope is:
-        it is what tells the caller how much of the fitted slope is range noise,
-        without the planner having to know anything about the range channel.
+        * **Rising** is bounded by ``max_accel_mps2 * dt`` always.  There is no
+          case in which a setpoint may step upward: the vehicle cannot follow it,
+          so the only thing a step does is saturate the throttle and wind up the
+          controller's integrator.
+        * **Falling** is bounded by ``max_decel_mps2 * dt`` -- the COMFORT rate --
+          on an ordinary frame, because the published target is a comfort request
+          that the throttle serves and the authoritative braking figure is
+          ``decel_demand_mps2``, which is shaped separately and is not touched
+          here.
+        * **An AEB frame is exempt** and publishes its target immediately.  A
+          target that trailed the vehicle down at the comfort rate during an
+          emergency stop is exactly how the primary path came to contribute
+          0.06 m/s^2 while the arbiter did all the braking.
+
+        Args:
+            raw_target_mps: The target the law computed this frame, m/s.
+            dt_s: Elapsed time since the previous call, seconds.
+            aeb_active: True when this frame's demand is at emergency grade.
+
+        Returns:
+            The target to publish, m/s.  On the first call after
+            :meth:`reset` there is no previous value and the raw target is
+            published unchanged.
         """
-        if (
-            lead is None
-            or lead.track_id < 0
-            or lead.is_coasting
-            or not math.isfinite(lead.distance_m)
-            or lead.distance_m < 0.0
-        ):
-            self._forget_range_history()
-            return None
-        if lead.track_id != self._range_track_id:
-            self._range_track_id = lead.track_id
-            self._range_clock_s = 0.0
-            self._range_hist = [(0.0, lead.distance_m)]
-            return None
+        lim = self.limits
+        previous = self._prev_target_mps
+        if aeb_active or previous is None or not math.isfinite(previous):
+            return raw_target_mps
+        up = lim.max_accel_mps2 * dt_s
+        down = lim.max_decel_mps2 * dt_s
+        return _clamp(raw_target_mps, previous - down, previous + up)
 
-        self._range_clock_s += dt_s
-        self._range_hist.append((self._range_clock_s, lead.distance_m))
-        window = self.limits.range_rate_cross_check_window
-        if len(self._range_hist) > window:
-            del self._range_hist[0 : len(self._range_hist) - window]
-            # Rebase so neither the stored times nor the clock grow without
-            # bound over a multi-hour run.
-            base = self._range_hist[0][0]
-            self._range_hist = [(t - base, d) for t, d in self._range_hist]
-            self._range_clock_s -= base
-        n = len(self._range_hist)
-        if n < window:
-            return None
+    def _blind_step(self, dt_s: float, reason: str, degraded: bool) -> SpeedDecision:
+        """One frame with no usable picture: hold, then make a controlled stop.
 
-        t_mean = sum(t for t, _ in self._range_hist) / n
-        d_mean = sum(d for _, d in self._range_hist) / n
-        s_tt = sum((t - t_mean) ** 2 for t, _ in self._range_hist)
-        if s_tt <= 1e-12:  # pragma: no cover - defensive, dt is validated > 1e-4
-            return None
-        slope = sum((t - t_mean) * (d - d_mean) for t, d in self._range_hist) / s_tt
-        intercept = d_mean - slope * t_mean
-        residual_ss = sum((d - (intercept + slope * t)) ** 2 for t, d in self._range_hist)
-        stderr = math.sqrt(max(0.0, residual_ss) / (n - 2) / s_tt)
-        if not (math.isfinite(slope) and math.isfinite(stderr)):  # pragma: no cover
-            return None
-        return slope, stderr
-
-    def _cross_checked_range_rate(
-        self, lead: LeadVehicle | None, ego_speed_mps: float, dt_s: float
-    ) -> float | None:
-        """Return a corrected closing rate, or None to use the reported one.
-
-        Fires only when the planner's own fitted range rate says the gap is
-        collapsing faster than the rate channel claims by BOTH
-        ``range_rate_disagreement_mps`` outright AND
-        ``range_rate_significance_sigma`` standard errors of the fit, and the
-        correction is then clamped at ``-v_ego`` -- the rate implied by a
-        STATIONARY obstacle -- so no input can make this path invent a closing
-        rate the ego's own speed does not already justify.
+        A dropped frame is a dropped frame; half a second of nothing is a vehicle
+        driving blind.  Until ``blind_hold_frames`` have passed the previous
+        avoidance demand is HELD -- a detector that produced nothing has not
+        produced evidence of an empty road -- and after that the vehicle makes a
+        minimum-risk stop at ``mrm_decel_mps2``.  Nothing was detected in front
+        of it, so nothing warrants more than the comfort rate.
         """
-        fit = self._measured_range_rate(lead, dt_s)
-        if fit is None or lead is None:
-            if fit is None:
-                self._rate_gate.clear()
-            return None
-        measured, stderr = fit
-        reported = lead.range_rate_mps if math.isfinite(lead.range_rate_mps) else 0.0
-        threshold = max(
-            self.limits.range_rate_disagreement_mps,
-            self.limits.range_rate_significance_sigma * stderr,
-        )
-        if measured >= reported - threshold:
-            self._rate_gate.clear()
-            return None
-        corrected = max(measured, -max(0.0, ego_speed_mps))
-        if corrected >= reported - 1e-9:
-            # The stationary-obstacle clamp removed the whole disagreement.
-            self._rate_gate.clear()
-            return None
-        emit, dropped = self._rate_gate.mark()
-        if emit:
-            logger.warning(
-                "Lead %d reports range rate %+.2f m/s but its range has been "
-                "collapsing at %+.2f m/s (+/-%.2f) over %d frames; planning with "
-                "%+.2f m/s. Condition is latched: repeats at most every %.0f s "
-                "(%d frames suppressed since the last line); every frame carries "
-                "it as SpeedDecision.range_rate_corrected.",
-                lead.track_id,
-                reported,
-                measured,
-                stderr,
-                self.limits.range_rate_cross_check_window,
-                corrected,
-                self._rate_gate.period_s,
-                dropped,
-            )
-        return corrected
-
-    def _ramp_down(
-        self,
-        decel_mps2: float,
-        dt_s: float,
-        reason: str,
-        ego_speed_mps: float | None,
-    ) -> SpeedDecision:
-        """Hold the last valid target and ramp it toward zero at ``decel_mps2``.
-
-        Seeds from the measured ego speed on the very first call when it is known,
-        and from zero when it is not -- the conservative direction in both cases.
-        """
-        if self._prev_target_mps is None:
-            if ego_speed_mps is not None and math.isfinite(ego_speed_mps) and ego_speed_mps >= 0.0:
-                self._prev_target_mps = _clamp(ego_speed_mps, 0.0, self.limits.cruise_speed_mps)
-            else:
-                self._prev_target_mps = 0.0
-        target = max(0.0, self._prev_target_mps - decel_mps2 * dt_s)
-        self._prev_target_mps = target
+        lim = self.limits
+        self._evidence.reset()
+        if self._blind_frames > lim.blind_hold_frames:
+            target_decel = max(self._held_avoid_mps2, lim.mrm_decel_mps2)
+            reason = "%s_minimum_risk_stop" % reason
+        else:
+            target_decel = self._held_avoid_mps2
+        demand = self._shaper.step(target_decel, dt_s)
+        aeb_active = demand >= lim.emergency_grade_mps2
+        v_target = self._rate_limited_target_mps(0.0, dt_s, aeb_active)
+        self._prev_target_mps = v_target
         return SpeedDecision(
-            target_speed_mps=target,
+            target_speed_mps=v_target,
             reason=reason,
-            degraded=True,
+            decel_demand_mps2=demand,
+            aeb_active=aeb_active,
+            degraded=degraded,
             dropout_frames=self._dropout_frames,
+        )
+
+    def _no_lead_step(self, dt_s: float, v_ego: float, reason: str) -> SpeedDecision:
+        """Perception is healthy and reported no usable lead.
+
+        The avoidance demand is HELD for ``miss_hold_frames`` before it decays:
+        a detector that produced nothing has not produced evidence of an empty
+        road, and a hazard does not stop existing because one frame missed it.
+        Once the hold expires the road really is treated as clear.
+        """
+        lim = self.limits
+        if self._miss_frames > lim.miss_hold_frames:
+            self._held_avoid_mps2 = 0.0
+            self._evidence.reset()
+        target_decel = self._held_avoid_mps2
+        demand = self._shaper.step(target_decel, dt_s)
+        aeb_active = demand >= lim.emergency_grade_mps2
+        v_target = self._rate_limited_target_mps(lim.cruise_speed_mps, dt_s, aeb_active)
+        self._prev_target_mps = v_target
+        if self._held_avoid_mps2 > 0.0:
+            reason = "detection_miss_hold_%d" % self._miss_frames
+        return SpeedDecision(
+            target_speed_mps=v_target,
+            reason=reason,
+            decel_demand_mps2=demand,
+            aeb_active=aeb_active,
+            degraded=False,
+            dropout_frames=0,
         )

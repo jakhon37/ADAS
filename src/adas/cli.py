@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import math
+from dataclasses import replace
 import os
 import signal
 import sys
@@ -225,7 +226,24 @@ def build_safety_limits(config: RuntimeConfig) -> SafetyLimits:
     command into a physical road-wheel angle, and a disagreement silently
     mis-scales every steering check.  :meth:`RuntimeConfig.__post_init__` has
     already derived or verified it.
+
+    ``safety.arbiter`` is applied last and reaches the fields that have no named
+    key of their own, so every arbiter tunable is settable from a configuration
+    file.  Its keys were validated against the ``SafetyLimits`` field names when
+    the config was constructed; their VALUES are range-checked by
+    ``ArbiterLimits.__post_init__`` when :meth:`SafetyLimits.to_arbiter_limits`
+    runs, i.e. during pipeline construction, so a bad limit fails the build
+    rather than the first hazard.
     """
+    s = config.safety
+    return replace(
+        _base_safety_limits(config),
+        **{k: (float(v) if not isinstance(v, bool) else v) for k, v in s.arbiter.items()},
+    )
+
+
+def _base_safety_limits(config: RuntimeConfig) -> SafetyLimits:
+    """The named ``SafetyConfig`` keys, before ``safety.arbiter`` overrides."""
     s = config.safety
     return SafetyLimits(
         max_speed_mps=s.max_speed_mps,

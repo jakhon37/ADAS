@@ -404,6 +404,34 @@ class FrameRecord:
         )
 
 
+_ARBITER_TAKES_CAPTURE_TIME = "measurement_t_s" in {
+    f.name for f in dataclass_fields(SafetyContext)
+}
+"""Whether the arbiter under test accepts a separate CAPTURE time.
+
+``SafetyContext.measurement_t_s`` is the time the measurements were TRUE, which
+is ``sense_latency_s`` earlier than the decision time ``t_s``.  It is what every
+range fit must be placed on, ``adas.runtime.pipeline`` supplies it from
+``frame.timestamp_s``, and :class:`ReferenceController` reads the same
+``obs.measurement_t_s``; withholding it from the system under test handed it a
+worse input than either, and once the latency exceeded one frame period that
+showed up as a fabricated closing rate (measured: 9.23 m/s reported for a true
+20 m/s at 80 ms of latency).
+
+Probed rather than assumed because ``tests/test_backtest.py`` runs THIS harness
+against the two historical arbiters, whose ``SafetyContext`` predates the field.
+Passing an unknown keyword there is a ``TypeError`` and the backtest -- the
+harness's own proof that it still catches the two known defects -- dies with it.
+"""
+
+
+def _CAPTURE_TIME_KWARG(measurement_t_s: float) -> Dict[str, float]:
+    """``{"measurement_t_s": t}`` for an arbiter that takes it, else ``{}``."""
+    if _ARBITER_TAKES_CAPTURE_TIME:
+        return {"measurement_t_s": measurement_t_s}
+    return {}
+
+
 class StackUnderTest:
     """The production longitudinal path, wired the way the pipeline wires it.
 
@@ -507,6 +535,7 @@ class StackUnderTest:
             return fail, ControlCommand(0.0, 0.0, 0.0), fail, result
 
         ctx = SafetyContext(
+            **_CAPTURE_TIME_KWARG(obs.measurement_t_s),
             ego=obs.ego,
             tracks=obs.tracks,
             perception=obs.perception,

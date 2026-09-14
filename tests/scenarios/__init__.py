@@ -134,9 +134,10 @@ def baseline_header(scenario_names, known_failures=None):
             "This baseline describes the arbiter with md5 %s judged by a corpus "
             "of %d scenarios (names md5 %s). If any of those three differ from "
             "what you measure now, the file is STALE and the new/worsened/fixed "
-            "split below is meaningless: re-record it. Regenerating with "
-            "report.py --write-baseline does NOT rewrite this header -- "
-            "report.build_baseline() should call "
-            "tests.scenarios.baseline_header() so it cannot silently go missing."
+            "split below is meaningless: re-record it with "
+            "'PYTHONPATH=src:. python3 -m tests.scenarios.report --write-baseline', "
+            "which rewrites this header too: report.build_baseline() calls "
+            "tests.scenarios.baseline_header(), so the provenance cannot go "
+            "missing on a regeneration."
         ) % ((digest or "unknown")[:8], len(names), corpus_md5[:8]),
     }

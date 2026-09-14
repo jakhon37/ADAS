@@ -469,9 +469,42 @@ class Verdict(object):
     LATE = "LATE"
     MISSED = "MISSED"
     COLLISION = "COLLISION"
+    COLLISION_UNAVOIDABLE = "COLLISION_UNAVOIDABLE"
+    """Contact that was ALREADY unavoidable on the cell's first frame.
+
+    A statement about the CELL, not about the system, and the exact counterpart
+    of :data:`tests.scenarios.scenario.SCENARIO_DEFECT_CODES`'s
+    ``collided_unavoidable`` in the readable suite -- which the sweep lacked, so
+    the sweep's own floor was non-zero and ``--gate`` could not return 0 for any
+    design whatever.
+
+    The test is the oracle's own: ``lost_frame == 0``, i.e.
+    :func:`tests.scenarios.oracle.full_braking_min_gap` from frame 0 already
+    contacts.  That counterfactual is an OMNISCIENT controller -- it commits full
+    authority on the first frame, before any measurement of the lead's motion
+    could exist -- driving the same plant with the same 0.15 s brake rise and the
+    same 20 m/s^3 jerk ceiling this specification's ``excess_jerk`` requirement
+    imposes.  Nothing a compliant system can do beats it, so grading such a cell
+    as a failure is the sweep manufacturing a bug report out of its own
+    arithmetic, which is precisely what section 3a/B3 of the specification
+    forbids for the scenario library.
+
+    It is NOT counted as a failure, and it is reported separately rather than
+    folded into CORRECT, so that a design change which moves a cell across this
+    boundary is visible in the counts.
+    """
     INFEASIBLE = "INFEASIBLE"
 
-    ORDER = (COLLISION, MISSED, PHANTOM, LATE, EARLY, CORRECT, INFEASIBLE)
+    ORDER = (
+        COLLISION,
+        MISSED,
+        PHANTOM,
+        LATE,
+        EARLY,
+        COLLISION_UNAVOIDABLE,
+        CORRECT,
+        INFEASIBLE,
+    )
     CHARS = {
         CORRECT: ".",
         PHANTOM: "P",
@@ -479,6 +512,7 @@ class Verdict(object):
         LATE: "L",
         MISSED: "M",
         COLLISION: "X",
+        COLLISION_UNAVOIDABLE: "u",
         INFEASIBLE: " ",
     }
     FAILURES = (COLLISION, MISSED, PHANTOM, LATE, EARLY)
@@ -940,8 +974,15 @@ def classify_cell(spec: SweepSpec, result: CellResult) -> str:
 
     The order is the order of severity:
 
-    ``COLLISION``  the closed-loop pass put the ego into the lead.  Overrides
-                   every open-loop opinion; a collision cannot be argued with.
+    ``COLLISION``  the closed-loop pass put the ego into the lead, and the
+                   oracle says it was AVOIDABLE.  Overrides every open-loop
+                   opinion; an avoidable collision cannot be argued with.
+    ``COLLISION_UNAVOIDABLE``
+                   the closed-loop pass put the ego into the lead, and full
+                   authority committed on frame 0 -- before any measurement of
+                   the lead's motion could exist -- would have hit it too.  A
+                   statement about the CELL; not a failure.  See
+                   :attr:`Verdict.COLLISION_UNAVOIDABLE`.
     ``PHANTOM``    an emergency-grade intervention when no emergency ever arises
                    in this scene at all, however long you wait.
     ``EARLY``      an emergency-grade intervention before the frame at which
@@ -960,6 +1001,15 @@ def classify_cell(spec: SweepSpec, result: CellResult) -> str:
     graded for timing: ``CORRECT`` with a note, never ``MISSED``.
     """
     if result.collided:
+        if result.lost_frame == 0:
+            result.notes.append(
+                "contact was ALREADY unavoidable on frame 0: full authority "
+                "committed on the first frame, through the same plant and under "
+                "the same 20 m/s^3 jerk ceiling, still contacts. Not graded as a "
+                "failure -- no compliant system can pass this cell, and grading "
+                "it would put the gate's floor above zero."
+            )
+            return Verdict.COLLISION_UNAVOIDABLE
         return Verdict.COLLISION
     if result.warrant_frame is None:
         # No emergency ever exists in this scene.  Hard braking here is a
