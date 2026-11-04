@@ -15,10 +15,7 @@ recursive-include docs *.md
 # Exclude development files
 exclude .gitignore
 exclude Makefile
-exclude RELEASE_GUIDE.md
-exclude TRANSFORMATION_SUMMARY.md
-exclude REORGANIZATION_SUMMARY.md
-exclude PHASE3_COMPLETION.md
+recursive-exclude docs/history *
 
 # Exclude Docker files
 exclude Dockerfile
