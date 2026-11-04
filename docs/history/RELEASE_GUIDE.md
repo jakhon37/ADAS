@@ -255,14 +255,14 @@ adas-run --config config.json
 
 ### 📚 Documentation
 
-- [Architecture Guide](ARCHITECTURE.md)
-- [Deployment Guide](DEPLOYMENT.md)
-- [ROS2 Integration](docs/ROS2_INTEGRATION.md)
-- [Tools Guide](docs/TOOLS_GUIDE.md)
+- [Architecture Guide](../../ARCHITECTURE.md)
+- [Deployment Guide](../../DEPLOYMENT.md)
+- [ROS2 Integration](../ROS2_INTEGRATION.md)
+- [Tools Guide](../TOOLS_GUIDE.md)
 
 ### 🎯 Roadmap
 
-See [CHANGELOG.md](CHANGELOG.md) for full details.
+See [CHANGELOG.md](../../CHANGELOG.md) for full details.
 
 **Full Changelog**: https://github.com/jakhon37/ADAS/commits/v0.1.0
 ```
