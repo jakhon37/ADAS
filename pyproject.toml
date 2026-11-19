@@ -36,6 +36,7 @@ Changelog = "https://github.com/jakhon37/ADAS/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
+  "numpy",
   "pytest>=7.4,<8.4",
   "ruff>=0.3",
   "pytest-cov>=4.0",
@@ -45,6 +46,7 @@ ros2 = [
 ]
 jetson = []
 all = [
+  "numpy",
   "pytest>=7.4,<8.4",
   "ruff>=0.3",
   "pytest-cov>=4.0",
@@ -69,3 +71,8 @@ cache_dir = "/tmp/adas-pytest-cache"
 [tool.ruff]
 line-length = 100
 src = ["src", "tests"]
+
+[tool.ruff.lint]
+# Ruff's classic default rules. Newer ruff releases enable more rules by default,
+# which turned CI red without any change to the code.
+select = ["E4", "E7", "E9", "F"]
